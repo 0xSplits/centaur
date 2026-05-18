@@ -108,6 +108,35 @@ describe('normalizeSlackEnvelope', () => {
     }
   })
 
+  it('preserves Slack Connect user_team as recipient_team_id without changing thread key', async () => {
+    const normalized = await normalizeSlackEnvelope({
+      envelope: {
+        type: 'event_callback',
+        team_id: 'THOME',
+        event_id: 'Ev-slack-connect',
+        event: {
+          type: 'app_mention',
+          user: 'UEXTERNAL',
+          user_team: 'TEXTERNAL',
+          source_team: 'TEXTERNAL',
+          team: 'THOME',
+          channel: 'C123',
+          channel_type: 'channel',
+          thread_ts: '1778875060.000100',
+          ts: '1778875070.942789',
+          text: '<@UBOT> hello'
+        }
+      },
+      botUserId: 'UBOT',
+      client
+    })
+
+    expect(normalized?.thread_key).toBe('slack:THOME:C123:1778875060.000100')
+    expect(normalized?.team_id).toBe('THOME')
+    expect(normalized?.recipient_team_id).toBe('TEXTERNAL')
+    expect(normalized?.slack.user_team).toBe('TEXTERNAL')
+  })
+
   it('backfills prior Slack thread messages for mid-thread mentions', async () => {
     const replies = mock(async () => ({
       ok: true,

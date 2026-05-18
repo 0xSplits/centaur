@@ -35,7 +35,9 @@ export class CentaurHandoff {
             source: 'slackbot',
             slack: {
               message_ts: event.slack.message_ts,
-              enterprise_id: event.slack.enterprise_id
+              enterprise_id: event.slack.enterprise_id,
+              user_team: event.slack.user_team,
+              source_team: event.slack.source_team
             },
             is_mention: event.is_mention
           },
@@ -44,7 +46,7 @@ export class CentaurHandoff {
             channel: event.channel_id,
             thread_ts: event.thread_ts,
             recipient_user_id: event.user_id,
-            recipient_team_id: event.team_id
+            recipient_team_id: event.recipient_team_id ?? event.team_id
           }
         }
       })

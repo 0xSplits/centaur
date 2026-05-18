@@ -24,6 +24,7 @@ export type NormalizedSlackEvent = {
   thread_key: string
   message_id: string
   team_id: string
+  recipient_team_id?: string
   user_id: string
   channel_id: string
   thread_ts: string
@@ -41,6 +42,8 @@ export type NormalizedSlackEvent = {
     event_ts?: string
     message_ts: string
     enterprise_id?: string
+    user_team?: string
+    source_team?: string
   }
 }
 

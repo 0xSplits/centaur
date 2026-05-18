@@ -123,4 +123,48 @@ describe('CentaurHandoff', () => {
       globalThis.fetch = originalFetch
     }
   })
+
+  it('uses recipient_team_id for Slack Connect delivery routing', async () => {
+    const originalFetch = globalThis.fetch
+    let capturedInit: RequestInit | undefined
+    const fetchMock = mock(async (_input: string | URL | Request, init?: RequestInit) => {
+      capturedInit = init
+      return new Response(JSON.stringify({ ok: true }), { status: 200 })
+    })
+    globalThis.fetch = fetchMock as any
+    try {
+      const handoff = new CentaurHandoff(config)
+      const event: NormalizedSlackEvent = {
+        thread_key: 'slack:THOME:C123:1778883099.579529',
+        message_id: 'slack:THOME:C123:1778883099.579529',
+        team_id: 'THOME',
+        recipient_team_id: 'TEXTERNAL',
+        user_id: 'UEXTERNAL',
+        channel_id: 'C123',
+        thread_ts: '1778883099.579529',
+        is_mention: true,
+        parts: [{ type: 'text', text: 'hello' }],
+        slack: {
+          event_ts: '1778883100.000000',
+          message_ts: '1778883099.579529',
+          user_team: 'TEXTERNAL'
+        }
+      }
+
+      await handoff.emit(event)
+
+      const bodyText = capturedInit?.body
+      expect(typeof bodyText).toBe('string')
+      if (typeof bodyText !== 'string') throw new Error('expected JSON request body')
+      const body = JSON.parse(bodyText) as {
+        input: { delivery: { recipient_team_id: string; recipient_user_id: string } }
+      }
+      expect(body.input.delivery).toMatchObject({
+        recipient_team_id: 'TEXTERNAL',
+        recipient_user_id: 'UEXTERNAL'
+      })
+    } finally {
+      globalThis.fetch = originalFetch
+    }
+  })
 })

@@ -5,6 +5,8 @@ type SlackMessageEvent = {
   type?: string
   subtype?: string
   user?: string
+  user_team?: string
+  source_team?: string
   bot_id?: string
   channel?: string
   channel_type?: string
@@ -75,6 +77,7 @@ export async function normalizeSlackEnvelope(opts: {
     thread_key: `slack:${teamId}:${event.channel}:${threadTs}`,
     message_id: `slack:${teamId}:${event.channel}:${event.ts}`,
     team_id: teamId,
+    recipient_team_id: recipientSlackTeamId(event) ?? teamId,
     user_id: event.user,
     channel_id: event.channel,
     thread_ts: threadTs,
@@ -85,9 +88,18 @@ export async function normalizeSlackEnvelope(opts: {
       event_id: opts.envelope.event_id,
       event_ts: event.event_ts,
       message_ts: event.ts,
-      enterprise_id: opts.envelope.enterprise_id
+      enterprise_id: opts.envelope.enterprise_id,
+      user_team: event.user_team,
+      source_team: event.source_team
     }
   }
+}
+
+function recipientSlackTeamId(event: SlackMessageEvent): string | undefined {
+  for (const candidate of [event.user_team, event.source_team, event.team]) {
+    if (typeof candidate === 'string' && candidate.trim()) return candidate.trim()
+  }
+  return undefined
 }
 
 function isMessageLikeEvent(event: SlackMessageEvent): boolean {
