@@ -50,7 +50,7 @@ describe('final delivery polling', () => {
                     },
                     final_payload: {
                       session_title: 'Centaur · codex',
-                      result_text: 'done once'
+                      result_text: 'done [once](https://example.com) with **bold** text'
                     }
                   }
                 ]
@@ -85,6 +85,10 @@ describe('final delivery polling', () => {
           slackCalls.push({ method: 'chat.appendStream', params })
           return { ok: true }
         },
+        postMessage: async (params: unknown) => {
+          slackCalls.push({ method: 'chat.postMessage', params })
+          return { ok: true }
+        },
         stopStream: async (params: unknown) => {
           slackCalls.push({ method: 'chat.stopStream', params })
           return { ok: true }
@@ -108,13 +112,18 @@ describe('final delivery polling', () => {
           call => call.path === '/agent/final-deliveries/exe-duplicate-guard/delivered'
         )
       ).toHaveLength(1)
-      expect(slackCalls.filter(call => call.method === 'chat.startStream')).toHaveLength(1)
-      const startStream = slackCalls.find(call => call.method === 'chat.startStream')
-      expect((startStream?.params as any)?.chunks[0]).toEqual({
-        type: 'plan_update',
-        title: 'Centaur · codex'
-      })
-      expect(slackCalls.filter(call => call.method === 'chat.stopStream')).toHaveLength(1)
+      expect(slackCalls.filter(call => call.method === 'chat.startStream')).toHaveLength(0)
+      expect(slackCalls.filter(call => call.method === 'chat.stopStream')).toHaveLength(0)
+      const postMessage = slackCalls.find(call => call.method === 'chat.postMessage')
+      expect((postMessage?.params as any)?.text).toBe(
+        'done [once](https://example.com) with **bold** text'
+      )
+      expect((postMessage?.params as any)?.blocks).toEqual([
+        {
+          type: 'markdown',
+          text: 'done [once](https://example.com) with **bold** text'
+        }
+      ])
     } finally {
       globalThis.fetch = originalFetch
     }

@@ -34,6 +34,7 @@ type CodexSessionState = {
   firstBufferedTextAt: number | null
   streamedCommentaryText: string
   streamedAnswerText: string
+  deliveredAnswerChars: number
   agentMessagePhase: AgentMessagePhase | null
   planText: string
   taskByUseId: Map<string, HarnessTask>
@@ -53,7 +54,10 @@ export class CodexSessionRenderer {
     this.renderer = new AgentSessionRenderer(client)
   }
 
-  async event(agentSessionId: string, event: any): Promise<{ threadId?: string; done: boolean }> {
+  async event(
+    agentSessionId: string,
+    event: any
+  ): Promise<{ threadId?: string; done: boolean; streamedAnswerChars: number }> {
     const state = getState(agentSessionId)
     if (event?.session_id) state.threadId = String(event.session_id)
     if (event?.thread_id) state.threadId = String(event.thread_id)
@@ -199,7 +203,11 @@ export class CodexSessionRenderer {
       await this.done(agentSessionId)
     }
 
-    return { threadId: state.threadId || undefined, done: state.done }
+    return {
+      threadId: state.threadId || undefined,
+      done: state.done,
+      streamedAnswerChars: state.deliveredAnswerChars
+    }
   }
 
   async done(agentSessionId: string, threadId?: string): Promise<void> {
@@ -211,11 +219,12 @@ export class CodexSessionRenderer {
     completeOpenTasks(state)
     await this.publishActivitySummary(agentSessionId, state, { final: true })
     await this.publishPendingAssistantText(agentSessionId, state, { force: true })
-    await this.renderer.done(agentSessionId, {
-      streamFinalUpdates: false,
+    const { streamedTextChars } = await this.renderer.done(agentSessionId, {
+      streamFinalUpdates: true,
       commentaryMarkdown: state.commentaryText,
       answerMarkdown: state.answerText
     })
+    state.deliveredAnswerChars = streamedTextChars
     state.done = true
     states.delete(agentSessionId)
   }
@@ -266,11 +275,14 @@ export class CodexSessionRenderer {
     if (state.answerText.length <= state.streamedAnswerText.length) return
     const delta = state.answerText.slice(state.streamedAnswerText.length)
     if (!delta) return
-    state.streamedAnswerText = state.answerText
-    await this.renderer.textDelta(agentSessionId, delta, {
+    const acceptedChars = await this.renderer.textDelta(agentSessionId, delta, {
       force: opts.force ?? false,
       planPrefix: hasPlan
     })
+    if (acceptedChars > 0) {
+      state.streamedAnswerText += delta.slice(0, acceptedChars)
+      state.deliveredAnswerChars = this.renderer.streamedTextChars(agentSessionId)
+    }
   }
 
   private async publishStructuredPlan(
@@ -316,6 +328,7 @@ function getState(agentSessionId: string): CodexSessionState {
       firstBufferedTextAt: null,
       streamedCommentaryText: '',
       streamedAnswerText: '',
+      deliveredAnswerChars: 0,
       agentMessagePhase: null,
       planText: '',
       taskByUseId: new Map(),
@@ -627,7 +640,7 @@ function shellLanguage(language: string | undefined): string {
   return language === 'bash' || !language ? 'sh' : language
 }
 
-function shellLanguageForCommand(command: string): string {
+function shellLanguageForCommand(_command: string): string {
   return 'sh'
 }
 

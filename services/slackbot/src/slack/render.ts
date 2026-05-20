@@ -4,7 +4,7 @@ import { slackReplyLimits } from '../constants'
 const MAX_BLOCKS = slackReplyLimits.message.maxBlocks
 const MAX_MARKDOWN_CHARS = slackReplyLimits.stream.markdownChunkChars
 const MAX_FALLBACK_CHARS = slackReplyLimits.text.maxFallbackChars
-const MAX_STREAM_CHUNK_CHARS = 4_000
+const MAX_STREAM_CHUNK_CHARS = slackReplyLimits.stream.markdownChunkChars
 
 export type StatusMetadata = {
   title?: string
@@ -120,14 +120,14 @@ function splitText(input: string, maxChars: number): string[] {
   let remaining = input
   while (remaining.length > maxChars) {
     const hard = remaining.slice(0, maxChars)
-    const boundary = Math.max(
-      hard.lastIndexOf('\n\n'),
-      hard.lastIndexOf('\n'),
-      hard.lastIndexOf(' ')
-    )
-    const take = boundary > maxChars * 0.5 ? boundary : maxChars
+    const paragraphBoundary = hard.lastIndexOf('\n\n')
+    const lineBoundary = hard.lastIndexOf('\n')
+    const spaceBoundary = hard.lastIndexOf(' ')
+    const boundary = Math.max(paragraphBoundary, lineBoundary, spaceBoundary)
+    const delimiterLength = boundary === paragraphBoundary ? 2 : boundary >= 0 ? 1 : 0
+    const take = boundary > maxChars * 0.5 ? boundary + delimiterLength : maxChars
     chunks.push(remaining.slice(0, take))
-    remaining = remaining.slice(take).trimStart()
+    remaining = remaining.slice(take)
   }
   if (remaining) chunks.push(remaining)
   return chunks

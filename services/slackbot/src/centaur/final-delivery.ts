@@ -1,10 +1,12 @@
 import type { WebClient } from '@slack/web-api'
 import { centaurApiKey, type AppConfig } from '../config'
+import { slackReplyLimits } from '../constants'
 import { logError } from '../logging'
-import { AgentSessionRenderer } from '../slack/agent-session'
+import { renderMarkdownBlocks } from '../slack/render'
 import { withLaminarSpan } from './laminar'
 
 const CONSUMER_ID = `slackbot-${process.pid}`
+const FINAL_DELIVERY_CHUNK_CHARS = slackReplyLimits.text.maxFallbackChars
 
 export function startFinalDeliveryPoller(config: AppConfig, client: WebClient): void {
   if (!centaurApiKey(config)) return
@@ -41,13 +43,16 @@ export async function pollFinalDeliveriesOnce(config: AppConfig, client: WebClie
           delivery
         )
       } catch (error) {
+        const errorMessage = error instanceof Error ? error.message : String(error)
+        const msgTooLong = errorMessage.includes('msg_too_long')
         await centaur(
           config,
           `/agent/final-deliveries/${executionId}/failed`,
           {
             consumer_id: CONSUMER_ID,
-            error: error instanceof Error ? error.message : String(error),
-            retry_after_seconds: 10
+            error: errorMessage,
+            retry_after_seconds: 10,
+            ...(msgTooLong ? { error_class: 'msg_too_long', non_retryable: true } : {})
           },
           delivery
         ).catch(failError => logError('final_delivery_mark_failed_failed', failError))
@@ -63,22 +68,28 @@ async function deliver(client: WebClient, delivery: any): Promise<void> {
   const channel = meta.channel_id ?? meta.channel ?? target.channel
   const threadTs = meta.thread_ts ?? target.threadTs
   if (!channel || !threadTs) throw new Error('missing_slack_delivery_target')
-  const renderer = new AgentSessionRenderer(client)
-  const { sessionId } = await renderer.open({
-    channel,
-    parentTs: threadTs,
-    recipientTeamId: String(meta.team_id ?? delivery.team_id ?? target.teamId ?? ''),
-    recipientUserId: String(meta.recipient_user_id ?? meta.user_id ?? delivery.user_id ?? ''),
-    title: sessionTitle(payload),
-    header: sessionHeader(payload)
-  })
-  await renderer.text(sessionId, extractText(payload))
-  await renderer.done(sessionId)
+  const text = extractText(payload)
+  const textToPost = continuationText(payload, text) ?? text
+  await postFollowups(client, channel, threadTs, splitFinalDeliveryText(textToPost))
 }
 
-function sessionTitle(payload: any): string {
-  const title = String(payload?.session_title ?? payload?.title ?? '').trim()
-  return title || 'Execution steps'
+async function postFollowups(
+  client: WebClient,
+  channel: string,
+  threadTs: string,
+  chunks: string[]
+): Promise<void> {
+  for (const chunk of chunks) {
+    const response = await client.chat.postMessage({
+      channel,
+      thread_ts: threadTs,
+      text: chunk,
+      blocks: renderMarkdownBlocks(chunk),
+      unfurl_links: false,
+      unfurl_media: false
+    })
+    if (!response.ok) throw new Error(response.error ?? 'chat.postMessage failed')
+  }
 }
 
 function extractText(payload: any): string {
@@ -104,9 +115,33 @@ function firstNonEmpty(...values: unknown[]): string {
   return ''
 }
 
-function sessionHeader(payload: any): string | undefined {
-  const value = String(payload?.session_header ?? payload?.header ?? '').trim()
-  return value || undefined
+function continuationText(payload: any, text: string): string | null {
+  const rawOffset = Number(payload?.slackbot_streamed_answer_chars)
+  if (!Number.isFinite(rawOffset) || rawOffset <= 0) return null
+  const offset = Math.floor(rawOffset)
+  if (offset >= text.length) return null
+  return text.slice(offset).trimStart()
+}
+
+function splitFinalDeliveryText(text: string): string[] {
+  const trimmed = text.trim()
+  if (!trimmed) return []
+  const chunks: string[] = []
+  let remaining = trimmed
+  while (remaining.length > FINAL_DELIVERY_CHUNK_CHARS) {
+    let cut = remaining.lastIndexOf('\n\n', FINAL_DELIVERY_CHUNK_CHARS)
+    if (cut <= FINAL_DELIVERY_CHUNK_CHARS * 0.3) {
+      cut = remaining.lastIndexOf('\n', FINAL_DELIVERY_CHUNK_CHARS)
+    }
+    if (cut <= FINAL_DELIVERY_CHUNK_CHARS * 0.3) {
+      cut = remaining.lastIndexOf(' ', FINAL_DELIVERY_CHUNK_CHARS)
+    }
+    if (cut <= FINAL_DELIVERY_CHUNK_CHARS * 0.3) cut = FINAL_DELIVERY_CHUNK_CHARS
+    chunks.push(remaining.slice(0, cut).trimEnd())
+    remaining = remaining.slice(cut).trimStart()
+  }
+  if (remaining) chunks.push(remaining)
+  return chunks
 }
 
 function targetFromDelivery(delivery: any): {
