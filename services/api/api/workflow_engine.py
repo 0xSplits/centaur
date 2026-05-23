@@ -32,7 +32,7 @@ from zoneinfo import ZoneInfo
 
 import structlog
 
-from api import slackbot_client
+from api.platforms import resolve_for_delivery
 from api.runtime_control import (
     ControlPlaneError,
     append_message,
@@ -75,6 +75,24 @@ class Delivery:
     team_id: str | None = None
 
     @classmethod
+    def for_channel(
+        cls,
+        platform: str,
+        channel: str,
+        thread_id: str | None = None,
+        *,
+        user_id: str | None = None,
+        team_id: str | None = None,
+    ) -> Delivery:
+        return cls(
+            platform=platform,
+            channel=channel,
+            thread_ts=thread_id,
+            recipient_user_id=user_id,
+            recipient_team_id=team_id,
+        )
+
+    @classmethod
     def slack(
         cls,
         channel: str,
@@ -83,12 +101,8 @@ class Delivery:
         user_id: str | None = None,
         team_id: str | None = None,
     ) -> Delivery:
-        return cls(
-            platform="slack",
-            channel=channel,
-            thread_ts=thread_ts,
-            recipient_user_id=user_id,
-            recipient_team_id=team_id,
+        return cls.for_channel(
+            "slack", channel, thread_ts, user_id=user_id, team_id=team_id,
         )
 
     @classmethod
@@ -778,6 +792,34 @@ class WorkflowContext:
             eager_start=eager_start,
         )
 
+    async def post_to_channel(
+        self,
+        platform: str,
+        channel: str,
+        text: str,
+        *,
+        thread_id: str | None = None,
+    ) -> dict[str, Any]:
+        """Post a message to a channel via the platform's outbound tool.
+
+        Uses a checkpointed step so the message is sent exactly once even
+        if the workflow replays. ``platform`` selects the registered
+        messaging platform (``"slack"``, ``"discord"``, …).
+        """
+        from api.platforms import resolve_platform
+
+        platform_impl = resolve_platform(platform)
+
+        async def _post() -> dict[str, Any]:
+            return await platform_impl.send_channel_message(
+                channel, text, thread_id=thread_id,
+            )
+
+        step_name = f"post_{platform_impl.name}_{channel}"
+        return await self.step(
+            step_name, _post, step_kind=f"{platform_impl.name}_post",
+        )
+
     async def post_to_slack(
         self,
         channel: str,
@@ -785,35 +827,10 @@ class WorkflowContext:
         *,
         thread_ts: str | None = None,
     ) -> dict[str, Any]:
-        """Post a message to a Slack channel via the slack tool.
-
-        Accepts channel name (e.g. ``"team-updates"``) or ID.
-        Uses a checkpointed step so the message is sent exactly once,
-        even if the workflow replays.
-        """
-        from api.app import get_tool_manager
-
-        async def _post() -> dict[str, Any]:
-            tm = get_tool_manager()
-            args: dict[str, Any] = {
-                "channel": channel,
-                "text": text,
-                "no_attribution": True,
-            }
-            if thread_ts:
-                args["thread_ts"] = thread_ts
-            raw = await tm.call_tool("slack", "send_message", args)
-            import json as _json
-            try:
-                result = _json.loads(raw) if isinstance(raw, str) else raw
-            except (ValueError, TypeError):
-                result = {"raw": raw}
-            if isinstance(result, dict) and result.get("error"):
-                raise RuntimeError(str(result["error"]))
-            return result
-
-        step_name = f"post_slack_{channel}"
-        return await self.step(step_name, _post, step_kind="slack_post")
+        """Slack-specific convenience wrapper around ``post_to_channel``."""
+        return await self.post_to_channel(
+            "slack", channel, text, thread_id=thread_ts,
+        )
 
     @property
     def tools(self) -> _ToolProxy:
@@ -1141,6 +1158,7 @@ async def do_agent_turn(
             effective_delivery = dict(run_in.get("delivery") or {})
         effective_history = history_messages or run_in.get("history_messages") or []
         selector = {"persona_id": persona, "harness": harness}
+        platform = resolve_for_delivery(effective_delivery)
         slackbot_session_id: str | None = None
 
         try:
@@ -1155,7 +1173,7 @@ async def do_agent_turn(
             )
         except Exception as exc:
             try:
-                failure_session_id = await slackbot_client.open_agent_session(
+                failure_session_id = await platform.open_live_session(
                     delivery=effective_delivery,
                     metadata=effective_metadata,
                     thread_key=effective_thread_key,
@@ -1163,11 +1181,11 @@ async def do_agent_turn(
                     header=None,
                 )
                 if failure_session_id:
-                    await slackbot_client.session_text(
+                    await platform.session_text(
                         failure_session_id,
                         f"Failed to start the runtime: {exc}",
                     )
-                    await slackbot_client.session_done(failure_session_id)
+                    await platform.session_done(failure_session_id)
             except Exception:
                 log.warning(
                     "workflow_spawn_failure_session_failed",
@@ -1184,7 +1202,7 @@ async def do_agent_turn(
         session_header = await _compute_agent_session_header(
             ctx._pool, effective_thread_key, selector,
         )
-        slackbot_session_id = await slackbot_client.open_agent_session(
+        slackbot_session_id = await platform.open_live_session(
             delivery=effective_delivery,
             metadata=effective_metadata,
             thread_key=effective_thread_key,
@@ -1432,7 +1450,7 @@ def _load_workflow_file(
             return
         wf_handler = getattr(mod, "handler", None)
 
-        # Auto-generate handler from PROMPT + SLACK_CHANNEL exports
+        # Auto-generate handler from PROMPT + (SLACK_CHANNEL | DELIVERY) exports
         if not callable(wf_handler):
             prompt_val = getattr(mod, "PROMPT", None)
             if not isinstance(prompt_val, str) or not prompt_val.strip():
@@ -1443,16 +1461,48 @@ def _load_workflow_file(
                 )
                 return
             channel_val = getattr(mod, "SLACK_CHANNEL", None)
+            delivery_val = getattr(mod, "DELIVERY", None)
+            if not isinstance(delivery_val, dict):
+                delivery_val = None
 
             async def _auto_handler(
                 inp: Any, ctx: WorkflowContext,
-                _prompt: str = prompt_val, _channel: str | None = channel_val,
+                _prompt: str = prompt_val,
+                _channel: str | None = channel_val,
+                _delivery: dict[str, Any] | None = delivery_val,
             ) -> dict[str, Any]:
                 result = await ctx.agent_turn(_prompt)
                 text = result.get("result_text", "")
-                channel = (inp.get("slack_channel") if isinstance(inp, dict) else None) or _channel
+                inp_delivery = (
+                    inp.get("delivery") if isinstance(inp, dict) else None
+                ) or {}
+                inp_slack_channel = (
+                    inp.get("slack_channel") if isinstance(inp, dict) else None
+                )
+                platform_name = (
+                    inp_delivery.get("platform")
+                    or (_delivery.get("platform") if _delivery else None)
+                    or "slack"
+                )
+                channel = (
+                    inp_delivery.get("channel")
+                    or (_delivery.get("channel") if _delivery else None)
+                    or inp_slack_channel
+                    or _channel
+                )
+                thread_id = (
+                    inp_delivery.get("thread_ts")
+                    or inp_delivery.get("thread_id")
+                    or (
+                        _delivery.get("thread_ts") or _delivery.get("thread_id")
+                        if _delivery
+                        else None
+                    )
+                )
                 if text and channel:
-                    await ctx.post_to_slack(channel, text)
+                    await ctx.post_to_channel(
+                        platform_name, channel, text, thread_id=thread_id,
+                    )
                 return result
 
             wf_handler = _auto_handler
@@ -1473,15 +1523,33 @@ def _load_workflow_file(
             slack_ch = getattr(mod, "SLACK_CHANNEL", None)
             if isinstance(slack_ch, str) and slack_ch.strip():
                 schedule.setdefault("slack_channel", slack_ch.strip())
+            mod_delivery = getattr(mod, "DELIVERY", None)
+            if (
+                isinstance(mod_delivery, dict)
+                and mod_delivery.get("platform")
+                and mod_delivery.get("channel")
+            ):
+                schedule.setdefault("delivery", dict(mod_delivery))
         version = hashlib.sha256(py_file.read_bytes()).hexdigest()
-        _WORKFLOW_HANDLERS[wf_name] = _RegisteredHandler(
+        registered = _RegisteredHandler(
             handler=wf_handler,
             input_cls=input_cls,
             source_path=str(py_file),
             version=version,
             schedule=schedule,
         )
+        _WORKFLOW_HANDLERS[wf_name] = registered
         discovered[wf_name] = str(py_file)
+        # Register any aliases this workflow module declares (for renames
+        # where the old name must keep resolving to the new handler).
+        aliases = getattr(mod, "WORKFLOW_ALIASES", ()) or ()
+        if isinstance(aliases, str):
+            aliases = (aliases,)
+        for alias in aliases:
+            if not isinstance(alias, str) or not alias.strip() or alias == wf_name:
+                continue
+            _WORKFLOW_HANDLERS[alias] = registered
+            discovered[alias] = str(py_file)
     except Exception:
         log.warning("workflow_handler_load_failed", file=str(py_file), exc_info=True)
 
@@ -1637,14 +1705,22 @@ def _registered_schedule_specs() -> list[ScheduleSpec]:
 
         if thread_key:
             input_json["thread_key"] = thread_key
-            # Auto-derive Slack delivery from thread_key
+            # Auto-derive delivery from thread_key. Default platform is slack
+            # to preserve back-compat; future platforms can use their own
+            # ``<platform>:...`` thread_key prefix and the resolver below picks
+            # the right shape.
             if "delivery" not in input_json:
                 try:
                     channel, thread_ts = _split_thread_key(thread_key)
+                    derived_platform = (
+                        thread_key.split(":", 1)[0]
+                        if ":" in thread_key
+                        else "slack"
+                    )
                     input_json["delivery"] = {
                         "channel": channel,
                         "thread_ts": thread_ts,
-                        "platform": "slack",
+                        "platform": derived_platform,
                     }
                 except ControlPlaneError:
                     log.warning(
@@ -1653,7 +1729,17 @@ def _registered_schedule_specs() -> list[ScheduleSpec]:
                         thread_key=thread_key,
                     )
 
-        # slack_channel: use channel name for delivery (no thread_ts)
+        # Schedule-declared explicit delivery (any platform).
+        sched_delivery = sched.get("delivery")
+        if (
+            isinstance(sched_delivery, dict)
+            and sched_delivery.get("platform")
+            and sched_delivery.get("channel")
+            and "delivery" not in input_json
+        ):
+            input_json["delivery"] = dict(sched_delivery)
+
+        # slack_channel: back-compat shorthand for slack channel delivery.
         if slack_channel and "delivery" not in input_json:
             input_json["delivery"] = {
                 "channel": slack_channel,
@@ -1752,7 +1838,10 @@ def _workflow_request_hash(
     workflow_name: str, run_input: dict[str, Any],
 ) -> str:
     hash_input = dict(run_input)
-    if workflow_name == "slack_thread_turn":
+    # messaging_thread_turn (and its legacy alias slack_thread_turn) drops
+    # history_messages from the request hash so backfill differences don't
+    # break idempotency.
+    if workflow_name in {"messaging_thread_turn", "slack_thread_turn"}:
         hash_input.pop("history_messages", None)
     return request_hash(
         {"workflow_name": workflow_name, "input": hash_input},

@@ -1363,6 +1363,8 @@ async def test_worker_sends_final_result_when_live_slack_only_streamed_placehold
     session_text_mock = AsyncMock()
     session_done_mock = AsyncMock()
     backend = SimpleNamespace(attach=AsyncMock(), close_streams=AsyncMock())
+    from api.platforms.slack import SLACK_PLATFORM
+
     with (
         patch("api.runtime_control.get_or_spawn", new=AsyncMock(return_value=session)),
         patch(
@@ -1377,16 +1379,19 @@ async def test_worker_sends_final_result_when_live_slack_only_streamed_placehold
             return_value=SimpleNamespace(turn_counter=1),
         ),
         patch("api.runtime_control._stream_stdout", _blank_placeholder_stream),
-        patch(
-            "api.runtime_control.slackbot_client.harness_event",
+        patch.object(
+            SLACK_PLATFORM,
+            "harness_event",
             new=AsyncMock(side_effect=_live_delivery_ack_without_answer_text),
         ),
-        patch(
-            "api.runtime_control.slackbot_client.session_text",
+        patch.object(
+            SLACK_PLATFORM,
+            "session_text",
             new=session_text_mock,
         ),
-        patch(
-            "api.runtime_control.slackbot_client.session_done",
+        patch.object(
+            SLACK_PLATFORM,
+            "session_done",
             new=session_done_mock,
         ),
     ):

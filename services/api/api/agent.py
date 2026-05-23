@@ -18,7 +18,6 @@ import asyncio
 import contextlib
 import json
 import os
-import re
 import time
 import uuid
 from collections.abc import AsyncIterator
@@ -41,15 +40,12 @@ from api.trace_context import get_or_create_thread_trace_id
 
 log = structlog.get_logger()
 
-_GITHUB_HANDLE_RE = re.compile(r"^[A-Za-z0-9](?:[A-Za-z0-9-]{0,37}[A-Za-z0-9])?$")
-_GITHUB_URL_RE = re.compile(
-    r"(?:https?://)?github\.com/([A-Za-z0-9](?:[A-Za-z0-9-]{0,37}[A-Za-z0-9])?)",
-    re.IGNORECASE,
-)
-_GITHUB_LABEL_RE = re.compile(r"\bgithub\b", re.IGNORECASE)
-_GITHUB_PREFIX_RE = re.compile(
-    r"\bgithub\b\s*(?:username|user|handle|profile)?\s*[:/@-]?\s*@?([A-Za-z0-9][A-Za-z0-9-]{0,38})",
-    re.IGNORECASE,
+# Slack profile → GitHub handle extraction lives on the SlackPlatform; we
+# keep the legacy module-level name as a re-export so the existing test
+# (`from api.agent import _extract_github_handle_from_slack_profile`) and
+# any other call sites keep working until they migrate.
+from api.platforms.slack import (  # noqa: E402, F401
+    extract_github_handle_from_slack_profile as _extract_github_handle_from_slack_profile,
 )
 
 _VALID_STDOUT_EVENT_TYPES = frozenset(
@@ -562,130 +558,21 @@ async def _get_latest_thread_user_id(thread_key: str) -> str | None:
     return str(user_id).strip() or None
 
 
-def _valid_github_handle(value: str) -> str | None:
-    candidate = value.strip().strip("@").strip()
-    candidate = candidate.rstrip("/").split("/", 1)[0]
-    return candidate if _GITHUB_HANDLE_RE.match(candidate) else None
-
-
-def _extract_github_handle_from_slack_profile(
-    profile: dict[str, Any],
-) -> tuple[str | None, str | None, str]:
-    """Return (handle, source, unavailable_reason) from Slack profile fields."""
-    custom_fields = profile.get("custom_fields")
-    if not isinstance(custom_fields, dict) or not custom_fields:
-        return None, None, "no GitHub custom field found on Slack profile"
-
-    saw_github_field = False
-    for label, raw_value in custom_fields.items():
-        label_text = str(label or "").strip()
-        value = str(raw_value or "").strip()
-        if not value:
-            continue
-
-        label_mentions_github = bool(_GITHUB_LABEL_RE.search(label_text))
-        value_mentions_github = bool(_GITHUB_LABEL_RE.search(value))
-        if not label_mentions_github and not value_mentions_github:
-            continue
-        saw_github_field = True
-
-        source = (
-            f'Slack profile custom field "{label_text}"'
-            if label_text
-            else "Slack profile custom field"
-        )
-        url_match = _GITHUB_URL_RE.search(value)
-        if url_match:
-            handle = _valid_github_handle(url_match.group(1))
-            if handle:
-                return f"@{handle}", source, ""
-
-        prefixed_match = _GITHUB_PREFIX_RE.search(value)
-        if prefixed_match:
-            handle = _valid_github_handle(prefixed_match.group(1))
-            if handle:
-                return f"@{handle}", source, ""
-
-        if label_mentions_github:
-            handle = _valid_github_handle(value)
-            if handle:
-                return f"@{handle}", source, ""
-
-    if saw_github_field:
-        return (
-            None,
-            None,
-            "GitHub profile field did not contain a valid GitHub handle",
-        )
-    return None, None, "no GitHub custom field found on Slack profile"
-
-
 async def _resolve_requester_identity(
     *,
     platform: str | None,
     user_id: str | None,
 ) -> dict[str, str | bool] | None:
-    if not user_id or (platform or "").lower() != "slack":
+    """Delegate to the registered messaging platform.
+
+    Slack pulls GitHub handles from profile custom fields; other platforms
+    return ``None`` until their adapter implements identity recovery.
+    """
+    from api.platforms import resolve_platform
+
+    if not user_id:
         return None
-
-    identity: dict[str, str | bool] = {
-        "slack_user_id": user_id,
-        "slack_mention": f"<@{user_id}>",
-    }
-    try:
-        from api.app import get_tool_manager
-
-        profile = await get_tool_manager().call_tool_raw(
-            "slack", "get_user_profile", {"user_id": user_id}
-        )
-    except Exception as exc:
-        log.warning(
-            "requester_identity_lookup_failed",
-            platform=platform,
-            user_id=user_id,
-            error=str(exc),
-        )
-        identity.update(
-            {
-                "github_handle_verified": False,
-                "github_handle_unavailable_reason": "Slack profile could not be fetched",
-            }
-        )
-        return identity
-
-    if not isinstance(profile, dict) or profile.get("error"):
-        error = str(profile.get("error") or "Slack profile could not be fetched")
-        log.warning(
-            "requester_identity_lookup_failed",
-            platform=platform,
-            user_id=user_id,
-            error=error,
-        )
-        identity.update(
-            {
-                "github_handle_verified": False,
-                "github_handle_unavailable_reason": "Slack profile could not be fetched",
-            }
-        )
-        return identity
-
-    handle, source, reason = _extract_github_handle_from_slack_profile(profile)
-    if handle:
-        identity.update(
-            {
-                "github_handle": handle,
-                "github_handle_source": source or "Slack profile custom field",
-                "github_handle_verified": True,
-            }
-        )
-    else:
-        identity.update(
-            {
-                "github_handle_verified": False,
-                "github_handle_unavailable_reason": reason,
-            }
-        )
-    return identity
+    return await resolve_platform(platform).load_requester_identity(user_id)
 
 
 async def _insert_system_message(
@@ -933,10 +820,12 @@ def _build_session_context(
 ) -> str:
     """Build session context to append to the system prompt.
 
-    Contains metadata (time, thread, platform) and platform-specific formatting
-    rules so the agent produces output suitable for the target platform.
+    Contains metadata (time, thread, platform) plus identity + formatting
+    rules contributed by the registered messaging platform.
     """
     from datetime import datetime, timezone
+
+    from api.platforms import resolve_platform
 
     now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
     lines = [
@@ -948,55 +837,9 @@ def _build_session_context(
     if platform:
         lines.append(f"- **Platform**: {platform}")
 
-    if requester_identity:
-        lines.extend(
-            [
-                "",
-                "## Requester Identity",
-                "",
-                f"- Slack user ID: {requester_identity['slack_user_id']}",
-                f"- Slack mention: {requester_identity['slack_mention']}",
-            ]
-        )
-        if requester_identity.get("github_handle_verified"):
-            lines.extend(
-                [
-                    "- GitHub handle from Slack profile: "
-                    f"{requester_identity['github_handle']}",
-                    "- GitHub handle source: "
-                    f"{requester_identity['github_handle_source']}",
-                    "- GitHub handle verified: yes",
-                ]
-            )
-        else:
-            lines.extend(
-                [
-                    "- GitHub handle from Slack profile: unavailable",
-                    "- GitHub handle unavailable reason: "
-                    f"{requester_identity['github_handle_unavailable_reason']}",
-                    "- GitHub handle verified: no",
-                ]
-            )
-
-    if platform and platform.lower() == "slack":
-        lines.extend(
-            [
-                "",
-                "## Slack Formatting Rules",
-                "",
-                "- Use standard markdown links `[Display Text](URL)` for hyperlinks",
-                "- Do NOT use Slack-native `<URL|text>` link syntax",
-                "- Preserve Slack user mentions (`<@UXXXXXXX>`) exactly as-is — only use these for actual Slack users",
-                "- For Twitter/X handles, link to the profile WITHOUT an @ prefix in the display text: `[handle](https://x.com/handle)` (NOT `[@handle](...)`)",
-                "- Prefer concise, well-structured markdown; long replies may be split across multiple Slack messages",
-                "- Markdown tables are allowed and may render as native Slack tables when the structure is clean",
-                "- NEVER put links/URLs inside code blocks (``` ```) — they won't be clickable. Use markdown tables or plain text with `[text](url)` links instead",
-            ]
-        )
-        if user_id:
-            lines.append(
-                f"- After completing a long task, tag the requester with their real Slack mention: <@{user_id}>"
-            )
+    platform_impl = resolve_platform(platform)
+    lines.extend(platform_impl.system_prompt_identity_lines(requester_identity))
+    lines.extend(platform_impl.system_prompt_rules(user_id=user_id))
 
     lines.extend(["", "---", ""])
     return "\n".join(lines)

@@ -1,4 +1,12 @@
-"""Workflow: single agent turn in a Slack thread."""
+"""Workflow: single agent turn in a messaging-platform thread.
+
+This handler is platform-agnostic — the delivery dict it receives carries
+``platform``/``channel``/``thread_ts`` for any registered messaging
+platform (Slack today, others later). The canonical workflow name is
+``messaging_thread_turn``; the legacy name ``slack_thread_turn`` is kept
+as an alias so existing clients (the slackbot) keep working until they
+migrate.
+"""
 
 from __future__ import annotations
 
@@ -10,7 +18,8 @@ from typing import Any
 from api.runtime_control import ControlPlaneError
 from api.workflow_engine import Delivery, WorkflowContext
 
-WORKFLOW_NAME = "slack_thread_turn"
+WORKFLOW_NAME = "messaging_thread_turn"
+WORKFLOW_ALIASES = ("slack_thread_turn",)
 
 _EXECUTION_HARNESSES = frozenset({"amp", "claude-code", "codex", "pi-mono"})
 _PROMPT_FLAG_ALIASES = {
@@ -469,7 +478,7 @@ async def handler(inp: Input, ctx: WorkflowContext) -> dict[str, Any]:
     if not thread_key:
         raise ControlPlaneError(
             "INVALID_WORKFLOW_INPUT",
-            "slack_thread_turn requires thread_key",
+            "messaging_thread_turn requires thread_key",
             422,
         )
 

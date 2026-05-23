@@ -23,7 +23,7 @@ from api.agent import (
     steer_stdin,
     stop_session,
 )
-from api import slackbot_client
+from api.platforms import resolve_for_delivery
 from api.observability import (
     ExecutionObservationAccumulator,
     extract_usage_metrics,
@@ -975,97 +975,12 @@ async def _mark_slackbot_live_delivery_failed(
     )
 
 
-def _canonical_text_blocks(event: dict[str, Any]) -> list[str]:
-    if event.get("type") == "assistant":
-        message = event.get("message") if isinstance(event.get("message"), dict) else {}
-        content = (
-            message.get("content") if isinstance(message.get("content"), list) else []
-        )
-        return [
-            str(block.get("text") or "")
-            for block in content
-            if isinstance(block, dict)
-            and block.get("type") == "text"
-            and str(block.get("text") or "").strip()
-        ]
-    if event.get("type") == "result":
-        text = str(event.get("result") or event.get("text") or "")
-        return [text] if text.strip() else []
-    return []
-
-
 def _slackbot_streamed_answer_chars(value: Any) -> int:
     if isinstance(value, bool):
         return 0
     if isinstance(value, int):
         return max(value, 0)
     return 0
-
-
-async def _send_slackbot_canonical_event(
-    session_id: str, event: dict[str, Any]
-) -> bool:
-    sent_text = False
-    for text in _canonical_text_blocks(event):
-        await slackbot_client.session_text(
-            session_id,
-            _clip_slackbot(text, _MAX_SLACKBOT_TEXT_CHARS),
-        )
-        sent_text = True
-
-    event_type = str(event.get("type") or "")
-    if event_type == "assistant":
-        message = event.get("message") if isinstance(event.get("message"), dict) else {}
-        content = (
-            message.get("content") if isinstance(message.get("content"), list) else []
-        )
-        for block in content:
-            if not isinstance(block, dict) or block.get("type") != "tool_use":
-                continue
-            tool_id = str(block.get("id") or uuid.uuid4())
-            tool_name = str(block.get("name") or "Tool")
-            tool_input = (
-                block.get("input") if isinstance(block.get("input"), dict) else {}
-            )
-            await slackbot_client.session_step(
-                session_id,
-                step_id=tool_id,
-                title=tool_name,
-                status="in_progress",
-                details=_clip_slackbot(tool_input),
-            )
-    elif event_type == "tool":
-        content = event.get("content") if isinstance(event.get("content"), list) else []
-        for block in content:
-            if not isinstance(block, dict):
-                continue
-            tool_id = str(block.get("tool_use_id") or uuid.uuid4())
-            is_error = bool(block.get("is_error"))
-            await slackbot_client.session_step(
-                session_id,
-                step_id=tool_id,
-                title="Tool result",
-                status="error" if is_error else "complete",
-                output=_clip_slackbot(block.get("content")),
-            )
-    elif event_type == "command_execution":
-        command = str(event.get("command") or "Command")
-        await slackbot_client.session_step(
-            session_id,
-            step_id=f"command-{hashlib.sha256(command.encode()).hexdigest()[:12]}",
-            title=command[:256],
-            status="complete" if event.get("status") == "completed" else "in_progress",
-            output=_clip_slackbot(event.get("aggregated_output") or ""),
-        )
-    elif event_type == "error":
-        await slackbot_client.session_step(
-            session_id,
-            step_id=f"error-{uuid.uuid4().hex[:12]}",
-            title="Execution error",
-            status="error",
-            output=_clip_slackbot(event.get("error") or event),
-        )
-    return sent_text
 
 
 async def append_execution_event(
@@ -2331,6 +2246,7 @@ async def _process_execution_impl(pool, row: dict[str, Any]) -> None:
     assignment_generation = int(row["assignment_generation"])
     execution_status = str(row.get("status") or "running")
     delivery = decode_jsonb(row.get("delivery"), {})
+    platform = resolve_for_delivery(delivery)
     execution_metadata = decode_jsonb(row.get("metadata"), {})
     if not isinstance(execution_metadata, dict):
         execution_metadata = {}
@@ -2594,7 +2510,7 @@ async def _process_execution_impl(pool, row: dict[str, Any]) -> None:
         if finalize_session_id and not slackbot_done and slackbot_forward_live:
             try:
                 terminal_result_sent_to_slackbot = False
-                await slackbot_client.session_done(
+                await platform.session_done(
                     finalize_session_id, harness_thread_id or None
                 )
                 slackbot_done = True
@@ -2760,7 +2676,7 @@ async def _process_execution_impl(pool, row: dict[str, Any]) -> None:
                         slack_event.setdefault(
                             "centaur_assignment_generation", assignment_generation
                         )
-                    harness_result = await slackbot_client.harness_event(
+                    harness_result = await platform.harness_event(
                         slackbot_session_id, slack_event
                     )
                     if harness_result is None:
@@ -2789,7 +2705,7 @@ async def _process_execution_impl(pool, row: dict[str, Any]) -> None:
                                 streamed_answer_chars=slackbot_streamed_answer_chars,
                             )
                             with contextlib.suppress(Exception):
-                                await slackbot_client.set_status(delivery, "")
+                                await platform.assistant_status(delivery, "")
                             slackbot_forward_live = False
                         break
                     if isinstance(harness_result, dict):

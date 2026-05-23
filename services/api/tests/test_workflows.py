@@ -1392,13 +1392,16 @@ async def test_agent_turn_opens_slack_session_after_spawn_with_resolved_header(
         return_value={"ok": True, "execution_id": "exe-resolved", "status": "queued"},
     )
 
+    from api.platforms.slack import SLACK_PLATFORM
+
     with (
         patch(
             "api.workflow_engine.spawn_assignment",
             new=AsyncMock(side_effect=spawn_after_recording),
         ),
-        patch(
-            "api.workflow_engine.slackbot_client.open_agent_session",
+        patch.object(
+            SLACK_PLATFORM,
+            "open_live_session",
             new=AsyncMock(side_effect=open_after_spawn),
         ) as open_session_mock,
         patch("api.workflow_engine.append_message", new=append_message_mock),
@@ -1450,21 +1453,26 @@ async def test_agent_turn_spawn_failure_opens_unresolved_failure_session(db_pool
     append_message_mock = AsyncMock()
     enqueue_execution_mock = AsyncMock()
 
+    from api.platforms.slack import SLACK_PLATFORM
+
     with (
         patch(
             "api.workflow_engine.spawn_assignment",
             new=AsyncMock(side_effect=RuntimeError("spawn unavailable")),
         ),
-        patch(
-            "api.workflow_engine.slackbot_client.open_agent_session",
+        patch.object(
+            SLACK_PLATFORM,
+            "open_live_session",
             new=AsyncMock(return_value="sess-failed"),
         ) as open_session_mock,
-        patch(
-            "api.workflow_engine.slackbot_client.session_text",
+        patch.object(
+            SLACK_PLATFORM,
+            "session_text",
             new=AsyncMock(),
         ) as session_text_mock,
-        patch(
-            "api.workflow_engine.slackbot_client.session_done",
+        patch.object(
+            SLACK_PLATFORM,
+            "session_done",
             new=AsyncMock(),
         ) as session_done_mock,
         patch("api.workflow_engine.append_message", new=append_message_mock),

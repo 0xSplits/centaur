@@ -1,10 +1,11 @@
-"""Tests for Slack egress sanitization in slackbot_client."""
+"""Tests for Slack egress sanitization."""
 
 from __future__ import annotations
 
 import pytest
 
 from api import slackbot_client
+from api.platforms import slack as _platform_slack
 
 
 @pytest.fixture
@@ -15,7 +16,9 @@ def posted(monkeypatch):
         calls.append((path, body))
         return {"ok": True}
 
-    monkeypatch.setattr(slackbot_client, "post", fake_post)
+    # SLACK_PLATFORM methods call platforms.slack.slackbot_post directly;
+    # patch the platform-side reference, not the shim alias.
+    monkeypatch.setattr(_platform_slack, "slackbot_post", fake_post)
     return calls
 
 

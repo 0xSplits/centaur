@@ -21,7 +21,7 @@ def _no_sleep(monkeypatch):
     async def _instant(_s: float) -> None:
         return None
 
-    monkeypatch.setattr("api.slackbot_client.asyncio.sleep", _instant)
+    monkeypatch.setattr("api.platforms.slack.asyncio.sleep", _instant)
 
 
 def _response(status: int, body: dict[str, Any] | None = None) -> httpx.Response:
@@ -50,7 +50,7 @@ class _FakeClient:
 @pytest.mark.asyncio
 async def test_post_retries_on_5xx_then_returns_payload():
     fake = _FakeClient([_response(502), _response(503), _response(200, {"ok": True})])
-    with patch("api.slackbot_client.httpx.AsyncClient", return_value=fake):
+    with patch("api.platforms.slack.httpx.AsyncClient", return_value=fake):
         from api import slackbot_client
 
         result = await slackbot_client.post(
@@ -65,7 +65,7 @@ async def test_post_retries_on_5xx_then_returns_payload():
 @pytest.mark.parametrize("status", [408, 429])
 async def test_post_retries_on_retryable_4xx(status: int):
     fake = _FakeClient([_response(status), _response(200, {"ok": True})])
-    with patch("api.slackbot_client.httpx.AsyncClient", return_value=fake):
+    with patch("api.platforms.slack.httpx.AsyncClient", return_value=fake):
         from api import slackbot_client
 
         result = await slackbot_client.post("/api/slack/agent-sessions/sess/done", {})
@@ -78,7 +78,7 @@ async def test_post_retries_on_retryable_4xx(status: int):
 @pytest.mark.parametrize("status", [400, 403, 404])
 async def test_post_does_not_retry_on_permanent_4xx(status: int):
     fake = _FakeClient([_response(status, {"error": "bad"})])
-    with patch("api.slackbot_client.httpx.AsyncClient", return_value=fake):
+    with patch("api.platforms.slack.httpx.AsyncClient", return_value=fake):
         from api import slackbot_client
 
         result = await slackbot_client.post("/api/slack/agent-sessions/sess/done", {})
@@ -90,7 +90,7 @@ async def test_post_does_not_retry_on_permanent_4xx(status: int):
 @pytest.mark.asyncio
 async def test_post_returns_none_after_exhausting_retries():
     fake = _FakeClient([_response(502), _response(502), _response(502)])
-    with patch("api.slackbot_client.httpx.AsyncClient", return_value=fake):
+    with patch("api.platforms.slack.httpx.AsyncClient", return_value=fake):
         from api import slackbot_client
 
         result = await slackbot_client.post(

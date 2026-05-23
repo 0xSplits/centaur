@@ -55,6 +55,39 @@ log = structlog.get_logger()
 
 FINAL_DELIVERY_MAX_ATTEMPTS = int(os.getenv("FINAL_DELIVERY_MAX_ATTEMPTS", "50"))
 
+
+def _resolve_delivery_fallback(
+    body_delivery: dict[str, Any] | None,
+    body_platform: str | None,
+    body_user_id: str | None,
+    *,
+    endpoint: str,
+    default_platform: str,
+    default_channel: str,
+) -> dict[str, Any]:
+    """Resolve the delivery dict for an execute/auto-execute call.
+
+    Explicit ``body.delivery`` wins. Otherwise we build a minimal delivery
+    from ``body.platform`` (or the endpoint-specific default) and log a
+    deprecation note when the caller relied on the fallback so we can flush
+    the implicit defaults in a later release.
+    """
+    if isinstance(body_delivery, dict) and body_delivery:
+        return body_delivery
+    platform = (body_platform or "").strip() or default_platform
+    if not body_platform:
+        log.info(
+            "execute_delivery_fallback",
+            endpoint=endpoint,
+            platform=platform,
+            reason="caller omitted both delivery and platform",
+        )
+    return {
+        "channel": default_channel,
+        "platform": platform,
+        "recipient_user_id": body_user_id,
+    }
+
 router = APIRouter(
     prefix="/agent",
     tags=["agent"],
@@ -270,11 +303,14 @@ async def execute(request: Request):
             return _json_error(exc.code, exc.message, exc.status_code)
 
     execute_id = body.execute_id or f"exec-{uuid.uuid4().hex[:16]}"
-    delivery = body.delivery or {
-        "channel": "slack",
-        "platform": body.platform or "slack",
-        "recipient_user_id": body.user_id,
-    }
+    delivery = _resolve_delivery_fallback(
+        body.delivery,
+        body.platform,
+        body.user_id,
+        endpoint="execute",
+        default_platform="slack",
+        default_channel="slack",
+    )
     metadata = body.metadata or {}
     if body.user_id:
         metadata = {**metadata, "user_id": body.user_id}
@@ -339,11 +375,14 @@ async def _auto_execute(pool, body: ExecuteRequest) -> JSONResponse:
 
     # 3. Execute
     execute_id = body.execute_id or f"exec-{nonce}"
-    delivery = body.delivery or {
-        "channel": "dev",
-        "platform": body.platform or "dev",
-        "recipient_user_id": body.user_id,
-    }
+    delivery = _resolve_delivery_fallback(
+        body.delivery,
+        body.platform,
+        body.user_id,
+        endpoint="execute_auto",
+        default_platform="dev",
+        default_channel="dev",
+    )
 
     result = await enqueue_execution(
         pool,
