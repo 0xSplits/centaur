@@ -1362,6 +1362,9 @@ class _RegisteredHandler:
     source_path: str
     version: str
     schedule: dict[str, Any] | None = None  # Optional SCHEDULE export
+    # Input keys to drop from the request-hash so they don't affect
+    # idempotency (e.g. ``history_messages`` for messaging_thread_turn).
+    hash_ignored_input_keys: tuple[str, ...] = ()
 
 
 # Maps workflow_name → registered handler + optional input class
@@ -1531,12 +1534,19 @@ def _load_workflow_file(
             ):
                 schedule.setdefault("delivery", dict(mod_delivery))
         version = hashlib.sha256(py_file.read_bytes()).hexdigest()
+        raw_hash_ignored = getattr(mod, "HASH_IGNORED_INPUT_KEYS", ()) or ()
+        if isinstance(raw_hash_ignored, str):
+            raw_hash_ignored = (raw_hash_ignored,)
+        hash_ignored_input_keys = tuple(
+            str(key) for key in raw_hash_ignored if isinstance(key, str) and key
+        )
         registered = _RegisteredHandler(
             handler=wf_handler,
             input_cls=input_cls,
             source_path=str(py_file),
             version=version,
             schedule=schedule,
+            hash_ignored_input_keys=hash_ignored_input_keys,
         )
         _WORKFLOW_HANDLERS[wf_name] = registered
         discovered[wf_name] = str(py_file)
@@ -1845,11 +1855,13 @@ def _workflow_request_hash(
     workflow_name: str, run_input: dict[str, Any],
 ) -> str:
     hash_input = dict(run_input)
-    # messaging_thread_turn (and its legacy alias slack_thread_turn) drops
-    # history_messages from the request hash so backfill differences don't
-    # break idempotency.
-    if workflow_name in {"messaging_thread_turn", "slack_thread_turn"}:
-        hash_input.pop("history_messages", None)
+    # Workflows may declare ``HASH_IGNORED_INPUT_KEYS`` to drop selected
+    # input fields from the request hash (e.g. backfill payloads that
+    # shouldn't affect idempotency).
+    registered = _WORKFLOW_HANDLERS.get(workflow_name)
+    if registered is not None:
+        for key in registered.hash_ignored_input_keys:
+            hash_input.pop(key, None)
     return request_hash(
         {"workflow_name": workflow_name, "input": hash_input},
     )

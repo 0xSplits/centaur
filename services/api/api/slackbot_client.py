@@ -1,15 +1,16 @@
-"""Compatibility shim. The implementation moved to ``api.platforms.slack``;
+"""Compatibility shim. The implementation lives in ``api.platforms.slack``;
 this module re-exports the module-level helpers and delegates the async
 session helpers to the registered ``SlackPlatform`` singleton so existing
 ``from api import slackbot_client`` callers keep working.
 
-Phase 1 callers should resolve a platform via
+New callers should resolve a platform via
 ``api.platforms.resolve_for_delivery(delivery)`` and call methods on it
-directly. This shim will be removed once those migrations land.
+directly. This shim is scheduled for removal in a future cleanup PR.
 """
 
 from __future__ import annotations
 
+import warnings
 from typing import Any
 
 from api.platforms.slack import (
@@ -22,6 +23,13 @@ from api.platforms.slack import (
     sanitize_slack_event,
     slackbot_post as post,
     thread_ts,
+)
+
+warnings.warn(
+    "api.slackbot_client is a back-compat shim; resolve a platform via "
+    "api.platforms.resolve_for_delivery and call methods on it directly.",
+    DeprecationWarning,
+    stacklevel=2,
 )
 
 __all__ = [

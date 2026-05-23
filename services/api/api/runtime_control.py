@@ -52,8 +52,12 @@ from api.trace_context import get_or_create_thread_trace_id
 
 log = structlog.get_logger()
 
+# Canonical key written by current slackbot deploys.
 _SLACKBOT_LIVE_DELIVERY_METADATA_KEY = "slackbot_live_delivery"
-_LEGACY_SLACKBOT_LIVE_DELIVERY_METADATA_KEY = "slackbot" + "_v" + "2_live_delivery"
+# Legacy spelling that pre-dated the rename to ``slackbot_live_delivery``.
+# In-flight executions may still carry this value; we read both spellings
+# but never write the legacy one.
+_LEGACY_SLACKBOT_LIVE_DELIVERY_METADATA_KEY = "slackbot_v2_live_delivery"
 
 EXECUTION_SILENCE_TIMEOUT_S = int(os.getenv("EXECUTION_SILENCE_TIMEOUT_S", "600"))
 EXECUTION_TOOL_SILENCE_TIMEOUT_S = int(
@@ -916,6 +920,9 @@ async def get_live_session_id_for_thread(pool, thread_key: str) -> str | None:
     tool call into the live session without coupling themselves to the
     ``agent_execution_requests`` schema.
     """
+    # Read both the canonical ``slackbot_live_delivery`` and the legacy
+    # ``slackbot_v2_live_delivery`` key so in-flight executions written
+    # before the rename are still routable.
     session_id = await pool.fetchval(
         "SELECT metadata->>'slackbot_agent_session_id' "
         "FROM agent_execution_requests "
@@ -923,7 +930,7 @@ async def get_live_session_id_for_thread(pool, thread_key: str) -> str | None:
         "AND status = 'running' "
         "AND ("
         "  metadata->>'slackbot_live_delivery' = 'true' "
-        "  OR metadata->>('slackbot' || '_v' || '2_live_delivery') = 'true'"
+        "  OR metadata->>'slackbot_v2_live_delivery' = 'true'"
         ") "
         "AND COALESCE(metadata->>'slackbot_agent_session_id', '') <> '' "
         "ORDER BY started_at DESC NULLS LAST, created_at DESC LIMIT 1",

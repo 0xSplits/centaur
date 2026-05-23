@@ -2,10 +2,9 @@
 system-prompt injection, live-streaming session, and active-thread
 ``slack.send_message`` capture.
 
-Everything Slack-specific lives here. The thin shims at
+Everything Slack-specific lives here. Thin shims at
 ``api/slack_sanitize.py`` and ``api/slackbot_client.py`` re-export the
-module-level helpers so existing callsites keep working during the
-Phase 0 → Phase 1 transition.
+public surface for back-compat with older callers.
 """
 
 from __future__ import annotations
@@ -264,8 +263,10 @@ _GITHUB_PREFIX_RE = re.compile(
 
 
 def _valid_github_handle(value: str) -> str | None:
-    candidate = value.strip().strip("@").strip()
-    candidate = candidate.rstrip("/").split("/", 1)[0]
+    # Accept inputs like " @octocat ", "@octocat/repo", or "octocat/" by
+    # stripping surrounding whitespace + leading ``@`` and lopping off
+    # any trailing path segment before pattern matching.
+    candidate = value.strip("@ \t\n").rstrip("/").split("/", 1)[0]
     return candidate if _GITHUB_HANDLE_RE.match(candidate) else None
 
 
@@ -328,9 +329,22 @@ _SLACK_ID_MENTION_RE = re.compile(
 )
 
 
-# ── Live tool-call capture predicate ──────────────────────────────────
+# ── Slack channel-ID shape, used inside match_active_thread_capture ───
 
 _SLACK_CHANNEL_ID_RE = re.compile(r"^[CDG][A-Z0-9]+$")
+
+
+# ── Slack-flavoured system-prompt formatting rules ────────────────────
+
+_SLACK_FORMATTING_RULES: tuple[str, ...] = (
+    "- Use standard markdown links `[Display Text](URL)` for hyperlinks",
+    "- Do NOT use Slack-native `<URL|text>` link syntax",
+    "- Preserve Slack user mentions (`<@UXXXXXXX>`) exactly as-is — only use these for actual Slack users",
+    "- For Twitter/X handles, link to the profile WITHOUT an @ prefix in the display text: `[handle](https://x.com/handle)` (NOT `[@handle](...)`)",
+    "- Prefer concise, well-structured markdown; long replies may be split across multiple Slack messages",
+    "- Markdown tables are allowed and may render as native Slack tables when the structure is clean",
+    "- NEVER put links/URLs inside code blocks (``` ```) — they won't be clickable. Use markdown tables or plain text with `[text](url)` links instead",
+)
 
 
 # ── Platform implementation ───────────────────────────────────────────
@@ -445,18 +459,7 @@ class SlackPlatform(MessagingPlatform):
         return lines
 
     def system_prompt_rules(self, *, user_id: str | None = None) -> list[str]:
-        lines = [
-            "",
-            "## Slack Formatting Rules",
-            "",
-            "- Use standard markdown links `[Display Text](URL)` for hyperlinks",
-            "- Do NOT use Slack-native `<URL|text>` link syntax",
-            "- Preserve Slack user mentions (`<@UXXXXXXX>`) exactly as-is — only use these for actual Slack users",
-            "- For Twitter/X handles, link to the profile WITHOUT an @ prefix in the display text: `[handle](https://x.com/handle)` (NOT `[@handle](...)`)",
-            "- Prefer concise, well-structured markdown; long replies may be split across multiple Slack messages",
-            "- Markdown tables are allowed and may render as native Slack tables when the structure is clean",
-            "- NEVER put links/URLs inside code blocks (``` ```) — they won't be clickable. Use markdown tables or plain text with `[text](url)` links instead",
-        ]
+        lines = ["", "## Slack Formatting Rules", "", *_SLACK_FORMATTING_RULES]
         if user_id:
             lines.append(
                 f"- After completing a long task, tag the requester with their real Slack mention: <@{user_id}>"

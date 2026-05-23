@@ -20,6 +20,9 @@ from api.workflow_engine import Delivery, WorkflowContext
 
 WORKFLOW_NAME = "messaging_thread_turn"
 WORKFLOW_ALIASES = ("slack_thread_turn",)
+# Drop history_messages from the request hash so re-fires of the same
+# user turn with different backfill history still hit the idempotency key.
+HASH_IGNORED_INPUT_KEYS = ("history_messages",)
 
 _EXECUTION_HARNESSES = frozenset({"amp", "claude-code", "codex", "pi-mono"})
 _PROMPT_FLAG_ALIASES = {
