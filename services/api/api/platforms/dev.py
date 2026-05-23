@@ -1,13 +1,18 @@
 """Dev platform: no-op everything. Used for localhost-bypass executions
-and unit tests where no real messaging integration is wired up."""
+and unit tests where no real messaging integration is wired up.
+
+Registration happens centrally via
+``api.platforms.register_builtin_platforms``; importing this module
+does not register on its own.
+"""
 
 from __future__ import annotations
 
-from api.platforms import MessagingPlatform, register_platform
+from api.platforms import MessagingPlatform
 
 
 class DevPlatform(MessagingPlatform):
     name = "dev"
 
 
-register_platform(DevPlatform())
+DEV_PLATFORM = DevPlatform()

@@ -1660,10 +1660,17 @@ def _registered_schedule_specs() -> list[ScheduleSpec]:
       that write to DB instead of posting to Slack)
     """
     specs: list[ScheduleSpec] = []
+    # Workflow aliases register the same _RegisteredHandler under multiple
+    # names; iterate canonical handlers once so a scheduled workflow with
+    # aliases doesn't fire its schedule N times per tick.
+    seen_handlers: set[int] = set()
     for wf_name, reg in _WORKFLOW_HANDLERS.items():
         sched = reg.schedule
         if not sched:
             continue
+        if id(reg) in seen_handlers:
+            continue
+        seen_handlers.add(id(reg))
         cron_expr = sched.get("cron")
         interval_s = sched.get("interval_seconds")
         if not cron_expr and not interval_s:

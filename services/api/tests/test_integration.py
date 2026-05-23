@@ -562,18 +562,19 @@ class TestBuildSessionContext:
 
     def test_requester_identity_with_github_handle(self):
         from api.agent import _build_session_context
+        from api.platforms import RequesterIdentity
 
         ctx = _build_session_context(
             "test:1",
             platform="slack",
             user_id="U123",
-            requester_identity={
-                "slack_user_id": "U123",
-                "slack_mention": "<@U123>",
-                "github_handle": "@alice",
-                "github_handle_source": 'Slack profile custom field "GitHub"',
-                "github_handle_verified": True,
-            },
+            requester_identity=RequesterIdentity(
+                user_id="U123",
+                mention="<@U123>",
+                github_handle="@alice",
+                github_handle_source='Slack profile custom field "GitHub"',
+                github_handle_verified=True,
+            ),
         )
 
         assert "Requester Identity" in ctx
@@ -582,19 +583,20 @@ class TestBuildSessionContext:
 
     def test_requester_identity_without_github_handle(self):
         from api.agent import _build_session_context
+        from api.platforms import RequesterIdentity
 
         ctx = _build_session_context(
             "test:1",
             platform="slack",
             user_id="U123",
-            requester_identity={
-                "slack_user_id": "U123",
-                "slack_mention": "<@U123>",
-                "github_handle_verified": False,
-                "github_handle_unavailable_reason": (
+            requester_identity=RequesterIdentity(
+                user_id="U123",
+                mention="<@U123>",
+                github_handle_verified=False,
+                github_handle_unavailable_reason=(
                     "no GitHub custom field found on Slack profile"
                 ),
-            },
+            ),
         )
 
         assert "GitHub handle from Slack profile: unavailable" in ctx
@@ -652,16 +654,18 @@ class TestBuildSessionContext:
             thread_key,
         )
 
+        from api.platforms import RequesterIdentity
+
         async def fake_resolve_requester_identity(*, platform, user_id):
             assert platform == "slack"
             assert user_id == "U123"
-            return {
-                "slack_user_id": user_id,
-                "slack_mention": f"<@{user_id}>",
-                "github_handle": "@alice",
-                "github_handle_source": 'Slack profile custom field "GitHub"',
-                "github_handle_verified": True,
-            }
+            return RequesterIdentity(
+                user_id=user_id,
+                mention=f"<@{user_id}>",
+                github_handle="@alice",
+                github_handle_source='Slack profile custom field "GitHub"',
+                github_handle_verified=True,
+            )
 
         monkeypatch.setattr(
             agent,

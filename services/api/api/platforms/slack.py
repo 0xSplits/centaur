@@ -15,12 +15,13 @@ import json
 import os
 import re
 from collections.abc import Callable
+from dataclasses import replace
 from typing import Any
 
 import httpx
 import structlog
 
-from api.platforms import MessagingPlatform, register_platform
+from api.platforms import MessagingPlatform, RequesterIdentity
 
 log = structlog.get_logger()
 
@@ -335,6 +336,16 @@ _SLACK_CHANNEL_ID_RE = re.compile(r"^[CDG][A-Z0-9]+$")
 # ── Platform implementation ───────────────────────────────────────────
 
 
+def _identity_with_unavailable_reason(
+    base: RequesterIdentity, reason: str
+) -> RequesterIdentity:
+    return replace(
+        base,
+        github_handle_verified=False,
+        github_handle_unavailable_reason=reason,
+    )
+
+
 class SlackPlatform(MessagingPlatform):
     name = "slack"
     mention_prefix_re = _SLACK_ID_MENTION_RE
@@ -359,13 +370,10 @@ class SlackPlatform(MessagingPlatform):
 
     async def load_requester_identity(
         self, user_id: str | None
-    ) -> dict[str, str | bool] | None:
+    ) -> RequesterIdentity | None:
         if not user_id:
             return None
-        identity: dict[str, str | bool] = {
-            "slack_user_id": user_id,
-            "slack_mention": f"<@{user_id}>",
-        }
+        base = RequesterIdentity(user_id=user_id, mention=f"<@{user_id}>")
         try:
             from api.app import get_tool_manager
 
@@ -379,13 +387,9 @@ class SlackPlatform(MessagingPlatform):
                 user_id=user_id,
                 error=str(exc),
             )
-            identity.update(
-                {
-                    "github_handle_verified": False,
-                    "github_handle_unavailable_reason": "Slack profile could not be fetched",
-                }
+            return _identity_with_unavailable_reason(
+                base, "Slack profile could not be fetched"
             )
-            return identity
 
         if not isinstance(profile, dict) or profile.get("error"):
             error = str(profile.get("error") or "Slack profile could not be fetched")
@@ -395,49 +399,37 @@ class SlackPlatform(MessagingPlatform):
                 user_id=user_id,
                 error=error,
             )
-            identity.update(
-                {
-                    "github_handle_verified": False,
-                    "github_handle_unavailable_reason": "Slack profile could not be fetched",
-                }
+            return _identity_with_unavailable_reason(
+                base, "Slack profile could not be fetched"
             )
-            return identity
 
         handle, source, reason = extract_github_handle_from_slack_profile(profile)
         if handle:
-            identity.update(
-                {
-                    "github_handle": handle,
-                    "github_handle_source": source or "Slack profile custom field",
-                    "github_handle_verified": True,
-                }
+            return replace(
+                base,
+                github_handle=handle,
+                github_handle_source=source or "Slack profile custom field",
+                github_handle_verified=True,
             )
-        else:
-            identity.update(
-                {
-                    "github_handle_verified": False,
-                    "github_handle_unavailable_reason": reason,
-                }
-            )
-        return identity
+        return _identity_with_unavailable_reason(base, reason)
 
     def system_prompt_identity_lines(
-        self, identity: dict[str, str | bool] | None
+        self, identity: RequesterIdentity | None
     ) -> list[str]:
-        if not identity:
+        if identity is None:
             return []
         lines = [
             "",
             "## Requester Identity",
             "",
-            f"- Slack user ID: {identity['slack_user_id']}",
-            f"- Slack mention: {identity['slack_mention']}",
+            f"- Slack user ID: {identity.user_id}",
+            f"- Slack mention: {identity.mention}",
         ]
-        if identity.get("github_handle_verified"):
+        if identity.github_handle_verified:
             lines.extend(
                 [
-                    f"- GitHub handle from Slack profile: {identity['github_handle']}",
-                    f"- GitHub handle source: {identity['github_handle_source']}",
+                    f"- GitHub handle from Slack profile: {identity.github_handle}",
+                    f"- GitHub handle source: {identity.github_handle_source}",
                     "- GitHub handle verified: yes",
                 ]
             )
@@ -446,7 +438,7 @@ class SlackPlatform(MessagingPlatform):
                 [
                     "- GitHub handle from Slack profile: unavailable",
                     "- GitHub handle unavailable reason: "
-                    f"{identity['github_handle_unavailable_reason']}",
+                    f"{identity.github_handle_unavailable_reason}",
                     "- GitHub handle verified: no",
                 ]
             )
@@ -596,13 +588,16 @@ class SlackPlatform(MessagingPlatform):
         raw = await get_tool_manager().call_tool("slack", "send_message", args)
         try:
             result = json.loads(raw) if isinstance(raw, str) else raw
-        except (ValueError, TypeError):
+        except json.JSONDecodeError:
             result = {"raw": raw}
         if isinstance(result, dict) and result.get("error"):
             raise RuntimeError(str(result["error"]))
         return result
 
     # ── Live tool-call capture ─────────────────────────────────────
+
+    def intercepts_tool_call(self, tool_name: str, method_name: str) -> bool:
+        return tool_name == "slack" and method_name == "send_message"
 
     async def capture_active_thread_tool_call(
         self,
@@ -615,7 +610,7 @@ class SlackPlatform(MessagingPlatform):
     ) -> dict[str, Any] | None:
         if request is None or not sandbox_claims:
             return None
-        if tool_name != "slack" or method_name != "send_message":
+        if not self.intercepts_tool_call(tool_name, method_name):
             return None
 
         thread_key = str(sandbox_claims.get("thread_key") or "")
@@ -673,7 +668,8 @@ class SlackPlatform(MessagingPlatform):
         }
 
 
-# ── Singleton + registration ──────────────────────────────────────────
+# ── Singleton ─────────────────────────────────────────────────────────
+# Registration is centralized via api.platforms.register_builtin_platforms;
+# this module only exposes the singleton.
 
 SLACK_PLATFORM = SlackPlatform()
-register_platform(SLACK_PLATFORM)

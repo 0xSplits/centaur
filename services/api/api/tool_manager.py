@@ -927,7 +927,7 @@ async def _capture_active_thread_tool_call(
         return None
     thread_key = str(sandbox_claims.get("thread_key") or "")
     platform = resolve_for_thread_key(thread_key)
-    if platform is None:
+    if platform is None or not platform.intercepts_tool_call(tool_name, method_name):
         return None
     return await platform.capture_active_thread_tool_call(
         request=request,

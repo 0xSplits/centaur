@@ -11,17 +11,55 @@ delivery dict on an execution (``resolve_for_delivery(delivery)``). The
 default fallback when the platform is missing or unknown is ``"dev"``,
 which is a no-op implementation suitable for unit tests and the localhost
 bypass path.
+
+Built-in platforms are wired up by ``register_builtin_platforms()`` at the
+bottom of this module, so simple ``from api.platforms import
+resolve_platform`` works without explicit app-startup setup.
+
+Platform-agnostic execution metadata keys
+-----------------------------------------
+The execution worker reads and writes several JSONB metadata keys on
+``agent_execution_requests`` that are conceptually platform-agnostic but
+historically Slack-named. Any platform that implements live streaming
+must honor these spellings so the rest of the system stays platform-blind:
+
+- ``slackbot_live_delivery`` (bool) — gate for live-session forwarding
+- ``slackbot_agent_session_id`` (str) — opaque per-execution session id
+- ``slackbot_live_delivery_failed`` (str) — reason live forwarding bailed
+- ``slackbot_streamed_answer_chars`` (int) — chars already streamed live
+
+A future schema-cleanup PR will rename these to ``live_session_*``; until
+then platforms write under the legacy spellings.
 """
 
 from __future__ import annotations
 
 import json
-import re
+from dataclasses import dataclass
 from typing import Any
 
 import structlog
 
 log = structlog.get_logger()
+
+
+@dataclass(frozen=True)
+class RequesterIdentity:
+    """Who triggered an agent turn, as recovered from the messaging platform.
+
+    Rendered into the system prompt so the agent can address the requester
+    by handle, mention them in replies, and look up their GitHub identity.
+    Construction is platform-agnostic; per-platform rendering of e.g.
+    ``"Slack user ID: ..."`` lives on the platform's
+    ``system_prompt_identity_lines`` method.
+    """
+
+    user_id: str
+    mention: str
+    github_handle: str | None = None
+    github_handle_source: str | None = None
+    github_handle_verified: bool = False
+    github_handle_unavailable_reason: str | None = None
 
 
 class MessagingPlatform:
@@ -37,10 +75,11 @@ class MessagingPlatform:
     message_chunk_chars: int = 12_000
     step_chunk_chars: int = 12_000
 
-    # Regex that matches a leading ``<@USER_ID>`` mention prefix and captures
-    # the remaining text. Used by recovery-command normalisation in the
-    # messaging_thread_turn workflow. Default never matches.
-    mention_prefix_re: re.Pattern[str] = re.compile(r"(?!x)x")
+    # Regex matching a leading ``<@USER_ID>`` mention prefix and capturing
+    # the remaining text. Used by recovery-command normalization in the
+    # ``messaging_thread_turn`` workflow. ``None`` means the platform has
+    # no mention-prefix grammar; callers should fall through.
+    mention_prefix_re: Any = None
 
     # ── Delivery predicates ────────────────────────────────────────────
 
@@ -80,11 +119,11 @@ class MessagingPlatform:
 
     async def load_requester_identity(
         self, user_id: str | None
-    ) -> dict[str, str | bool] | None:
+    ) -> RequesterIdentity | None:
         return None
 
     def system_prompt_identity_lines(
-        self, identity: dict[str, str | bool] | None
+        self, identity: RequesterIdentity | None
     ) -> list[str]:
         return []
 
@@ -158,6 +197,15 @@ class MessagingPlatform:
 
     # ── Live tool-call capture ─────────────────────────────────────────
 
+    def intercepts_tool_call(self, tool_name: str, method_name: str) -> bool:
+        """Sync hint: does this platform want a chance to capture this tool call?
+
+        Lets ``tool_manager`` skip the ``await`` dispatch into
+        ``capture_active_thread_tool_call`` for tool calls no platform
+        intercepts (the overwhelmingly common case). Default: never.
+        """
+        return False
+
     async def capture_active_thread_tool_call(
         self,
         *,
@@ -197,7 +245,7 @@ def resolve_platform(name: str | None) -> MessagingPlatform:
         return PLATFORMS[name]
     if name:
         log.debug("resolve_platform_unknown", requested=name)
-    return PLATFORMS.get("dev") or _DEV_FALLBACK
+    return PLATFORMS["dev"]
 
 
 def resolve_for_delivery(
@@ -222,29 +270,19 @@ def resolve_for_thread_key(thread_key: str | None) -> MessagingPlatform | None:
     return PLATFORMS.get(prefix)
 
 
-def resolve_for_metadata(
-    metadata: dict[str, Any] | None,
-) -> MessagingPlatform | None:
-    """Resolve from metadata.platform if present; ``None`` otherwise.
+def register_builtin_platforms() -> None:
+    """Wire up the platforms that ship with the API.
 
-    Unlike ``resolve_for_delivery``, this does not fall back to dev — it
-    distinguishes "no platform recorded" from "dev platform".
+    Called at module import time (below) so simple ``from api.platforms
+    import resolve_platform`` works without explicit app-startup setup.
+    Tests that need a clean registry can call ``PLATFORMS.clear()`` and
+    re-invoke this.
     """
-    if not isinstance(metadata, dict):
-        return None
-    value = metadata.get("platform")
-    if isinstance(value, str) and value and value in PLATFORMS:
-        return PLATFORMS[value]
-    return None
+    from api.platforms.dev import DEV_PLATFORM
+    from api.platforms.slack import SLACK_PLATFORM
+
+    register_platform(DEV_PLATFORM)
+    register_platform(SLACK_PLATFORM)
 
 
-# Defensive fallback used if resolve_platform runs before registration.
-_DEV_FALLBACK = MessagingPlatform()
-_DEV_FALLBACK.name = "dev"
-
-
-# Eager imports so registration happens on package import. Kept at the
-# bottom to avoid circular-import issues with platforms that import from
-# api.* at module load.
-from api.platforms import dev as _dev_module  # noqa: E402, F401
-from api.platforms import slack as _slack_module  # noqa: E402, F401
+register_builtin_platforms()

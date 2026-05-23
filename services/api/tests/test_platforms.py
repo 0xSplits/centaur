@@ -7,6 +7,7 @@ import pytest
 from api.platforms import (
     MessagingPlatform,
     PLATFORMS,
+    RequesterIdentity,
     resolve_for_delivery,
     resolve_for_thread_key,
     resolve_platform,
@@ -88,24 +89,24 @@ def test_slack_system_prompt_rules_mentions_requester_when_user_id_present():
 
 def test_slack_identity_lines_branch_on_verified():
     verified = SLACK_PLATFORM.system_prompt_identity_lines(
-        {
-            "slack_user_id": "U1",
-            "slack_mention": "<@U1>",
-            "github_handle": "@octocat",
-            "github_handle_source": "Slack profile custom field",
-            "github_handle_verified": True,
-        }
+        RequesterIdentity(
+            user_id="U1",
+            mention="<@U1>",
+            github_handle="@octocat",
+            github_handle_source="Slack profile custom field",
+            github_handle_verified=True,
+        )
     )
     assert any("@octocat" in line for line in verified)
     assert any("verified: yes" in line for line in verified)
 
     unverified = SLACK_PLATFORM.system_prompt_identity_lines(
-        {
-            "slack_user_id": "U2",
-            "slack_mention": "<@U2>",
-            "github_handle_verified": False,
-            "github_handle_unavailable_reason": "no GitHub field",
-        }
+        RequesterIdentity(
+            user_id="U2",
+            mention="<@U2>",
+            github_handle_verified=False,
+            github_handle_unavailable_reason="no GitHub field",
+        )
     )
     assert any("unavailable" in line for line in unverified)
     assert any("verified: no" in line for line in unverified)
@@ -117,3 +118,31 @@ async def test_base_send_channel_message_raises_for_unimplemented_platforms():
     base.name = "stub"
     with pytest.raises(NotImplementedError):
         await base.send_channel_message("c", "t")
+
+
+def test_slack_intercepts_only_send_message():
+    assert SLACK_PLATFORM.intercepts_tool_call("slack", "send_message") is True
+    assert SLACK_PLATFORM.intercepts_tool_call("slack", "get_channel_history") is False
+    assert SLACK_PLATFORM.intercepts_tool_call("websearch", "search") is False
+
+
+def test_base_platform_does_not_intercept_any_tool_call():
+    base = MessagingPlatform()
+    base.name = "stub"
+    assert base.intercepts_tool_call("slack", "send_message") is False
+
+
+def test_requester_identity_defaults_unverified_with_no_handle():
+    identity = RequesterIdentity(user_id="U1", mention="<@U1>")
+    assert identity.github_handle is None
+    assert identity.github_handle_verified is False
+    assert identity.github_handle_unavailable_reason is None
+
+
+def test_register_builtin_platforms_repopulates_cleared_registry():
+    from api.platforms import register_builtin_platforms
+
+    PLATFORMS.clear()
+    register_builtin_platforms()
+    assert "slack" in PLATFORMS
+    assert "dev" in PLATFORMS
