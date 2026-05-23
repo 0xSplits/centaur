@@ -21,7 +21,7 @@ from typing import Any
 import httpx
 import structlog
 
-from api.platforms import MessagingPlatform, RequesterIdentity
+from api.platforms import ActiveThreadCapture, MessagingPlatform, RequesterIdentity
 
 log = structlog.get_logger()
 
@@ -596,24 +596,16 @@ class SlackPlatform(MessagingPlatform):
 
     # ── Live tool-call capture ─────────────────────────────────────
 
-    def intercepts_tool_call(self, tool_name: str, method_name: str) -> bool:
-        return tool_name == "slack" and method_name == "send_message"
-
-    async def capture_active_thread_tool_call(
+    def match_active_thread_capture(
         self,
         *,
-        request: Any,
-        sandbox_claims: dict[str, Any] | None,
+        thread_key: str,
         tool_name: str,
         method_name: str,
         args: dict[str, Any],
-    ) -> dict[str, Any] | None:
-        if request is None or not sandbox_claims:
+    ) -> ActiveThreadCapture | None:
+        if tool_name != "slack" or method_name != "send_message":
             return None
-        if not self.intercepts_tool_call(tool_name, method_name):
-            return None
-
-        thread_key = str(sandbox_claims.get("thread_key") or "")
         parts = thread_key.split(":")
         if len(parts) < 4 or parts[0] != "slack":
             return None
@@ -628,44 +620,18 @@ class SlackPlatform(MessagingPlatform):
             return None
         if requested_thread_ts and requested_thread_ts != active_thread_ts:
             return None
-
         text = str(args.get("text") or args.get("message") or "").strip()
         if not text:
             return None
-
-        pool = getattr(request.app.state, "db_pool", None)
-        if pool is None:
-            return None
-        session_id = await pool.fetchval(
-            "SELECT metadata->>'slackbot_agent_session_id' "
-            "FROM agent_execution_requests "
-            "WHERE thread_key = $1 "
-            "AND status = 'running' "
-            "AND ("
-            "  metadata->>'slackbot_live_delivery' = 'true' "
-            "  OR metadata->>('slackbot' || '_v' || '2_live_delivery') = 'true'"
-            ") "
-            "AND COALESCE(metadata->>'slackbot_agent_session_id', '') <> '' "
-            "ORDER BY started_at DESC NULLS LAST, created_at DESC LIMIT 1",
-            thread_key,
+        return ActiveThreadCapture(
+            text=text,
+            envelope={
+                "captured": True,
+                "message": "Captured into the active Slackbot live reply; no separate Slack message was posted.",
+                "channel": active_channel,
+                "thread_ts": active_thread_ts,
+            },
         )
-        session_id = str(session_id or "").strip()
-        if not session_id:
-            return None
-
-        await self.session_text(session_id, text)
-        log.info(
-            "slack_send_message_captured",
-            thread_key=thread_key,
-            sandbox_container_id=sandbox_claims.get("container_id"),
-            slackbot_agent_session_id=session_id,
-        )
-        return {
-            "captured": True,
-            "message": "Captured into the active Slackbot live reply; no separate Slack message was posted.",
-            "channel": active_channel,
-            "thread_ts": active_thread_ts,
-        }
 
 
 # ── Singleton ─────────────────────────────────────────────────────────

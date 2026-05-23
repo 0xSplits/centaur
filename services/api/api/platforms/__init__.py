@@ -36,11 +36,23 @@ from __future__ import annotations
 
 import json
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, NamedTuple
 
 import structlog
 
 log = structlog.get_logger()
+
+
+class ActiveThreadCapture(NamedTuple):
+    """Result of matching a tool call for re-routing into the live session.
+
+    ``text`` is what the platform wants forwarded into the live session as
+    the agent's reply. ``envelope`` is the dict returned to the agent in
+    place of the normal tool result so it knows the call was intercepted.
+    """
+
+    text: str
+    envelope: dict[str, Any]
 
 
 @dataclass(frozen=True)
@@ -197,26 +209,22 @@ class MessagingPlatform:
 
     # ── Live tool-call capture ─────────────────────────────────────────
 
-    def intercepts_tool_call(self, tool_name: str, method_name: str) -> bool:
-        """Sync hint: does this platform want a chance to capture this tool call?
-
-        Lets ``tool_manager`` skip the ``await`` dispatch into
-        ``capture_active_thread_tool_call`` for tool calls no platform
-        intercepts (the overwhelmingly common case). Default: never.
-        """
-        return False
-
-    async def capture_active_thread_tool_call(
+    def match_active_thread_capture(
         self,
         *,
-        request: Any,
-        sandbox_claims: dict[str, Any] | None,
+        thread_key: str,
         tool_name: str,
         method_name: str,
         args: dict[str, Any],
-    ) -> dict[str, Any] | None:
-        """If an agent tool call should be re-routed through the live session
-        instead of hitting the platform's API, return a captured-result dict.
+    ) -> ActiveThreadCapture | None:
+        """Pure-function check: should this tool call be re-routed through
+        the live session instead of hitting the platform's API?
+
+        Returns the text to forward + the response envelope on capture,
+        ``None`` when the call should pass through to the normal tool
+        path. The platform performs no I/O; ``tool_manager`` owns the
+        live-session lookup (via ``runtime_control.get_live_session_id_for_thread``)
+        and the actual ``session_text`` forward.
 
         Slack catches ``slack.send_message`` to the active thread; other
         platforms return ``None`` by default.

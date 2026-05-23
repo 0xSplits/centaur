@@ -920,22 +920,46 @@ async def _capture_active_thread_tool_call(
     tool call (e.g. an agent calling ``slack.send_message`` to the active
     thread is re-routed through the live streaming session).
 
-    Returns the captured-result envelope or ``None`` to fall through to the
-    normal tool path.
+    The platform's ``match_active_thread_capture`` is a pure synchronous
+    function that decides whether to capture; this wrapper owns the
+    live-session lookup and the actual ``session_text`` forward so
+    platform adapters stay decoupled from FastAPI app state and the
+    ``agent_execution_requests`` schema.
+
+    Returns the captured-result envelope or ``None`` to fall through to
+    the normal tool path.
     """
     if request is None or not sandbox_claims:
         return None
     thread_key = str(sandbox_claims.get("thread_key") or "")
     platform = resolve_for_thread_key(thread_key)
-    if platform is None or not platform.intercepts_tool_call(tool_name, method_name):
+    if platform is None:
         return None
-    return await platform.capture_active_thread_tool_call(
-        request=request,
-        sandbox_claims=sandbox_claims,
+    match = platform.match_active_thread_capture(
+        thread_key=thread_key,
         tool_name=tool_name,
         method_name=method_name,
         args=args,
     )
+    if match is None:
+        return None
+    pool = getattr(request.app.state, "db_pool", None)
+    if pool is None:
+        return None
+    from api.runtime_control import get_live_session_id_for_thread
+
+    session_id = await get_live_session_id_for_thread(pool, thread_key)
+    if not session_id:
+        return None
+    await platform.session_text(session_id, match.text)
+    log.info(
+        "active_thread_tool_call_captured",
+        thread_key=thread_key,
+        platform=platform.name,
+        sandbox_container_id=sandbox_claims.get("container_id"),
+        live_session_id=session_id,
+    )
+    return match.envelope
 
 
 async def _extract_tool_attachment(

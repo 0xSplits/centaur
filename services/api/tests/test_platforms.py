@@ -120,16 +120,99 @@ async def test_base_send_channel_message_raises_for_unimplemented_platforms():
         await base.send_channel_message("c", "t")
 
 
-def test_slack_intercepts_only_send_message():
-    assert SLACK_PLATFORM.intercepts_tool_call("slack", "send_message") is True
-    assert SLACK_PLATFORM.intercepts_tool_call("slack", "get_channel_history") is False
-    assert SLACK_PLATFORM.intercepts_tool_call("websearch", "search") is False
+def test_slack_match_captures_send_message_to_active_thread():
+    match = SLACK_PLATFORM.match_active_thread_capture(
+        thread_key="slack:T1:C123:1700.0001",
+        tool_name="slack",
+        method_name="send_message",
+        args={"channel": "C123", "thread_ts": "1700.0001", "text": "hi"},
+    )
+    assert match is not None
+    assert match.text == "hi"
+    assert match.envelope["captured"] is True
+    assert match.envelope["channel"] == "C123"
 
 
-def test_base_platform_does_not_intercept_any_tool_call():
+def test_slack_match_skips_non_send_message_tool_calls():
+    assert (
+        SLACK_PLATFORM.match_active_thread_capture(
+            thread_key="slack:T1:C123:1700.0001",
+            tool_name="slack",
+            method_name="get_channel_history",
+            args={"channel": "C123"},
+        )
+        is None
+    )
+    assert (
+        SLACK_PLATFORM.match_active_thread_capture(
+            thread_key="slack:T1:C123:1700.0001",
+            tool_name="websearch",
+            method_name="search",
+            args={"query": "hi"},
+        )
+        is None
+    )
+
+
+def test_slack_match_skips_writes_to_other_channels():
+    # Channel ID different from the active thread's channel.
+    assert (
+        SLACK_PLATFORM.match_active_thread_capture(
+            thread_key="slack:T1:C123:1700.0001",
+            tool_name="slack",
+            method_name="send_message",
+            args={"channel": "C999", "text": "hi"},
+        )
+        is None
+    )
+    # Same channel but explicitly targeting a different thread.
+    assert (
+        SLACK_PLATFORM.match_active_thread_capture(
+            thread_key="slack:T1:C123:1700.0001",
+            tool_name="slack",
+            method_name="send_message",
+            args={"channel": "C123", "thread_ts": "1700.9999", "text": "hi"},
+        )
+        is None
+    )
+
+
+def test_slack_match_skips_empty_text():
+    assert (
+        SLACK_PLATFORM.match_active_thread_capture(
+            thread_key="slack:T1:C123:1700.0001",
+            tool_name="slack",
+            method_name="send_message",
+            args={"channel": "C123", "text": "   "},
+        )
+        is None
+    )
+
+
+def test_slack_match_skips_non_slack_thread_key():
+    assert (
+        SLACK_PLATFORM.match_active_thread_capture(
+            thread_key="dev:nothing:here",
+            tool_name="slack",
+            method_name="send_message",
+            args={"channel": "C123", "text": "hi"},
+        )
+        is None
+    )
+
+
+def test_base_platform_match_returns_none():
     base = MessagingPlatform()
     base.name = "stub"
-    assert base.intercepts_tool_call("slack", "send_message") is False
+    assert (
+        base.match_active_thread_capture(
+            thread_key="anything:1:2",
+            tool_name="slack",
+            method_name="send_message",
+            args={"channel": "C123", "text": "hi"},
+        )
+        is None
+    )
 
 
 def test_requester_identity_defaults_unverified_with_no_handle():

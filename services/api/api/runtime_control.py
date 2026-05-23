@@ -906,6 +906,32 @@ def execution_terminal(status: str) -> bool:
     return status in {"completed", "failed_permanent", "cancelled"}
 
 
+async def get_live_session_id_for_thread(pool, thread_key: str) -> str | None:
+    """Return the live-delivery session_id bound to this thread's currently
+    running execution, or None when no execution has live delivery open.
+
+    Reads the platform-agnostic metadata-key contract documented in
+    ``api.platforms`` (``slackbot_live_delivery`` / ``slackbot_agent_session_id``).
+    Platform adapters use this via ``tool_manager`` to forward an active
+    tool call into the live session without coupling themselves to the
+    ``agent_execution_requests`` schema.
+    """
+    session_id = await pool.fetchval(
+        "SELECT metadata->>'slackbot_agent_session_id' "
+        "FROM agent_execution_requests "
+        "WHERE thread_key = $1 "
+        "AND status = 'running' "
+        "AND ("
+        "  metadata->>'slackbot_live_delivery' = 'true' "
+        "  OR metadata->>('slackbot' || '_v' || '2_live_delivery') = 'true'"
+        ") "
+        "AND COALESCE(metadata->>'slackbot_agent_session_id', '') <> '' "
+        "ORDER BY started_at DESC NULLS LAST, created_at DESC LIMIT 1",
+        thread_key,
+    )
+    return str(session_id or "").strip() or None
+
+
 def build_execution_state_payload(
     *,
     execution_id: str,
