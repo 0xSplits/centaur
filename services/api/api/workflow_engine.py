@@ -1558,6 +1558,14 @@ def _load_workflow_file(
         for alias in aliases:
             if not isinstance(alias, str) or not alias.strip() or alias == wf_name:
                 continue
+            existing = _WORKFLOW_HANDLERS.get(alias)
+            if existing is not None and existing is not registered:
+                log.warning(
+                    "workflow_alias_collision",
+                    alias=alias,
+                    new_source=str(py_file),
+                    existing_source=existing.source_path,
+                )
             _WORKFLOW_HANDLERS[alias] = registered
             discovered[alias] = str(py_file)
     except Exception:
@@ -1729,11 +1737,11 @@ def _registered_schedule_specs() -> list[ScheduleSpec]:
             if "delivery" not in input_json:
                 try:
                     channel, thread_ts = _split_thread_key(thread_key)
-                    derived_platform = (
-                        thread_key.split(":", 1)[0]
-                        if ":" in thread_key
-                        else "slack"
-                    )
+                    # 3-part ``platform:channel:ts`` keys carry their own
+                    # platform namespace; 2-part ``channel:ts`` legacy keys
+                    # predate the namespace and are always slack.
+                    parts = thread_key.split(":")
+                    derived_platform = parts[0] if len(parts) >= 3 else "slack"
                     input_json["delivery"] = {
                         "channel": channel,
                         "thread_ts": thread_ts,

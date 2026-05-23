@@ -34,19 +34,20 @@ from api.sandbox.harness_protocol import (
     messages_to_content_blocks,
 )
 from api.deps import mint_sandbox_token
+from api.platforms import RequesterIdentity
 from api.sandbox.normalize import normalize_harness_event
 from api.sandbox.registry import get_backend
 from api.trace_context import get_or_create_thread_trace_id
-
-log = structlog.get_logger()
 
 # Slack profile → GitHub handle extraction lives on the SlackPlatform; we
 # keep the legacy module-level name as a re-export so the existing test
 # (`from api.agent import _extract_github_handle_from_slack_profile`) and
 # any other call sites keep working until they migrate.
-from api.platforms.slack import (  # noqa: E402, F401
+from api.platforms.slack import (  # noqa: F401
     extract_github_handle_from_slack_profile as _extract_github_handle_from_slack_profile,
 )
+
+log = structlog.get_logger()
 
 _VALID_STDOUT_EVENT_TYPES = frozenset(
     {
@@ -562,7 +563,7 @@ async def _resolve_requester_identity(
     *,
     platform: str | None,
     user_id: str | None,
-) -> dict[str, str | bool] | None:
+) -> RequesterIdentity | None:
     """Delegate to the registered messaging platform.
 
     Slack pulls GitHub handles from profile custom fields; other platforms
@@ -816,7 +817,7 @@ def _build_session_context(
     *,
     platform: str | None = None,
     user_id: str | None = None,
-    requester_identity: dict[str, str | bool] | None = None,
+    requester_identity: RequesterIdentity | None = None,
 ) -> str:
     """Build session context to append to the system prompt.
 

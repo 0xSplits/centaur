@@ -88,8 +88,6 @@ EXECUTION_RESERVED_USER_SLOTS = max(
     int(os.getenv("EXECUTION_RESERVED_USER_SLOTS", "16")),
     0,
 )
-_MAX_SLACKBOT_TEXT_CHARS = 12_000
-_MAX_SLACKBOT_STEP_CHARS = 12_000
 _MAX_WORKFLOW_EXECUTION_SLOTS = max(
     EXECUTION_WORKER_CONCURRENCY - EXECUTION_RESERVED_USER_SLOTS,
     1,
@@ -964,16 +962,6 @@ def build_execution_state_payload(
     if extra:
         payload.update(extra)
     return payload
-
-
-def _clip_slackbot(value: Any, max_chars: int = _MAX_SLACKBOT_STEP_CHARS) -> str:
-    text = (
-        value
-        if isinstance(value, str)
-        else json.dumps(value, ensure_ascii=False, default=str)
-    )
-    text = text.strip()
-    return text if len(text) <= max_chars else f"{text[: max_chars - 1]}…"
 
 
 def _has_slackbot_live_delivery(metadata: dict[str, Any]) -> bool:
