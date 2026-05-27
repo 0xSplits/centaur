@@ -150,7 +150,11 @@ export class AgentSessionRenderer {
     return await this.queueText(state, segment, markdown)
   }
 
-  async textDelta(sessionId: string, markdownDelta: string, opts: TextOptions = {}): Promise<number> {
+  async textDelta(
+    sessionId: string,
+    markdownDelta: string,
+    opts: TextOptions = {}
+  ): Promise<number> {
     if (!markdownDelta) return 0
     const state = requireSession(sessionId)
     const segment = currentSegment(state)
@@ -222,8 +226,17 @@ export class AgentSessionRenderer {
 
     try {
       for (const segment of state.segments) {
+        // When a segment also carries a live task plan and the answer never reached Slack as a
+        // durable live chunk before finalize (e.g. a fast turn whose whole answer arrived in one
+        // burst, after the tool calls, without crossing a flush threshold), a finalize-time
+        // appendStream races chat.stopStream's composed layout and is dropped — the thread ends
+        // after the last tool output. Fold the answer into the durable stopStream blocks instead
+        // of relying on that racing live chunk. Text-only turns keep streaming live as before.
+        const answerStreamedLive = segment.streamedTextSourceChars > 0
+        const foldAnswerIntoBlocks = !answerStreamedLive && segment.tasks.size > 0
         balancePendingMarkdown(segment)
-        if (streamFinalUpdates) {
+        const flushedAnswerLive = streamFinalUpdates && !foldAnswerIntoBlocks
+        if (flushedAnswerLive) {
           await this.flushText(state, segment, { force: true })
         } else {
           await this.absorbPendingText(segment)
@@ -234,7 +247,7 @@ export class AgentSessionRenderer {
             await this.flushTask(state, segment, task)
           }
         }
-        await this.closeTextStream(state, segment)
+        await this.closeTextStream(state, segment, { answerInLiveStream: flushedAnswerLive })
       }
       streamedTextChars = streamedTextSourceChars(state)
       closed = true
@@ -282,7 +295,11 @@ export class AgentSessionRenderer {
     }
   }
 
-  private async closeTextStream(state: AgentSessionState, segment: Segment): Promise<void> {
+  private async closeTextStream(
+    state: AgentSessionState,
+    segment: Segment,
+    opts: { answerInLiveStream?: boolean } = {}
+  ): Promise<void> {
     raiseStreamError(segment)
     if (segment.closed) return
     const hasFinalText = Boolean(state.finalAnswerMarkdown?.trim())
@@ -295,11 +312,18 @@ export class AgentSessionRenderer {
     const tasks = compactFinalTasks(originalTasks)
     const answerSource =
       state.finalAnswerMarkdown?.trim() || segment.streamedText.trim() || segment.textParts.join('')
+    // When the answer is not in the live stream (it was folded in at finalize), its live copy
+    // can't be relied on, so it must be composed into the final blocks in full rather than
+    // deduped against the streamed prefix.
+    const answerInLiveStream = opts.answerInLiveStream ?? Boolean(segment.streamedText.trim())
     const answerMarkdown = finalMarkdownForFinalBlocks(answerSource, segment, {
-      includeStreamedText: originalTasks.length >= DURABLE_STREAMED_ANSWER_TASK_THRESHOLD
+      includeStreamedText:
+        !answerInLiveStream || originalTasks.length >= DURABLE_STREAMED_ANSWER_TASK_THRESHOLD
     })
     const streamedTextLive =
-      Boolean(segment.streamedText.trim()) && segment.streamedText.length < MAX_LIVE_TEXT_CHARS
+      answerInLiveStream &&
+      Boolean(segment.streamedText.trim()) &&
+      segment.streamedText.length < MAX_LIVE_TEXT_CHARS
     // Slack accumulates appendStream chunks; stopStream blocks are the composed final layout.
     // Only add blocks for content that was not streamed live; live task_update chunks carry
     // fenced details/output, and the header has already been streamed as the first chunk.
@@ -414,9 +438,14 @@ export class AgentSessionRenderer {
     if (segment.pendingTextFlush) await segment.pendingTextFlush
     if (!segment.pendingText) return
     const markdown = normalizeMarkdownChunk(segment.streamedText, segment.pendingText)
+    const absorbedSourceChars = segment.pendingTextSourceChars
     segment.pendingText = ''
     segment.pendingTextSourceChars = 0
     segment.streamedText += markdown
+    // Folded text is delivered via the final stopStream blocks, so count it as delivered. The
+    // control plane reads this back as `slackbot_streamed_answer_chars`; under-counting here
+    // makes services/api treat the answer as cut off and post a duplicate fallback copy.
+    segment.streamedTextSourceChars += absorbedSourceChars
   }
 
   private async flushTextNow(
