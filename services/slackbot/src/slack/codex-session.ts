@@ -41,6 +41,7 @@ type CodexSessionState = {
   streamedCommentaryText: string
   streamedAnswerText: string
   deliveredAnswerChars: number
+  finalAnswerDurablyDelivered: boolean
   agentMessagePhase: AgentMessagePhase | null
   agentMessagePhaseByItemId: Map<string, AgentMessagePhase>
   planText: string
@@ -54,6 +55,7 @@ type CodexSessionState = {
 type CompletedCodexSessionState = {
   threadId: string
   streamedAnswerChars: number
+  finalAnswerDurablyDelivered: boolean
   completedAt: number
 }
 
@@ -72,7 +74,12 @@ export class CodexSessionRenderer {
   async event(
     agentSessionId: string,
     event: any
-  ): Promise<{ threadId?: string; done: boolean; streamedAnswerChars: number }> {
+  ): Promise<{
+    threadId?: string
+    done: boolean
+    streamedAnswerChars: number
+    finalAnswerDurablyDelivered: boolean
+  }> {
     const completed = completedState(agentSessionId)
     if (completed) {
       if (isTerminalTurnEvent(event)) {
@@ -81,7 +88,8 @@ export class CodexSessionRenderer {
       return {
         threadId: completed.threadId || undefined,
         done: true,
-        streamedAnswerChars: completed.streamedAnswerChars
+        streamedAnswerChars: completed.streamedAnswerChars,
+        finalAnswerDurablyDelivered: completed.finalAnswerDurablyDelivered
       }
     }
     const state = getState(agentSessionId)
@@ -234,7 +242,8 @@ export class CodexSessionRenderer {
     return {
       threadId: state.threadId || undefined,
       done: state.done,
-      streamedAnswerChars: state.deliveredAnswerChars
+      streamedAnswerChars: state.deliveredAnswerChars,
+      finalAnswerDurablyDelivered: state.finalAnswerDurablyDelivered
     }
   }
 
@@ -247,15 +256,20 @@ export class CodexSessionRenderer {
     completeOpenTasks(state)
     await this.publishActivitySummary(agentSessionId, state, { final: true })
     await this.publishPendingAssistantText(agentSessionId, state, { force: true })
-    const { streamedTextChars } = await this.renderer.done(agentSessionId, {
-      streamFinalUpdates: true,
-      answerMarkdown: state.answerText
-    })
+    const { streamedTextChars, finalAnswerDurablyDelivered } = await this.renderer.done(
+      agentSessionId,
+      {
+        streamFinalUpdates: true,
+        answerMarkdown: state.answerText
+      }
+    )
     state.deliveredAnswerChars = streamedTextChars
+    state.finalAnswerDurablyDelivered = finalAnswerDurablyDelivered
     state.done = true
     completedStates.set(agentSessionId, {
       threadId: state.threadId,
       streamedAnswerChars: state.deliveredAnswerChars,
+      finalAnswerDurablyDelivered: state.finalAnswerDurablyDelivered,
       completedAt: Date.now()
     })
     states.delete(agentSessionId)
@@ -365,6 +379,7 @@ function getState(agentSessionId: string): CodexSessionState {
       streamedCommentaryText: '',
       streamedAnswerText: '',
       deliveredAnswerChars: 0,
+      finalAnswerDurablyDelivered: false,
       agentMessagePhase: null,
       agentMessagePhaseByItemId: new Map(),
       planText: '',

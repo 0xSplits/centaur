@@ -1239,6 +1239,92 @@ async def test_mark_execution_terminal_falls_back_after_cut_off_live_answer(db_p
 
 
 @pytest.mark.asyncio
+async def test_mark_execution_terminal_skips_fallback_when_answer_durably_delivered(db_pool):
+    # Regression for the #249 duplicate-tail bug: when the slackbot folded the complete answer
+    # into durable blocks, the streamed-char tally can still be a few chars short of result_text.
+    # Without the durable-delivery signal the fallback would repost result_text[streamed_chars:]
+    # (the answer's tail) even though it is already shown. The signal must suppress that fallback.
+    from api.runtime_control import _mark_execution_terminal
+
+    execution_id = f"exe-{uuid.uuid4().hex[:10]}"
+    thread_key = f"slack:C-test:{uuid.uuid4().hex}"
+    runtime_id = f"rt-{uuid.uuid4().hex[:8]}"
+    result_text = "Done. The migration is safe to run now"
+    streamed_chars = len("Done. The migration is safe to run")  # short of result_text
+    assert streamed_chars < len(result_text.strip())
+    await db_pool.execute(
+        "INSERT INTO sandbox_sessions (thread_key, sandbox_id, harness, engine, state) "
+        "VALUES ($1, $2, 'codex', 'codex', 'idle')",
+        thread_key,
+        runtime_id,
+    )
+    await db_pool.execute(
+        "INSERT INTO agent_runtime_assignments ("
+        "thread_key, assignment_generation, runtime_id, harness, engine, "
+        "persona_id, prompt_ref, effective_agents_md_sha256, state"
+        ") VALUES ($1, 1, $2, 'codex', 'codex', NULL, 'harness:codex', 'sha', 'active')",
+        thread_key,
+        runtime_id,
+    )
+    await db_pool.execute(
+        "INSERT INTO agent_execution_requests ("
+        "execution_id, thread_key, assignment_generation, execute_id, request_hash, status, "
+        "delivery, metadata, started_at"
+        ") VALUES ($1, $2, 1, 'exec-durable', 'hash-durable', 'running', "
+        "$3::jsonb, $4::jsonb, NOW())",
+        execution_id,
+        thread_key,
+        json.dumps(
+            {
+                "platform": "slack",
+                "channel": "C-test",
+                "thread_ts": "1779333881.200699",
+            }
+        ),
+        json.dumps(
+            {
+                "slackbot_live_delivery": True,
+                "slackbot_agent_session_id": "sess-durable",
+                "slackbot_streamed_answer_chars": streamed_chars,
+            }
+        ),
+    )
+    await db_pool.execute(
+        "INSERT INTO agent_final_delivery_outbox (execution_id, thread_key, delivery, state) "
+        "VALUES ($1, $2, '{}'::jsonb, 'awaiting_terminal')",
+        execution_id,
+        thread_key,
+    )
+
+    await _mark_execution_terminal(
+        db_pool,
+        execution_id=execution_id,
+        thread_key=thread_key,
+        status="completed",
+        terminal_reason="completed",
+        result_text=result_text,
+        error_text=None,
+        slackbot_streamed_answer_chars_override=streamed_chars,
+        slackbot_final_answer_durably_delivered=True,
+    )
+
+    outbox = await db_pool.fetchrow(
+        "SELECT state, final_payload FROM agent_final_delivery_outbox WHERE execution_id = $1",
+        execution_id,
+    )
+    assert outbox is not None
+    # The durable block already carries the full answer, so no fallback delivery is enqueued.
+    assert outbox["state"] == "awaiting_terminal"
+    assert outbox["final_payload"] is None
+    ready_events = await db_pool.fetchval(
+        "SELECT COUNT(*) FROM agent_execution_events "
+        "WHERE execution_id = $1 AND event_kind = 'final_delivery_ready'",
+        execution_id,
+    )
+    assert int(ready_events or 0) == 0
+
+
+@pytest.mark.asyncio
 async def test_final_delivery_claim_filters_platform(client, db_pool, api_key: str):
     slack_execution_id = f"exe-{uuid.uuid4().hex[:10]}"
     web_execution_id = f"exe-{uuid.uuid4().hex[:10]}"

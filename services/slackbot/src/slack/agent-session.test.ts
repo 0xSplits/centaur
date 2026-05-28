@@ -764,7 +764,8 @@ describe('AgentSessionRenderer', () => {
     })
 
     await expect(renderer.done(sessionId)).resolves.toEqual({
-      streamedTextChars: expect.any(Number)
+      streamedTextChars: expect.any(Number),
+      finalAnswerDurablyDelivered: expect.any(Boolean)
     })
     expect(stopAttempts).toBe(2)
   })

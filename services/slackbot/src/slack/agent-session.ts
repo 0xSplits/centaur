@@ -216,13 +216,20 @@ export class AgentSessionRenderer {
     await this.flushText(state, segment, { force: true })
   }
 
-  async done(sessionId: string, opts: DoneOptions = {}): Promise<{ streamedTextChars: number }> {
+  async done(
+    sessionId: string,
+    opts: DoneOptions = {}
+  ): Promise<{ streamedTextChars: number; finalAnswerDurablyDelivered: boolean }> {
     const state = requireSession(sessionId)
     state.done = true
     state.finalAnswerMarkdown = opts.answerMarkdown
     const streamFinalUpdates = opts.streamFinalUpdates ?? true
     let closed = false
     let streamedTextChars = 0
+    // True once the complete final answer has been composed into the durable chat.stopStream
+    // blocks. Durable blocks are never dropped by Slack, so the control plane can safely skip
+    // its live-delivery coverage fallback and avoid reposting the answer's tail in the thread.
+    let finalAnswerDurablyDelivered = false
 
     try {
       for (const segment of state.segments) {
@@ -247,7 +254,10 @@ export class AgentSessionRenderer {
             await this.flushTask(state, segment, task)
           }
         }
-        await this.closeTextStream(state, segment, { answerInLiveStream: flushedAnswerLive })
+        const { answerDeliveredInBlocks } = await this.closeTextStream(state, segment, {
+          answerInLiveStream: flushedAnswerLive
+        })
+        if (answerDeliveredInBlocks) finalAnswerDurablyDelivered = true
       }
       streamedTextChars = streamedTextSourceChars(state)
       closed = true
@@ -257,7 +267,7 @@ export class AgentSessionRenderer {
       }
       if (closed) sessions.delete(sessionId)
     }
-    return { streamedTextChars }
+    return { streamedTextChars, finalAnswerDurablyDelivered }
   }
 
   private async setStatus(sessionId: string, status: string): Promise<boolean> {
@@ -299,15 +309,15 @@ export class AgentSessionRenderer {
     state: AgentSessionState,
     segment: Segment,
     opts: { answerInLiveStream?: boolean } = {}
-  ): Promise<void> {
+  ): Promise<{ answerDeliveredInBlocks: boolean }> {
     raiseStreamError(segment)
-    if (segment.closed) return
+    if (segment.closed) return { answerDeliveredInBlocks: false }
     const hasFinalText = Boolean(state.finalAnswerMarkdown?.trim())
     if (!segment.streamTs && !segment.textParts.length && !segment.tasks.size && !hasFinalText) {
-      return
+      return { answerDeliveredInBlocks: false }
     }
     await this.ensureStream(state, segment, [])
-    if (!segment.streamTs) return
+    if (!segment.streamTs) return { answerDeliveredInBlocks: false }
     const originalTasks = finalTaskSnapshot(segment)
     const tasks = compactFinalTasks(originalTasks)
     const answerSource =
@@ -333,6 +343,11 @@ export class AgentSessionRenderer {
         : []),
       ...(!streamedTextLive && answerMarkdown ? renderMarkdownBlocks(answerMarkdown) : [])
     ] as AnyBlock[])
+    // The complete answer was composed into a durable block (not just streamed live) only when
+    // it was rendered in full — a clipped/truncated block still relies on a separate delivery
+    // for the remainder, so coverage must not be treated as complete in that case.
+    const answerDeliveredInBlocks =
+      !streamedTextLive && Boolean(answerMarkdown) && !answerMarkdown.endsWith('// truncated')
     const fallbackText = buildFinalFallbackText({
       title: state.title,
       answerMarkdown
@@ -347,6 +362,7 @@ export class AgentSessionRenderer {
     })
     if (!stopResponse.ok) throw new Error(stopResponse.error ?? 'chat.stopStream failed')
     segment.closed = true
+    return { answerDeliveredInBlocks }
   }
 
   private async streamChunks(

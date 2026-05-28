@@ -1940,6 +1940,7 @@ async def _mark_execution_terminal(
     result_text: str,
     error_text: str | None,
     slackbot_streamed_answer_chars_override: int | None = None,
+    slackbot_final_answer_durably_delivered: bool = False,
 ) -> None:
     next_attempt_at = dt.datetime.now(dt.timezone.utc) + dt.timedelta(
         seconds=FINAL_DELIVERY_READY_GRACE_S,
@@ -2026,6 +2027,11 @@ async def _mark_execution_terminal(
                 and not slackbot_live_delivery_failed
                 and (
                     not result_has_text
+                    # The slackbot rendered the complete final answer into durable Slack blocks,
+                    # so the live delivery covers the result regardless of the streamed-char
+                    # tally — skip the fallback so its continuation does not repost the answer's
+                    # trailing characters as a separate thread message.
+                    or slackbot_final_answer_durably_delivered
                     or _slackbot_live_delivery_covers_result(
                         result_text,
                         slackbot_streamed_answer_chars,
@@ -2984,6 +2990,7 @@ async def _process_execution_impl(pool, row: dict[str, Any]) -> None:
             result_text=result_text,
             error_text=error_text,
             slackbot_streamed_answer_chars_override=slackbot_streamed_answer_chars,
+            slackbot_final_answer_durably_delivered=slackbot_final_answer_durably_delivered,
         )
 
     execution_started_payload = {
@@ -3044,6 +3051,7 @@ async def _process_execution_impl(pool, row: dict[str, Any]) -> None:
     turn_done_event: dict[str, Any] | None = None
     latest_terminal_result_text = ""
     slackbot_streamed_answer_chars = 0
+    slackbot_final_answer_durably_delivered = False
     pending_event: asyncio.Task | None = None
     stream = _stream_stdout(
         session,
@@ -3188,6 +3196,12 @@ async def _process_execution_impl(pool, row: dict[str, Any]) -> None:
                             harness_result.get("threadId") or harness_thread_id
                         )
                         slackbot_done = bool(harness_result.get("done"))
+                        if harness_result.get("finalAnswerDurablyDelivered"):
+                            # The slackbot composed the complete final answer into durable
+                            # chat.stopStream blocks (never dropped by Slack), so the live
+                            # delivery already covers the result and the fallback continuation
+                            # must not repost the answer's tail in the thread.
+                            slackbot_final_answer_durably_delivered = True
                         streamed_chars = harness_result.get("streamedAnswerChars")
                         previous_streamed_answer_chars = slackbot_streamed_answer_chars
                         streamed_chars = _slackbot_streamed_answer_chars(streamed_chars)
