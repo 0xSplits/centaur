@@ -987,7 +987,7 @@ async def _compute_agent_session_header(
     the persona/engine pair the slackbot renders italic at the top of every
     assistant message. Persona defaults to the literal ``"base"`` when no
     persona is active. The engine segment is upgraded to a concrete model
-    identifier (e.g. ``claude-opus-4-7``, ``codex-gpt-5``) when known.
+    identifier (e.g. ``claude-opus-4-8``, ``codex-gpt-5``) when known.
     """
     from api.runtime_control import _agent_session_header  # local to avoid cycle
 
@@ -2386,15 +2386,15 @@ async def _execute_run(pool, run_id: str) -> None:
 
 
 def _workflow_sandbox_enabled() -> bool:
-    """Whether claimed runs should execute in a one-shot sandbox Pod.
+    """Whether claimed runs should execute in a one-shot per-run Pod.
 
-    On by default. Set ``WORKFLOW_RUN_SANDBOX_ENABLED=0`` to fall back to
-    in-process execution (e.g. local dev where there's no K8s backend).
+    Off by default. Set ``WORKFLOW_RUN_SANDBOX_ENABLED=1`` to opt in to the
+    per-run pod path; otherwise runs execute in-process inside the API.
     """
-    return os.getenv("WORKFLOW_RUN_SANDBOX_ENABLED", "1").strip().lower() not in {
-        "0",
-        "false",
-        "no",
+    return os.getenv("WORKFLOW_RUN_SANDBOX_ENABLED", "0").strip().lower() in {
+        "1",
+        "true",
+        "yes",
     }
 
 

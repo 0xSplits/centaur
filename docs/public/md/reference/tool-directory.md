@@ -66,6 +66,7 @@ These are broadly useful across most deployments and are good candidates to conf
 | `profslice` | Extract Firefox Profiler data for analysis | None |
 | `reth` | Reth execution timing and performance metrics | None |
 | `reth-log-analyzer` | Parse Reth logs and generate performance graphs | None |
+| `sentry` | Browse Sentry issues, issue details, events, stacktraces, and tag values (read-only) | `SENTRY_AUTH_TOKEN` |
 | `vlogs` | VictoriaLogs queries, fields, streams, and log analytics | None |
 | `vmetrics` | VictoriaMetrics PromQL/MetricsQL queries and metric discovery | None |
 

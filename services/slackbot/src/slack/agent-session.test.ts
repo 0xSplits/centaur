@@ -752,7 +752,7 @@ describe('AgentSessionRenderer', () => {
     })
 
     await renderer.text(sessionId, 'Finished reply')
-    await expect(renderer.done(sessionId)).rejects.toThrow('stream_already_closed')
+    expect(renderer.done(sessionId)).rejects.toThrow('stream_already_closed')
 
     expect(calls.filter(call => call.method === 'assistant.threads.setStatus').at(-1)).toEqual({
       method: 'assistant.threads.setStatus',
@@ -898,7 +898,7 @@ describe('AgentSessionRenderer', () => {
       recipientTeamId: 'T123',
       recipientUserId: 'U123',
       title: 'Centaur execution',
-      header: 'base · claude-opus-4-7'
+      header: 'base · claude-opus-4-8'
     })
 
     await renderer.step(sessionId, {
@@ -913,7 +913,7 @@ describe('AgentSessionRenderer', () => {
     const chunks = start?.params.chunks ?? []
     expect(chunks[0]).toEqual({
       type: 'markdown_text',
-      text: '_base · claude-opus-4-7_\n'
+      text: '_base · claude-opus-4-8_\n'
     })
     const planUpdateIdx = chunks.findIndex((chunk: any) => chunk.type === 'plan_update')
     expect(planUpdateIdx).toBeGreaterThan(0)

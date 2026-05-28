@@ -66,7 +66,7 @@ export type OpenAgentSessionInput = {
   title?: string
   /**
    * Italic one-line identifier rendered at the top of every assistant message (e.g. "base ·
-   * claude-opus-4-7", "legal · codex-gpt-5").
+   * claude-opus-4-8", "legal · codex-gpt-5").
    */
   header?: string
 }
@@ -150,11 +150,7 @@ export class AgentSessionRenderer {
     return await this.queueText(state, segment, markdown)
   }
 
-  async textDelta(
-    sessionId: string,
-    markdownDelta: string,
-    opts: TextOptions = {}
-  ): Promise<number> {
+  async textDelta(sessionId: string, markdownDelta: string, opts: TextOptions = {}): Promise<number> {
     if (!markdownDelta) return 0
     const state = requireSession(sessionId)
     const segment = currentSegment(state)
