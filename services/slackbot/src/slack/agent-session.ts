@@ -326,10 +326,14 @@ export class AgentSessionRenderer {
     // can't be relied on, so it must be composed into the final blocks in full rather than
     // deduped against the streamed prefix.
     const answerInLiveStream = opts.answerInLiveStream ?? Boolean(segment.streamedText.trim())
-    const answerMarkdown = finalMarkdownForFinalBlocks(answerSource, segment, {
-      includeStreamedText:
-        !answerInLiveStream || originalTasks.length >= DURABLE_STREAMED_ANSWER_TASK_THRESHOLD
-    })
+    const { markdown: answerMarkdown, truncated: answerTruncated } = finalMarkdownForFinalBlocks(
+      answerSource,
+      segment,
+      {
+        includeStreamedText:
+          !answerInLiveStream || originalTasks.length >= DURABLE_STREAMED_ANSWER_TASK_THRESHOLD
+      }
+    )
     const streamedTextLive =
       answerInLiveStream &&
       Boolean(segment.streamedText.trim()) &&
@@ -343,11 +347,13 @@ export class AgentSessionRenderer {
         : []),
       ...(!streamedTextLive && answerMarkdown ? renderMarkdownBlocks(answerMarkdown) : [])
     ] as AnyBlock[])
-    // The complete answer was composed into a durable block (not just streamed live) only when
-    // it was rendered in full — a clipped/truncated block still relies on a separate delivery
-    // for the remainder, so coverage must not be treated as complete in that case.
+    // The complete answer was composed into a durable block (not just streamed live) only when it
+    // was rendered in full. answerTruncated reflects whether clipText dropped characters. The
+    // pre-sanitize answerMarkdown is trustworthy because maxVisibleChars (6_250) stays under every
+    // sanitize cap (markdownChunkChars is 12_000) and shrinkToPayloadByteBudget only sheds the plan
+    // block, never the answer text — so the sanitized blocks still carry the answer in full.
     const answerDeliveredInBlocks =
-      !streamedTextLive && Boolean(answerMarkdown) && !answerMarkdown.endsWith('// truncated')
+      !streamedTextLive && Boolean(answerMarkdown) && !answerTruncated
     const fallbackText = buildFinalFallbackText({
       title: state.title,
       answerMarkdown
@@ -689,19 +695,23 @@ function finalMarkdownForFinalBlocks(
   markdown: string,
   segment: Segment,
   opts: { includeStreamedText?: boolean } = {}
-): string {
+): { markdown: string; truncated: boolean } {
+  const maxVisibleChars = slackReplyLimits.mixedBodyAndPlan.maxVisibleChars
   const trimmed = markdown.trim()
-  if (!trimmed) return ''
+  if (!trimmed) return { markdown: '', truncated: false }
   if (opts.includeStreamedText || !segment.streamedText.trim()) {
-    return clipText(trimmed, slackReplyLimits.mixedBodyAndPlan.maxVisibleChars)
+    const { text, truncated } = clipTextWithFlag(trimmed, maxVisibleChars)
+    return { markdown: text, truncated }
   }
   const streamedPrefix = unstreamedMarkdownAfterLivePrefix(markdown, segment.streamedText)
   if (streamedPrefix !== null) {
-    return clipText(streamedPrefix, slackReplyLimits.mixedBodyAndPlan.maxVisibleChars)
+    const { text, truncated } = clipTextWithFlag(streamedPrefix, maxVisibleChars)
+    return { markdown: text, truncated }
   }
   const unstreamed = markdown.slice(segment.streamedTextSourceChars).trim()
-  if (!unstreamed) return ''
-  return clipText(unstreamed, slackReplyLimits.mixedBodyAndPlan.maxVisibleChars)
+  if (!unstreamed) return { markdown: '', truncated: false }
+  const { text, truncated } = clipTextWithFlag(unstreamed, maxVisibleChars)
+  return { markdown: text, truncated }
 }
 
 function unstreamedMarkdownAfterLivePrefix(markdown: string, streamedText: string): string | null {
@@ -722,9 +732,22 @@ function normalizeFinalMarkdownPrefix(markdown: string): string {
 }
 
 function clipText(value: string, maxChars: number): string {
-  if (maxChars <= 0) return ''
-  if (maxChars <= 13) return value.length > maxChars ? value.slice(0, maxChars) : value
-  return value.length > maxChars ? `${value.slice(0, maxChars - 13)}\n// truncated` : value
+  return clipTextWithFlag(value, maxChars).text
+}
+
+// Returns the clipped text alongside whether clipping actually dropped characters, so callers can
+// signal "the complete value was rendered" without sniffing the `// truncated` sentinel (which a
+// real answer could legitimately end with, and which is easy to drift away from at a distance).
+function clipTextWithFlag(value: string, maxChars: number): { text: string; truncated: boolean } {
+  if (maxChars <= 0) return { text: '', truncated: value.length > 0 }
+  if (maxChars <= 13) {
+    return value.length > maxChars
+      ? { text: value.slice(0, maxChars), truncated: true }
+      : { text: value, truncated: false }
+  }
+  return value.length > maxChars
+    ? { text: `${value.slice(0, maxChars - 13)}\n// truncated`, truncated: true }
+    : { text: value, truncated: false }
 }
 
 function currentSegment(state: AgentSessionState): Segment {

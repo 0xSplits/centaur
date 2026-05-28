@@ -75,6 +75,32 @@ describe('#249 duplicate-tail regression: durable-delivery signal', () => {
     expect(durableBlockText(calls)).toContain(answer)
   })
 
+  it('does NOT report durable delivery when a folded answer is clipped by the visible-char cap', async () => {
+    const { client } = makeClient()
+    const renderer = new AgentSessionRenderer(client as any)
+    const { sessionId } = await renderer.open({
+      channel: 'C123',
+      parentTs: '1778883099.579529',
+      recipientTeamId: 'T123',
+      recipientUserId: 'U123',
+      title: 'Centaur execution'
+    })
+    await renderer.step(sessionId, {
+      id: 'cmd-1',
+      title: '1. run migration check',
+      status: 'complete',
+      details: '```\nmake db:check\n```',
+      output: '```\nok\n```'
+    })
+    // An answer past mixedBodyAndPlan.maxVisibleChars (6250) is folded but clipped, so its tail is
+    // not in the durable block. The signal must stay false so the coverage fallback delivers it.
+    const answer = 'A'.repeat(7000)
+    await renderer.textDelta(sessionId, answer, { flush: false })
+    const result = await renderer.done(sessionId, { answerMarkdown: answer })
+
+    expect(result.finalAnswerDurablyDelivered).toBe(false)
+  })
+
   it('does NOT report durable delivery when the answer streamed live', async () => {
     const { client, calls } = makeClient()
     const renderer = new AgentSessionRenderer(client as any)
