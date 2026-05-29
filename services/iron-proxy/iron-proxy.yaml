@@ -78,6 +78,9 @@ transforms:
         - "x-as-user-email"
         - "/^x-codex-.*$/"
         - "/^x-openai-.*$/"
+        # AWS SigV4 request headers (x-amz-target, x-amz-date,
+        # x-amz-content-sha256, x-amz-security-token) for the aws_auth transform.
+        - "/^x-amz-.*$/"
         - "/^x-[a-z0-9-]*(api-key|apikey|secret|token|auth|key)$/"
 
 log:
