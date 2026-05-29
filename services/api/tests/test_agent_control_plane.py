@@ -188,6 +188,130 @@ async def test_spawn_assignment_treats_harness_persona_selector_as_persona(db_po
 
 
 @pytest.mark.asyncio
+async def test_spawn_assignment_applies_default_persona_on_fresh_thread(
+    db_pool, monkeypatch
+):
+    from api.runtime_control import spawn_assignment
+
+    monkeypatch.setenv("CENTAUR_DEFAULT_PERSONA", "eng")
+    thread_key = f"slack:C-test:{uuid.uuid4().hex}:default-persona"
+    session = SandboxSession(
+        sandbox_id=f"rt-{uuid.uuid4().hex[:8]}",
+        thread_key=thread_key,
+        harness="codex",
+        engine="codex",
+    )
+    get_or_spawn = AsyncMock(return_value=session)
+    tool_manager = SimpleNamespace(
+        get_persona=lambda name: (
+            SimpleNamespace(name="eng", engine="codex", default_repo=None)
+            if name == "eng"
+            else None
+        )
+    )
+
+    with (
+        patch("api.runtime_control.get_or_spawn", new=get_or_spawn),
+        patch("api.app.get_tool_manager", return_value=tool_manager),
+    ):
+        result = await spawn_assignment(
+            db_pool,
+            thread_key=thread_key,
+            spawn_id="spawn-default-persona",
+            harness=None,
+            engine=None,
+            persona_id=None,
+            agents_md_override=None,
+        )
+
+    # Bare thread inherits the configured default persona and its engine.
+    get_or_spawn.assert_awaited_once_with(
+        thread_key, "codex", engine=None, persona="eng"
+    )
+    assert result["persona_id"] == "eng"
+    assignment = await db_pool.fetchrow(
+        "SELECT harness, persona_id FROM agent_runtime_assignments WHERE thread_key = $1",
+        thread_key,
+    )
+    assert assignment is not None
+    assert assignment["harness"] == "codex"
+    assert assignment["persona_id"] == "eng"
+
+
+@pytest.mark.asyncio
+async def test_spawn_assignment_default_persona_ignored_for_explicit_harness(
+    db_pool, monkeypatch
+):
+    from api.runtime_control import spawn_assignment
+
+    monkeypatch.setenv("CENTAUR_DEFAULT_PERSONA", "eng")
+    thread_key = f"slack:C-test:{uuid.uuid4().hex}:explicit-harness"
+    session = SandboxSession(
+        sandbox_id=f"rt-{uuid.uuid4().hex[:8]}",
+        thread_key=thread_key,
+        harness="codex",
+        engine="codex",
+    )
+    get_or_spawn = AsyncMock(return_value=session)
+    tool_manager = SimpleNamespace(get_persona=lambda name: None)
+
+    with (
+        patch("api.runtime_control.get_or_spawn", new=get_or_spawn),
+        patch("api.app.get_tool_manager", return_value=tool_manager),
+    ):
+        result = await spawn_assignment(
+            db_pool,
+            thread_key=thread_key,
+            spawn_id="spawn-explicit-harness",
+            harness="codex",
+            engine=None,
+            persona_id=None,
+            agents_md_override=None,
+        )
+
+    # An explicit selector bypasses the default-persona fallback entirely.
+    assert result["persona_id"] is None
+    get_or_spawn.assert_awaited_once_with(thread_key, "codex", engine=None)
+
+
+@pytest.mark.asyncio
+async def test_spawn_assignment_unknown_default_persona_falls_back_to_base(
+    db_pool, monkeypatch
+):
+    from api.runtime_control import spawn_assignment
+
+    monkeypatch.delenv("CENTAUR_DEFAULT_HARNESS", raising=False)
+    monkeypatch.setenv("CENTAUR_DEFAULT_PERSONA", "ghost")
+    thread_key = f"slack:C-test:{uuid.uuid4().hex}:unknown-default-persona"
+    session = SandboxSession(
+        sandbox_id=f"rt-{uuid.uuid4().hex[:8]}",
+        thread_key=thread_key,
+        harness="codex",
+        engine="codex",
+    )
+    get_or_spawn = AsyncMock(return_value=session)
+    tool_manager = SimpleNamespace(get_persona=lambda name: None)
+
+    with (
+        patch("api.runtime_control.get_or_spawn", new=get_or_spawn),
+        patch("api.app.get_tool_manager", return_value=tool_manager),
+    ):
+        result = await spawn_assignment(
+            db_pool,
+            thread_key=thread_key,
+            spawn_id="spawn-unknown-default-persona",
+            harness=None,
+            engine=None,
+            persona_id=None,
+            agents_md_override=None,
+        )
+
+    # A misconfigured default must not break the thread — fall through to base.
+    assert result["persona_id"] is None
+    get_or_spawn.assert_awaited_once_with(thread_key, "codex", engine=None)
+
+
+@pytest.mark.asyncio
 async def test_db_insert_session_initial_state_tracks_inflight_turn(db_pool):
     from api.agent import _db_insert_session
 

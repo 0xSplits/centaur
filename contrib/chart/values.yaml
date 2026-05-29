@@ -86,6 +86,12 @@ api:
     pullPolicy: Always
   executionWorkerEnabled: false
   defaultHarness: codex
+  # Default persona (system-prompt overlay) for spawns that select none — e.g. a
+  # Slackbot thread's first turn. Must be a persona name available to the
+  # deployment (base or overlay). Empty (the default) means no overlay: bare
+  # spawns run under the base system prompt. Explicit --persona flags and sticky
+  # per-thread assignments are unaffected.
+  defaultPersona: ""
   # The API's worker claims workflow_runs and spawns a per-run sandbox to
   # execute each handler. Disable only if you're running your own claimer.
   workflowWorkerEnabled: true

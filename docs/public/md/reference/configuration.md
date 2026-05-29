@@ -51,6 +51,7 @@ Optional required-by-mode variables:
 | Env var | Set from | Controls |
 | --- | --- | --- |
 | `CENTAUR_DEFAULT_HARNESS` | `api.defaultHarness`. | Default harness for new executions. |
+| `CENTAUR_DEFAULT_PERSONA` | `api.defaultPersona`. | Default persona (system-prompt overlay) for spawns that select none, e.g. a Slackbot thread's first turn. Unset means no overlay (base prompt). Explicit `--persona` flags and sticky per-thread assignments are unaffected. |
 | `CENTAUR_ENVIRONMENT` | `api.extraEnv` or deployment env. | Environment label in traces and telemetry. |
 | `CENTAUR_LOG_LEVEL`, `LOG_LEVEL` | Helm sets `CENTAUR_LOG_LEVEL=info`; override in `api.extraEnv`. | API log level. |
 | `CENTAUR_SERVICE_NAME` | `api.extraEnv`. | Default API log `service` field. |

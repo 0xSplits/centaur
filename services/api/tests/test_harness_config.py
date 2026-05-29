@@ -25,3 +25,27 @@ def test_default_harness_ignores_unknown_values(monkeypatch):
     monkeypatch.setenv("CENTAUR_DEFAULT_HARNESS", "unknown")
 
     assert default_harness() == "codex"
+
+
+def test_default_persona_unset_is_none(monkeypatch):
+    from api.harness_config import default_persona
+
+    monkeypatch.delenv("CENTAUR_DEFAULT_PERSONA", raising=False)
+
+    assert default_persona() is None
+
+
+def test_default_persona_blank_is_none(monkeypatch):
+    from api.harness_config import default_persona
+
+    monkeypatch.setenv("CENTAUR_DEFAULT_PERSONA", "   ")
+
+    assert default_persona() is None
+
+
+def test_default_persona_returns_name(monkeypatch):
+    from api.harness_config import default_persona
+
+    monkeypatch.setenv("CENTAUR_DEFAULT_PERSONA", "  eng  ")
+
+    assert default_persona() == "eng"

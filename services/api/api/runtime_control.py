@@ -25,7 +25,7 @@ from api.agent import (
     stop_session,
 )
 from api import slackbot_client
-from api.harness_config import default_harness
+from api.harness_config import default_harness, default_persona
 from api.otel import (
     add_span_event,
     context_from_serialized,
@@ -562,6 +562,27 @@ async def spawn_assignment(
         effective_persona_id = active_assignment.get("persona_id")
         effective_agents_md_override = active_assignment.get("agents_md_override")
     else:
+        # When the caller specified nothing (no harness/engine/persona/override)
+        # and the thread has no active assignment, fall back to the deployment
+        # default persona — the persona analogue of CENTAUR_DEFAULT_HARNESS. This
+        # is the only spawn shape it touches: a fresh, unspecified thread (e.g. a
+        # Slackbot thread's first turn). An explicit selection or a sticky
+        # per-thread assignment both bypass this branch and are left untouched.
+        if attach_active_assignment:
+            default_persona_id = default_persona()
+            if default_persona_id:
+                from api.app import get_tool_manager
+
+                persona_info = get_tool_manager().get_persona(default_persona_id)
+                if persona_info is not None:
+                    persona_id = default_persona_id
+                else:
+                    # A misconfigured default must not break every bare thread;
+                    # log and fall through to base.
+                    log.warning(
+                        "default_persona_unknown", persona_id=default_persona_id
+                    )
+
         # Explicit harness wins; otherwise inherit from the persona's declared
         # engine; otherwise use the deployment default.
         if harness:
