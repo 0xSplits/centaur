@@ -37,6 +37,7 @@ from api.proxy_config import (
 )
 from api.sandbox.base import SandboxBackend, SandboxSession
 from api.sandbox.config import (
+    OBSERVABILITY_NO_PROXY_HOSTS,
     build_harness_cmd,
     container_env,
     image,
@@ -190,11 +191,22 @@ def _workflow_run_pod_name(run_id: str) -> str:
 
 
 def _tool_server_tool_dirs() -> str:
-    """TOOL_DIRS the sidecar uses. Mirrors the API's TOOL_DIRS by default."""
+    """TOOL_DIRS the sidecar uses.
+
+    The API fully controls both of the sidecar's mounts, so it constructs the
+    path directly rather than inheriting (and rewriting) its own ``TOOL_DIRS``.
+    Base tools live at ``/app/tools`` in the shared image. The overlay, when
+    present, is mounted at ``_SANDBOX_OVERLAY_DIR`` — not the API's overlay
+    mount — so its tools are at ``<_SANDBOX_OVERLAY_DIR>/tools``. An explicit
+    ``KUBERNETES_TOOL_SERVER_TOOL_DIRS`` still wins as an escape hatch.
+    """
     value = (os.getenv("KUBERNETES_TOOL_SERVER_TOOL_DIRS") or "").strip()
     if value:
         return value
-    return (os.getenv("TOOL_DIRS") or "/app/tools").strip() or "/app/tools"
+    dirs = ["/app/tools"]
+    if _overlay_image():
+        dirs.append(f"{_SANDBOX_OVERLAY_DIR}/tools")
+    return ":".join(dirs)
 
 
 def _token_broker_name() -> str:
@@ -453,7 +465,12 @@ def _build_tool_server_container(
     secret_name = _secret_env_name()
     proxy_url = f"http://{firewall_host}:{_proxy_port()}"
     api_host = urlsplit(api_url).hostname or ""
-    no_proxy_hosts = ["localhost", "127.0.0.1", firewall_host]
+    no_proxy_hosts = [
+        "localhost",
+        "127.0.0.1",
+        firewall_host,
+        *OBSERVABILITY_NO_PROXY_HOSTS,
+    ]
     if api_host:
         no_proxy_hosts.append(api_host)
     no_proxy = ",".join(dict.fromkeys(no_proxy_hosts))
@@ -483,6 +500,7 @@ def _build_tool_server_container(
         {"name": "TOOL_DIRS", "value": _tool_server_tool_dirs()},
         {"name": "PLUGIN_WATCHER_ENABLED", "value": "0"},
     ]
+    _apply_tool_server_extra_env(env, no_proxy)
 
     volume_mounts: list[dict[str, Any]] = [
         {
@@ -542,6 +560,48 @@ def _build_tool_server_container(
         },
         "volumeMounts": volume_mounts,
     }
+
+
+def _apply_tool_server_extra_env(env: list[dict[str, Any]], computed_no_proxy: str) -> None:
+    """Let the sidecar see operator sandbox env without breaking its wiring."""
+    pinned = {
+        "DATABASE_URL",
+        "SANDBOX_SIGNING_KEY",
+        "HTTP_PROXY",
+        "HTTPS_PROXY",
+        "http_proxy",
+        "https_proxy",
+        "REQUESTS_CA_BUNDLE",
+        "SSL_CERT_FILE",
+        "NODE_EXTRA_CA_CERTS",
+        "CENTAUR_API_URL",
+        "CENTAUR_API_KEY",
+        "TOOL_DIRS",
+        "PLUGIN_WATCHER_ENABLED",
+    }
+    no_proxy_keys = {"NO_PROXY", "no_proxy"}
+    for name, value in sandbox_extra_env_map().items():
+        if name in pinned:
+            log.warning("tool_server_extra_env_ignored_pinned_var", key=name)
+            continue
+        if name in no_proxy_keys:
+            value = _merge_csv_env(computed_no_proxy, value)
+        _upsert_env_value(env, name, value)
+
+
+def _upsert_env_value(env: list[dict[str, Any]], name: str, value: str) -> None:
+    for item in env:
+        if item.get("name") == name:
+            item["value"] = value
+            item.pop("valueFrom", None)
+            return
+    env.append({"name": name, "value": value})
+
+
+def _merge_csv_env(base: str, extra: str) -> str:
+    values = [item.strip() for item in base.split(",") if item.strip()]
+    values.extend(item.strip() for item in extra.split(",") if item.strip())
+    return ",".join(dict.fromkeys(values))
 
 
 def _resource_name(prefix: str, raw: str, *, max_length: int = 63) -> str:
