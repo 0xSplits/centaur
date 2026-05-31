@@ -10,6 +10,8 @@ use tokio::{
 };
 use uuid::Uuid;
 
+mod tui;
+
 const DEFAULT_MESSAGE: &str = "Reply with exactly PONG and nothing else.";
 
 #[derive(Debug, Parser)]
@@ -53,6 +55,12 @@ struct Args {
 
     #[arg(long, alias = "stdin")]
     stdin_events: bool,
+
+    #[arg(long)]
+    tui: bool,
+
+    #[arg(long)]
+    debug: bool,
 }
 
 #[tokio::main]
@@ -71,6 +79,22 @@ async fn main() -> Result<()> {
 
     if attach_mode {
         let events_response = open_event_stream(&client, &session_url, args.after_event_id).await?;
+        if args.tui {
+            return tui::run(
+                client,
+                thread_key.as_str().to_owned(),
+                session_url,
+                events_response,
+                tui::TuiOptions {
+                    debug_visible: args.debug,
+                    idle_timeout_ms: args.idle_timeout_ms,
+                    max_duration_ms: args.max_duration_ms,
+                    exit_on_terminal: args.exit_on_terminal,
+                    exit_on_output_type: args.exit_on_output_type,
+                },
+            )
+            .await;
+        }
         return run_stream_and_optional_stdin(
             client,
             session_url,
@@ -123,6 +147,23 @@ async fn main() -> Result<()> {
         .context("execute initial turn")?;
     }
 
+    if args.tui {
+        return tui::run(
+            client,
+            thread_key.as_str().to_owned(),
+            session_url,
+            events_response,
+            tui::TuiOptions {
+                debug_visible: args.debug,
+                idle_timeout_ms: args.idle_timeout_ms,
+                max_duration_ms: args.max_duration_ms,
+                exit_on_terminal: args.exit_on_terminal,
+                exit_on_output_type: args.exit_on_output_type,
+            },
+        )
+        .await;
+    }
+
     run_stream_and_optional_stdin(
         client,
         session_url,
@@ -151,6 +192,9 @@ fn validate_mode(args: &Args, attach_mode: bool) -> Result<()> {
     }
     if args.attach && (args.message.is_some() || !args.input_lines.is_empty()) {
         bail!("--attach does not accept --message or --input-line");
+    }
+    if args.tui && args.stdin_events {
+        bail!("--tui cannot be combined with --stdin-events");
     }
     Ok(())
 }
@@ -208,7 +252,11 @@ async fn open_event_stream(
         .context("open event stream")
 }
 
-async fn append_user_message(client: &Client, session_url: &str, text: &str) -> Result<()> {
+pub(crate) async fn append_user_message(
+    client: &Client,
+    session_url: &str,
+    text: &str,
+) -> Result<()> {
     post_json(
         client,
         &format!("{session_url}/messages"),
@@ -227,7 +275,7 @@ async fn append_user_message(client: &Client, session_url: &str, text: &str) -> 
     Ok(())
 }
 
-async fn execute_input_lines(
+pub(crate) async fn execute_input_lines(
     client: &Client,
     session_url: &str,
     input_lines: Vec<String>,
@@ -391,7 +439,7 @@ async fn stream_output_lines(
     Ok(())
 }
 
-fn output_type_matches(data: &str, expected_type: Option<&str>) -> bool {
+pub(crate) fn output_type_matches(data: &str, expected_type: Option<&str>) -> bool {
     let Some(expected_type) = expected_type else {
         return false;
     };
@@ -415,10 +463,10 @@ fn session_input_lines(args: &Args) -> Result<Vec<String>> {
 }
 
 fn should_send_initial_turn(args: &Args) -> bool {
-    args.message.is_some() || !args.input_lines.is_empty() || !args.stdin_events
+    args.message.is_some() || !args.input_lines.is_empty() || (!args.stdin_events && !args.tui)
 }
 
-fn user_input_line(text: &str) -> Result<String> {
+pub(crate) fn user_input_line(text: &str) -> Result<String> {
     Ok(serde_json::to_string(&json!({
         "type": "user",
         "message": {
@@ -435,7 +483,7 @@ fn session_url(base_url: &str, thread_key: &str) -> String {
     format!("{base_url}/api/session/{}", urlencoding::encode(thread_key))
 }
 
-fn next_frame(buffer: &str) -> Option<(usize, usize)> {
+pub(crate) fn next_frame(buffer: &str) -> Option<(usize, usize)> {
     let lf = buffer.find("\n\n").map(|index| (index, 2));
     let crlf = buffer.find("\r\n\r\n").map(|index| (index, 4));
     match (lf, crlf) {
@@ -445,11 +493,11 @@ fn next_frame(buffer: &str) -> Option<(usize, usize)> {
     }
 }
 
-fn parse_json_or_string(data: &str) -> Value {
+pub(crate) fn parse_json_or_string(data: &str) -> Value {
     serde_json::from_str(data).unwrap_or_else(|_| Value::String(data.to_owned()))
 }
 
-fn is_terminal_event(event: &str) -> bool {
+pub(crate) fn is_terminal_event(event: &str) -> bool {
     matches!(
         event,
         "session.execution_completed" | "session.execution_failed" | "session.execution_cancelled"
@@ -457,7 +505,7 @@ fn is_terminal_event(event: &str) -> bool {
 }
 
 #[derive(Debug)]
-enum StdinEvent {
+pub(crate) enum StdinEvent {
     Message(String),
     InputLine(String),
     InputLines(Vec<String>),
@@ -465,7 +513,7 @@ enum StdinEvent {
 }
 
 impl StdinEvent {
-    fn parse(line: &str) -> Result<Option<Self>> {
+    pub(crate) fn parse(line: &str) -> Result<Option<Self>> {
         let line = line.trim();
         if line.is_empty() {
             return Ok(None);
@@ -539,14 +587,14 @@ fn parse_json_stdin_event(line: &str) -> Result<StdinEvent> {
 }
 
 #[derive(Debug)]
-struct SseFrame {
-    id: Option<String>,
-    event: String,
-    data: String,
+pub(crate) struct SseFrame {
+    pub(crate) id: Option<String>,
+    pub(crate) event: String,
+    pub(crate) data: String,
 }
 
 impl SseFrame {
-    fn parse(frame: &str) -> Option<Self> {
+    pub(crate) fn parse(frame: &str) -> Option<Self> {
         let frame = frame.replace("\r\n", "\n");
         let mut id = None;
         let mut event = "message".to_owned();
