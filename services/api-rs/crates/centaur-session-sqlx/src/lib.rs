@@ -26,7 +26,7 @@ impl PgSessionStore {
 
     pub async fn connect(database_url: &str) -> Result<Self, SessionStoreError> {
         let pool = PgPoolOptions::new()
-            .max_connections(10)
+            .max_connections(50)
             .connect(database_url)
             .await?;
         Ok(Self::new(pool))
