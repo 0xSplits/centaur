@@ -11,7 +11,7 @@ use thiserror::Error;
 use time::OffsetDateTime;
 
 pub const MAX_THREAD_KEY_BYTES: usize = 512;
-pub const MAX_HARNESS_TYPE_BYTES: usize = 64;
+pub const SUPPORTED_HARNESS_TYPES: &[&str] = &["codex", "amp", "claudecode"];
 
 #[derive(Clone, Debug, Eq, PartialEq, Hash)]
 pub struct ThreadKey(String);
@@ -116,21 +116,34 @@ fn validate_thread_key(value: &str) -> Result<(), ThreadKeyError> {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Hash)]
-pub struct HarnessType(String);
+pub enum HarnessType {
+    Codex,
+    Amp,
+    ClaudeCode,
+}
 
 impl HarnessType {
     pub fn parse(value: impl Into<String>) -> Result<Self, HarnessTypeError> {
         let value = value.into();
-        validate_harness_type(&value)?;
-        Ok(Self(value))
+        match value.as_str() {
+            "" => Err(HarnessTypeError::Empty),
+            "codex" => Ok(Self::Codex),
+            "amp" => Ok(Self::Amp),
+            "claudecode" => Ok(Self::ClaudeCode),
+            _ => Err(HarnessTypeError::Unsupported),
+        }
     }
 
     pub fn as_str(&self) -> &str {
-        &self.0
+        match self {
+            Self::Codex => "codex",
+            Self::Amp => "amp",
+            Self::ClaudeCode => "claudecode",
+        }
     }
 
     pub fn into_string(self) -> String {
-        self.0
+        self.as_str().to_owned()
     }
 }
 
@@ -171,25 +184,8 @@ impl<'de> Deserialize<'de> for HarnessType {
 pub enum HarnessTypeError {
     #[error("harness_type is required")]
     Empty,
-    #[error("harness_type must be at most {MAX_HARNESS_TYPE_BYTES} bytes")]
-    TooLong,
-    #[error("harness_type may only contain ASCII lowercase letters, digits, '-' and '_'")]
-    InvalidCharacter,
-}
-
-fn validate_harness_type(value: &str) -> Result<(), HarnessTypeError> {
-    if value.is_empty() {
-        return Err(HarnessTypeError::Empty);
-    }
-    if value.len() > MAX_HARNESS_TYPE_BYTES {
-        return Err(HarnessTypeError::TooLong);
-    }
-    if !value.bytes().all(|byte| {
-        byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-' || byte == b'_'
-    }) {
-        return Err(HarnessTypeError::InvalidCharacter);
-    }
-    Ok(())
+    #[error("harness_type must be one of: codex, amp, claudecode")]
+    Unsupported,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -398,11 +394,21 @@ mod tests {
     }
 
     #[test]
-    fn harness_type_rejects_spaces() {
-        let err = HarnessType::parse("claude code").unwrap_err();
+    fn harness_type_accepts_supported_values() {
+        assert_eq!(HarnessType::parse("codex").unwrap(), HarnessType::Codex);
+        assert_eq!(HarnessType::parse("amp").unwrap(), HarnessType::Amp);
+        assert_eq!(
+            HarnessType::parse("claudecode").unwrap(),
+            HarnessType::ClaudeCode
+        );
+    }
+
+    #[test]
+    fn harness_type_rejects_unsupported_values() {
+        let err = HarnessType::parse("claude-code").unwrap_err();
         assert_eq!(
             err.to_string(),
-            "harness_type may only contain ASCII lowercase letters, digits, '-' and '_'"
+            "harness_type must be one of: codex, amp, claudecode"
         );
     }
 }

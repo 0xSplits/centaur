@@ -9,7 +9,8 @@ create table if not exists sessions (
     updated_at timestamptz not null default now(),
     constraint sessions_thread_key_len check (octet_length(thread_key) <= 512),
     constraint sessions_thread_key_namespaced check (position(':' in thread_key) > 1),
-    constraint sessions_harness_type_len check (octet_length(harness_type) between 1 and 64)
+    constraint sessions_harness_type_len check (octet_length(harness_type) between 1 and 64),
+    constraint sessions_harness_type_supported check (harness_type in ('codex', 'amp', 'claudecode'))
 );
 
 create table if not exists session_messages (
