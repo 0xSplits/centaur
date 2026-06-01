@@ -229,6 +229,7 @@ dependencies = [
  "centaur-sandbox-local",
  "centaur-session-core",
  "centaur-session-sqlx",
+ "clap",
  "futures-util",
  "kube",
  "serde",

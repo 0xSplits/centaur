@@ -1,10 +1,11 @@
-use std::{env, net::SocketAddr, sync::Arc, time::Duration};
+use std::{net::SocketAddr, sync::Arc, time::Duration};
 
 use centaur_api_server::{SandboxRuntime, build_router_with_runtime};
 use centaur_sandbox_agent_k8s::{AgentSandboxBackend, AgentSandboxConfig};
 use centaur_sandbox_core::SandboxSpec;
 use centaur_sandbox_local::LocalSandboxBackend;
 use centaur_session_sqlx::PgSessionStore;
+use clap::{Parser, ValueEnum};
 use thiserror::Error;
 use tokio::net::TcpListener;
 use tracing::info;
@@ -14,21 +15,16 @@ use tracing_subscriber::{EnvFilter, fmt};
 async fn main() -> Result<(), ServerError> {
     init_tracing();
 
-    let database_url = env::var("DATABASE_URL").map_err(|_| ServerError::MissingDatabaseUrl)?;
-    let bind_addr = env::var("BIND_ADDR").unwrap_or_else(|_| "127.0.0.1:8080".to_owned());
-    let bind_addr: SocketAddr = bind_addr.parse()?;
-    let run_migrations = env::var("RUN_MIGRATIONS")
-        .map(|value| matches!(value.as_str(), "1" | "true" | "TRUE" | "yes"))
-        .unwrap_or(false);
+    let args = Args::parse();
 
-    let store = PgSessionStore::connect(&database_url).await?;
-    if run_migrations {
+    let store = PgSessionStore::connect(&args.database_url).await?;
+    if args.run_migrations {
         store.run_migrations().await?;
     }
-    let sandbox_runtime = sandbox_runtime_from_env().await?;
+    let sandbox_runtime = sandbox_runtime_from_args(&args).await?;
 
-    let listener = TcpListener::bind(bind_addr).await?;
-    info!(%bind_addr, "starting centaur api-rs server");
+    let listener = TcpListener::bind(args.bind_addr).await?;
+    info!(bind_addr = %args.bind_addr, "starting centaur api-rs server");
 
     axum::serve(listener, build_router_with_runtime(store, sandbox_runtime))
         .with_graceful_shutdown(shutdown_signal())
@@ -45,30 +41,20 @@ async fn shutdown_signal() {
     let _ = tokio::signal::ctrl_c().await;
 }
 
-async fn sandbox_runtime_from_env() -> Result<SandboxRuntime, ServerError> {
-    let backend = env::var("SESSION_SANDBOX_BACKEND").unwrap_or_else(|_| "mock".to_owned());
-    match backend.as_str() {
-        "mock" => Ok(SandboxRuntime::Mock),
-        "local" => Ok(SandboxRuntime::backend(
+async fn sandbox_runtime_from_args(args: &Args) -> Result<SandboxRuntime, ServerError> {
+    match args.session_sandbox_backend {
+        SandboxBackendKind::Mock => Ok(SandboxRuntime::Mock),
+        SandboxBackendKind::Local => Ok(SandboxRuntime::backend(
             Arc::new(LocalSandboxBackend::new()),
             local_mock_app_server_spec(),
         )),
-        "agent-k8s" => {
-            let namespace = env::var("SESSION_SANDBOX_K8S_NAMESPACE")
-                .unwrap_or_else(|_| "centaur-sandbox-e2e".to_owned());
-            let image =
-                env::var("SESSION_SANDBOX_IMAGE").unwrap_or_else(|_| "busybox:1.36".to_owned());
-            let mut config = AgentSandboxConfig::new(namespace);
-            config.ready_timeout = Duration::from_secs(
-                env::var("SESSION_SANDBOX_READY_TIMEOUT_SECS")
-                    .ok()
-                    .and_then(|value| value.parse().ok())
-                    .unwrap_or(90),
-            );
+        SandboxBackendKind::AgentK8s => {
+            let mut config = AgentSandboxConfig::new(args.session_sandbox_k8s_namespace.clone());
+            config.ready_timeout = Duration::from_secs(args.session_sandbox_ready_timeout_secs);
 
-            let backend = if let Ok(context) = env::var("SESSION_SANDBOX_K8S_CONTEXT") {
+            let backend = if let Some(context) = args.session_sandbox_k8s_context.as_deref() {
                 let kube_config = kube::Config::from_kubeconfig(&kube::config::KubeConfigOptions {
-                    context: Some(context),
+                    context: Some(context.to_owned()),
                     ..kube::config::KubeConfigOptions::default()
                 })
                 .await?;
@@ -79,11 +65,48 @@ async fn sandbox_runtime_from_env() -> Result<SandboxRuntime, ServerError> {
 
             Ok(SandboxRuntime::backend(
                 Arc::new(backend),
-                agent_k8s_mock_app_server_spec(&image),
+                agent_k8s_mock_app_server_spec(&args.session_sandbox_image),
             ))
         }
-        other => Err(ServerError::InvalidSandboxBackend(other.to_owned())),
     }
+}
+
+#[derive(Debug, Parser)]
+#[command(about = "Run the Centaur API Rust session control plane")]
+struct Args {
+    #[arg(long, env = "DATABASE_URL")]
+    database_url: String,
+    #[arg(long, env = "BIND_ADDR", default_value = "127.0.0.1:8080")]
+    bind_addr: SocketAddr,
+    #[arg(long, env = "RUN_MIGRATIONS", default_value_t = false)]
+    run_migrations: bool,
+    #[arg(
+        long,
+        env = "SESSION_SANDBOX_BACKEND",
+        value_enum,
+        default_value = "mock"
+    )]
+    session_sandbox_backend: SandboxBackendKind,
+    #[arg(
+        long,
+        env = "SESSION_SANDBOX_K8S_NAMESPACE",
+        default_value = "centaur-sandbox-e2e"
+    )]
+    session_sandbox_k8s_namespace: String,
+    #[arg(long, env = "SESSION_SANDBOX_IMAGE", default_value = "busybox:1.36")]
+    session_sandbox_image: String,
+    #[arg(long, env = "SESSION_SANDBOX_READY_TIMEOUT_SECS", default_value_t = 90)]
+    session_sandbox_ready_timeout_secs: u64,
+    #[arg(long, env = "SESSION_SANDBOX_K8S_CONTEXT")]
+    session_sandbox_k8s_context: Option<String>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
+enum SandboxBackendKind {
+    Mock,
+    Local,
+    #[value(name = "agent-k8s")]
+    AgentK8s,
 }
 
 fn local_mock_app_server_spec() -> SandboxSpec {
@@ -122,12 +145,6 @@ done"#
 
 #[derive(Debug, Error)]
 enum ServerError {
-    #[error("DATABASE_URL is required")]
-    MissingDatabaseUrl,
-    #[error("unknown SESSION_SANDBOX_BACKEND {0:?}; expected mock, local, or agent-k8s")]
-    InvalidSandboxBackend(String),
-    #[error(transparent)]
-    AddrParse(#[from] std::net::AddrParseError),
     #[error(transparent)]
     Io(#[from] std::io::Error),
     #[error(transparent)]
