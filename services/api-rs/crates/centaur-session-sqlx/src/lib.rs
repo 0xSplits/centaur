@@ -163,39 +163,6 @@ impl PgSessionStore {
         row.try_into()
     }
 
-    pub async fn claim_next_execution(
-        &self,
-        thread_key: &ThreadKey,
-    ) -> Result<Option<SessionExecution>, SessionStoreError> {
-        let row = sqlx::query_as::<_, SessionExecutionRow>(
-            r#"
-            update session_executions
-            set status = $2, started_at = coalesce(started_at, now()), updated_at = now()
-            where execution_id = (
-                select execution_id
-                from session_executions
-                where thread_key = $1 and status = $3
-                order by created_at, execution_id
-                for update skip locked
-                limit 1
-            )
-            returning execution_id, thread_key, status, metadata, error, created_at, updated_at, started_at, completed_at
-            "#,
-        )
-        .bind(thread_key.as_str())
-        .bind(ExecutionStatus::Running.as_str())
-        .bind(ExecutionStatus::Queued.as_str())
-        .fetch_optional(&self.pool)
-        .await?;
-
-        if let Some(row) = row {
-            self.set_session_status(&row.thread_key, SessionStatus::Executing)
-                .await?;
-            return row.try_into().map(Some);
-        }
-        Ok(None)
-    }
-
     pub async fn mark_execution_running(
         &self,
         execution_id: &str,
