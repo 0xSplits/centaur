@@ -115,7 +115,8 @@ fn validate_thread_key(value: &str) -> Result<(), ThreadKeyError> {
     Ok(())
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Hash)]
+#[derive(Clone, Debug, Eq, PartialEq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
 pub enum HarnessType {
     Codex,
     Amp,
@@ -158,25 +159,6 @@ impl FromStr for HarnessType {
 
     fn from_str(value: &str) -> Result<Self, Self::Err> {
         Self::parse(value)
-    }
-}
-
-impl Serialize for HarnessType {
-    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
-    where
-        S: Serializer,
-    {
-        serializer.serialize_str(self.as_str())
-    }
-}
-
-impl<'de> Deserialize<'de> for HarnessType {
-    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-    where
-        D: Deserializer<'de>,
-    {
-        let value = String::deserialize(deserializer)?;
-        Self::parse(value).map_err(de::Error::custom)
     }
 }
 
@@ -400,6 +382,18 @@ mod tests {
         assert_eq!(
             HarnessType::parse("claudecode").unwrap(),
             HarnessType::ClaudeCode
+        );
+    }
+
+    #[test]
+    fn harness_type_serializes_as_wire_value() {
+        assert_eq!(
+            serde_json::to_value(HarnessType::ClaudeCode).unwrap(),
+            serde_json::json!("claudecode")
+        );
+        assert_eq!(
+            serde_json::from_value::<HarnessType>(serde_json::json!("codex")).unwrap(),
+            HarnessType::Codex
         );
     }
 
