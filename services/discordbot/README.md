@@ -91,6 +91,9 @@ bun run dev           # run the server locally (needs env above)
 - The Gateway listener can't expose the precise close code on a fatal end; an unexpected
   disconnect exits the process so Kubernetes restarts it (CrashLoopBackOff surfaces bad
   token/intents). `/health` liveness is "listener still running", not a deep socket probe.
+- Concurrency is `'drop'`: the per-thread lock serializes handling so two near-simultaneous mentions
+  can't double-execute. The tradeoff is that a follow-up sent *while a stream is still running* is
+  dropped rather than appended mid-stream; send it again once the reply finishes.
 - Thread renaming is best-effort and applies on the first execution; a first mention inside a
   user-created thread will rename that thread (set `DISCORDBOT_NAME_THREADS=false` to disable).
 - A Gateway RESUME that replays a channel mention before state commits could, in rare cases, let

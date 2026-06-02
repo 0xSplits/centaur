@@ -96,7 +96,13 @@ export function createDiscordbot(rawOptions: DiscordbotOptions): Discordbot {
     userName,
     adapters: { discord },
     state: options.state ?? createDefaultState(options, logger),
-    onLockConflict: "force",
+    // Serialize handlers per thread via the SDK's per-thread lock. The deprecated
+    // `onLockConflict: 'force'` force-released the lock so two handlers ran concurrently on one
+    // thread — two near-simultaneous mentions could both pass the `activeExecution` check and
+    // double-execute. `'drop'` (the default conflict behavior) keeps the lock: a second message that
+    // lands while a handler holds the thread lock is dropped rather than run in parallel. Same code
+    // path as before for the no-contention case, so single-message streaming is unchanged.
+    concurrency: "drop",
     logger,
   });
 

@@ -193,7 +193,7 @@ async function createSession(
     headers: apiHeaders(options),
     body: JSON.stringify(body),
   });
-  await ensureApiOk(response, "create session");
+  await ensureApiOk(response, "create session", options);
 }
 
 async function appendSessionMessages(
@@ -215,7 +215,7 @@ async function appendSessionMessages(
       body: JSON.stringify(body),
     },
   );
-  await ensureApiOk(response, "append session messages");
+  await ensureApiOk(response, "append session messages", options);
 }
 
 async function executeSession(
@@ -242,10 +242,14 @@ async function executeSession(
       body: JSON.stringify(body),
     },
   );
-  await ensureApiOk(response, "execute session");
+  await ensureApiOk(response, "execute session", options);
 }
 
-async function ensureApiOk(response: Response, action: string): Promise<void> {
+async function ensureApiOk(
+  response: Response,
+  action: string,
+  options: SessionApiOptions,
+): Promise<void> {
   if (response.ok) return;
   let body = "";
   try {
@@ -253,10 +257,18 @@ async function ensureApiOk(response: Response, action: string): Promise<void> {
   } catch {
     body = "";
   }
-  const suffix = body ? `: ${body}` : "";
-  throw new Error(
-    `Centaur session ${action} failed: ${response.status} ${response.statusText}${suffix}`,
-  );
+  // api-rs is internal and unauthenticated; its error bodies can carry stack traces, internal
+  // hostnames, or echoed payloads. Log the full body server-side, but the thrown message must stay
+  // generic — it is surfaced verbatim into the user-facing chat thread via sessionStreamError.
+  if (body) {
+    options.logger?.warn(`${options.platform.tracePrefix}_session_api_error`, {
+      action,
+      status: response.status,
+      status_text: response.statusText,
+      body,
+    });
+  }
+  throw new Error(`Centaur session ${action} failed (${response.status})`);
 }
 
 async function streamSessionNotifications(
@@ -273,7 +285,7 @@ async function streamSessionNotifications(
       headers: apiHeaders(options, false),
     },
   );
-  await ensureApiOk(response, "stream events");
+  await ensureApiOk(response, "stream events", options);
   if (!response.body) return toAsyncIterable([]);
   return parseSessionEventStream(response.body, onEventId);
 }
