@@ -39,6 +39,8 @@ export type ChatSDKSessionClosed = {
 
 export type ChatSDKOutput = ChatSDKMessageUpsert | ChatSDKSessionClosed | ChatSDKStreamAppend
 
+const MAX_TASK_BODY_CHARS = 3000
+
 export class ChatSDKRenderer implements RendererInterface<ChatSDKOutput> {
   open(): ChatSDKOutput[] {
     return []
@@ -101,17 +103,38 @@ function taskChunk(task: RendererTaskUpdate): ChatSDKStreamChunk {
     title: task.title,
     status: task.status,
     ...(task.details?.length ? { details: taskBodyToChatSdkText(task.details) } : {}),
-    ...(task.output?.length ? { output: taskBodyToChatSdkText(task.output) } : {})
+    ...(task.output?.length
+      ? { output: taskBodyToChatSdkText(task.output, { fenceCode: false, truncate: false }) }
+      : {})
   }
 }
 
-function taskBodyToChatSdkText(blocks: RendererTaskBlock[]): string {
-  return blocks
+function taskBodyToChatSdkText(
+  blocks: RendererTaskBlock[],
+  options: { fenceCode?: boolean; truncate?: boolean } = {}
+): string {
+  const fenceCode = options.fenceCode ?? true
+  const truncate = options.truncate ?? true
+  const text = blocks
     .map(block => {
       if (block.type === 'text') return block.text
+      if (!fenceCode) return block.text
       const language = block.language ?? ''
       return `\`\`\`${language}\n${block.text}\n\`\`\``
     })
     .filter(Boolean)
     .join('\n')
+  return truncate ? truncateTaskBody(text) : text
+}
+
+function truncateTaskBody(text: string): string {
+  if (text.length <= MAX_TASK_BODY_CHARS) return text
+  let omitted = text.length - MAX_TASK_BODY_CHARS
+  while (true) {
+    const suffix = `\n[truncated ${omitted} chars from task body]`
+    const keep = Math.max(0, MAX_TASK_BODY_CHARS - suffix.length)
+    const actualOmitted = text.length - keep
+    if (actualOmitted === omitted) return `${text.slice(0, keep).trimEnd()}${suffix}`
+    omitted = actualOmitted
+  }
 }

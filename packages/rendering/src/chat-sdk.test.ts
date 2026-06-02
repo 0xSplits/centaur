@@ -60,4 +60,34 @@ describe('ChatSDKRenderer', () => {
       }
     ])
   })
+
+  it('bounds large task details while preserving full task output', () => {
+    const renderer = new ChatSDKRenderer()
+    const largeDetails = 'd'.repeat(10000)
+    const largeOutput = 'x'.repeat(10000)
+
+    const rendered = renderer.render('session-1', {
+      type: 'renderer.task.update',
+      task: {
+        id: 'cmd-1',
+        title: '1. Command execution',
+        status: 'complete',
+        details: [{ type: 'code', text: largeDetails, language: 'text' }],
+        output: [{ type: 'code', text: largeOutput, language: 'text' }]
+      }
+    })
+
+    const chunk = rendered[0]?.type === 'chat.stream.append' ? rendered[0].chunks[0] : undefined
+    expect(chunk).toEqual(
+      expect.objectContaining({
+        type: 'task_update',
+        id: 'cmd-1',
+        status: 'complete'
+      })
+    )
+    expect(chunk?.type === 'task_update' ? chunk.details?.length : 0).toBeLessThanOrEqual(3000)
+    expect(chunk?.type === 'task_update' ? chunk.details : '').toContain('[truncated')
+    expect(chunk?.type === 'task_update' ? chunk.output : '').toBe(largeOutput)
+    expect(chunk?.type === 'task_update' ? chunk.output : '').not.toContain('[truncated')
+  })
 })
