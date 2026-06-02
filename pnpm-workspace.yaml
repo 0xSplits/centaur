@@ -2,3 +2,4 @@ packages:
   - 'packages/*'
   - 'services/slackbot'
   - 'services/slackbotv2'
+  - 'services/discordbot'
