@@ -1,13 +1,35 @@
 ---
 title: Add Discord chat ingress (discordbot service)
 type: feat
-status: active
+status: in-progress
 date: 2026-06-01
 origin: docs/brainstorms/2026-06-01-discord-chat-ingress-brainstorm.md
 ticket: PE-7563
 ---
 
 # ✨ Add Discord chat ingress (`discordbot` service)
+
+## Implementation Status (2026-06-01)
+
+**Built & verified statically (typecheck + unit tests green):**
+- ✅ Phase 1 — `@chat-adapter/discord@4.30.0` added; lockfile updated.
+- ✅ Phase 2 — `@centaur/chat-session-bridge` extracted; `slackbotv2` switched onto it (its
+  emulation suite still 6/6). `discordbot` service built: `index.ts`, `gateway.ts`,
+  `discord-allowlist.ts`, `discord-threading.ts`, `server.ts`, `types.ts`. **Typechecks against the
+  real SDK.**
+- ✅ Phase 3 (partial) — unit tests for the allowlist (DM-deny, fail-closed), thread naming/rename,
+  and the gateway controller (active/shutdown/fatal-end). 21/21 green.
+- ✅ Phase 0 scaffolded — `spike/probe.ts` + README setup guide.
+- ✅ Discovery win: the adapter **auto-creates threads on mention**, so threading needed no custom
+  creation module — only the message-derived rename. Open Q #1 resolved from source (large
+  `durationMs` ⇒ one long-lived RESUME-backed connection, no IDENTIFY churn).
+
+**Still pending (need real infrastructure or are follow-ups):**
+- ⏳ Phase 0 spike must be **run** with real Discord credentials (Bun×discord.js, direct dispatch,
+  threading) — only the user can.
+- ⏳ Phase 3 — the full `chat-sdk-emulate` test (final-answer-after-plan, reconnect dedup).
+- ⏳ Phase 4 — deployment plumbing (Dockerfile, Justfile, Helm, CI).
+- Runtime acceptance criteria below remain unchecked until the spike/integration validate them.
 
 ## Enhancement Summary
 
