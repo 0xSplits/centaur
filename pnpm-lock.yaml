@@ -27,6 +27,25 @@ importers:
         specifier: ^4.1.0
         version: 4.1.0(@opentelemetry/api@1.9.1)(@types/node@25.9.0)(vite@8.0.0(@types/node@25.9.0)(jiti@2.6.1)(yaml@2.8.4))
 
+  packages/chat-session-bridge:
+    dependencies:
+      '@centaur/harness-events':
+        specifier: workspace:*
+        version: link:../harness-events
+    devDependencies:
+      '@types/bun':
+        specifier: ^1.3.13
+        version: 1.3.14
+      '@types/node':
+        specifier: ^25.7.0
+        version: 25.9.0
+      chat:
+        specifier: ^4.30.0
+        version: 4.30.0(zod@4.4.3)
+      typescript:
+        specifier: 5.9.3
+        version: 5.9.3
+
   packages/harness-events:
     devDependencies:
       '@types/node':
@@ -121,6 +140,9 @@ importers:
 
   services/slackbotv2:
     dependencies:
+      '@centaur/chat-session-bridge':
+        specifier: workspace:*
+        version: link:../../packages/chat-session-bridge
       '@centaur/harness-events':
         specifier: workspace:*
         version: link:../../packages/harness-events

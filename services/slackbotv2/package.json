@@ -10,6 +10,7 @@
     "check:types": "bun tsgo --project tsconfig.json --noEmit"
   },
   "dependencies": {
+    "@centaur/chat-session-bridge": "workspace:*",
     "@centaur/harness-events": "workspace:*",
     "@centaur/rendering": "workspace:*",
     "@chat-adapter/slack": "^4.30.0",

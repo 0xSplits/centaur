@@ -1,29 +1,29 @@
-import type { Logger } from 'chat'
-import type { JsonObject, SlackbotV2Options, SlackbotV2Trace } from './types'
+import type { Logger } from "chat";
+import type { JsonObject, SessionTrace, TraceableOptions } from "./types";
 
 export const noopLogger: Logger = {
   debug: () => undefined,
   info: () => undefined,
   warn: () => undefined,
   error: () => undefined,
-  child: () => noopLogger
-}
+  child: () => noopLogger,
+};
 
 export function nowMs(): number {
-  return globalThis.performance?.now?.() ?? Date.now()
+  return globalThis.performance?.now?.() ?? Date.now();
 }
 
 export function elapsedMs(startedAtMs: number): number {
-  return Math.max(0, Math.round(nowMs() - startedAtMs))
+  return Math.max(0, Math.round(nowMs() - startedAtMs));
 }
 
 export function traceLog(
-  options: SlackbotV2Options,
+  options: TraceableOptions,
   event: string,
-  trace?: SlackbotV2Trace,
-  fields: JsonObject = {}
+  trace?: SessionTrace,
+  fields: JsonObject = {},
 ): void {
-  const logger = options.logger ?? noopLogger
+  const logger = options.logger ?? noopLogger;
   logger.info(event, {
     ...(trace
       ? {
@@ -32,28 +32,30 @@ export function traceLog(
           message_id: trace.messageId,
           mode: trace.mode,
           open_stream: trace.openStream,
-          thread_id: trace.threadId
+          thread_id: trace.threadId,
         }
       : {}),
-    ...fields
-  })
+    ...fields,
+  });
 }
 
 export function errorMessage(error: unknown): string {
-  if (error instanceof Error) return error.message
-  return String(error)
+  if (error instanceof Error) return error.message;
+  return String(error);
 }
 
 export function stringValue(value: unknown): string | undefined {
-  return typeof value === 'string' && value.trim() ? value.trim() : undefined
+  return typeof value === "string" && value.trim() ? value.trim() : undefined;
 }
 
 export function isJsonObject(value: unknown): value is JsonObject {
-  return Boolean(value && typeof value === 'object' && !Array.isArray(value))
+  return Boolean(value && typeof value === "object" && !Array.isArray(value));
 }
 
-export async function* toAsyncIterable<T>(source: Iterable<T>): AsyncIterable<T> {
+export async function* toAsyncIterable<T>(
+  source: Iterable<T>,
+): AsyncIterable<T> {
   for await (const item of source) {
-    yield item
+    yield item;
   }
 }
