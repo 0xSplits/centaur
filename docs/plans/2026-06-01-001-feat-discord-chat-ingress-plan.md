@@ -30,8 +30,9 @@ ticket: PE-7563
   *Helm rendering and the Docker build were not validated locally (no `helm`/registry build here).*
 
 **Still pending (need real infrastructure or are follow-ups):**
-- ⏳ Phase 0 spike must be **run** with real Discord credentials (Bun×discord.js, direct dispatch,
-  threading) — only the user can.
+- ✅ Phase 0 spike **run and passed** (2026-06-02): Bun×discord.js, direct dispatch, and auto-threading
+  all confirmed — an @-mention produced a threaded reply end-to-end. Spike code removed. (Also
+  surfaced + fixed a `tslib` resolution issue under Bun via a root `.npmrc` hoist.)
 - ⏳ Phase 3 — the full `chat-sdk-emulate` integration test (final-answer-after-plan, reconnect dedup).
 - ⏳ Validate `helm template` renders and the Docker image builds in CI.
 - Runtime acceptance criteria below remain unchecked until the spike/integration validate them.

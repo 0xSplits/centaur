@@ -59,24 +59,12 @@ DMs are denied unconditionally (DM intents are not requested).
 5. Set `DISCORDBOT_GUILD_ALLOWLIST` to the server(s) you invited it to — the bot is **inert** until
    this is set.
 
-## Phase 0 spike (run before deploying)
+## Runtime assumptions (validated 2026-06-02)
 
-The build typechecks against the real SDK, but three things can only be confirmed at runtime.
-Validate them with the throwaway probe:
-
-```bash
-DISCORD_BOT_TOKEN=... DISCORD_PUBLIC_KEY=... DISCORD_APPLICATION_ID=... \
-  bun run services/discordbot/spike/probe.ts
-```
-
-Then `@`-mention the bot in a channel and in a thread, and check the JSON logs for:
-
-- `SPIKE_initialized` (Bun runs discord.js's Gateway) — **approach-killer #1**.
-- `SPIKE_on_new_mention` firing at all — **direct dispatch #2**.
-- `created_or_used_thread: true` with a `discord_thread_id` on a channel mention — **threading #3**.
-- `SPIKE_allMessages_count` and `author_is_me` — context backfill + self-loop safety.
-
-If any fails, revisit the approach before deploying (see the plan's Phase 0).
+A throwaway spike confirmed the three things the static build couldn't prove: discord.js's Gateway
+runs under Bun, a Gateway `MESSAGE_CREATE` dispatches in-process to `chat.onNewMention`, and a
+channel mention auto-creates a thread that the bot streams into. An `@`-mention produced a threaded
+reply end-to-end. The spike has served its purpose and been removed.
 
 ## Develop / test
 
