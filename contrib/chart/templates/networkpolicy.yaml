@@ -112,6 +112,11 @@ spec:
             matchLabels:
 {{ include "centaur.componentSelectorLabels" (dict "root" . "component" "slackbotv2") | nindent 14 }}
 {{- end }}
+{{- if .Values.discordbot.enabled }}
+        - podSelector:
+            matchLabels:
+{{ include "centaur.componentSelectorLabels" (dict "root" . "component" "discordbot") | nindent 14 }}
+{{- end }}
         # Sandboxes call back into the control plane. agent-k8s labels its pods
         # centaur.ai/managed-by=api-rs (MANAGED_BY_VALUE in centaur-sandbox-agent-k8s),
         # which also covers the per-sandbox iron-proxy pods.
