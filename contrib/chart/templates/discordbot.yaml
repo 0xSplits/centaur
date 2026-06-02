@@ -1,0 +1,166 @@
+{{- if .Values.discordbot.enabled }}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "centaur.componentName" (dict "root" . "component" "discordbot") }}
+  labels:
+{{ include "centaur.componentLabels" (dict "root" . "component" "discordbot") | nindent 4 }}
+spec:
+  # Exactly one replica: two pods on the same bot token open two Gateway sessions and every
+  # message is handled twice. Recreate tears the old pod down before the new one logs in, so the
+  # token never holds two sessions during a rollout. Do NOT add an HPA.
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+{{ include "centaur.componentSelectorLabels" (dict "root" . "component" "discordbot") | nindent 6 }}
+  template:
+    metadata:
+      annotations:
+        checksum/secret-env: {{ toJson (dict "secretManager" .Values.secretManager "firewallCa" .Values.firewall.ca) | sha256sum }}
+        checksum/firewall-ca: {{ toJson .Values.firewall.ca | sha256sum }}
+        checksum/infra-secrets: {{ include "centaur.infraSecretsChecksum" . }}
+      labels:
+{{ include "centaur.componentSelectorLabels" (dict "root" . "component" "discordbot") | nindent 8 }}
+    spec:
+      automountServiceAccountToken: false
+      # Allow the Gateway to drain and close cleanly on SIGTERM (protects the IDENTIFY budget).
+      terminationGracePeriodSeconds: 35
+      {{- with .Values.global.imagePullSecrets }}
+      imagePullSecrets:
+{{ toYaml . | nindent 8 }}
+      {{- end }}
+      containers:
+        - name: discordbot
+          image: {{ printf "%s:%s" .Values.discordbot.image.repository .Values.discordbot.image.tag | quote }}
+          imagePullPolicy: {{ .Values.discordbot.image.pullPolicy }}
+          env:
+            - name: DATABASE_URL
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "centaur.secretEnvName" . }}
+                  key: {{ printf "%sDATABASE_URL" .Values.secretManager.envPrefix }}
+            - name: DISCORD_BOT_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "centaur.secretEnvName" . }}
+                  key: {{ printf "%sDISCORD_BOT_TOKEN" .Values.secretManager.envPrefix }}
+            - name: DISCORD_PUBLIC_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "centaur.secretEnvName" . }}
+                  key: {{ printf "%sDISCORD_PUBLIC_KEY" .Values.secretManager.envPrefix }}
+            - name: DISCORD_APPLICATION_ID
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "centaur.secretEnvName" . }}
+                  key: {{ printf "%sDISCORD_APPLICATION_ID" .Values.secretManager.envPrefix }}
+            - name: DISCORDBOT_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "centaur.secretEnvName" . }}
+                  key: {{ printf "%sDISCORDBOT_API_KEY" .Values.secretManager.envPrefix }}
+            - name: CENTAUR_API_URL
+              value: {{ printf "http://%s:8000" (include "centaur.componentName" (dict "root" . "component" "api")) | quote }}
+            - name: DISCORDBOT_GUILD_ALLOWLIST
+              value: {{ .Values.discordbot.guildAllowlist | quote }}
+            # The Discord Gateway WebSocket cannot be proxied (discord.js ignores HTTPS_PROXY), so
+            # discordbot reaches Discord directly. Trust the firewall CA for any intercepted HTTPS.
+            - name: NODE_EXTRA_CA_CERTS
+              value: /firewall-certs/ca-cert.pem
+{{- range $name, $value := .Values.discordbot.extraEnv }}
+            - name: {{ $name }}
+              value: {{ $value | quote }}
+{{- end }}
+          envFrom:
+            - secretRef:
+                name: {{ include "centaur.secretEnvName" . }}
+          ports:
+            - containerPort: 3001
+              name: http
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: 3001
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: 3001
+            # /health reflects the Gateway connection; give the listener time to connect on boot.
+            initialDelaySeconds: 20
+            periodSeconds: 15
+          volumeMounts:
+            - name: firewall-ca
+              mountPath: /firewall-certs
+              readOnly: true
+          securityContext:
+{{ toYaml .Values.containerSecurityContext | nindent 12 }}
+          resources:
+{{ toYaml .Values.discordbot.resources | nindent 12 }}
+      volumes:
+        - name: firewall-ca
+          secret:
+            secretName: {{ include "centaur.trustedCaSecretName" . }}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "centaur.componentName" (dict "root" . "component" "discordbot") }}
+  labels:
+{{ include "centaur.componentLabels" (dict "root" . "component" "discordbot") | nindent 4 }}
+spec:
+  selector:
+{{ include "centaur.componentSelectorLabels" (dict "root" . "component" "discordbot") | nindent 4 }}
+  ports:
+    - name: http
+      port: 3001
+      targetPort: 3001
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ include "centaur.componentName" (dict "root" . "component" "discordbot") }}
+  labels:
+{{ include "centaur.componentLabels" (dict "root" . "component" "discordbot") | nindent 4 }}
+spec:
+  podSelector:
+    matchLabels:
+{{ include "centaur.componentSelectorLabels" (dict "root" . "component" "discordbot") | nindent 6 }}
+  policyTypes:
+    - Ingress
+    - Egress
+  ingress:
+    # Only health probes need to reach discordbot; nothing else routes to it (Gateway is outbound).
+    - ports:
+        - protocol: TCP
+          port: 3001
+  egress:
+    - to:
+        - podSelector:
+            matchLabels:
+{{ include "centaur.componentSelectorLabels" (dict "root" . "component" "api") | nindent 14 }}
+      ports:
+        - protocol: TCP
+          port: 8000
+{{- if .Values.postgres.enabled }}
+    - to:
+        - podSelector:
+            matchLabels:
+{{ include "centaur.componentSelectorLabels" (dict "root" . "component" "postgres") | nindent 14 }}
+      ports:
+        - protocol: TCP
+          port: 5432
+{{- end }}
+    # DNS resolution.
+    - ports:
+        - protocol: UDP
+          port: 53
+        - protocol: TCP
+          port: 53
+    # Discord Gateway (wss), REST, and CDN all need direct HTTPS egress — the Gateway cannot be
+    # proxied, so this rule is load-bearing.
+    - ports:
+        - protocol: TCP
+          port: 443
+{{- end }}

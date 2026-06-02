@@ -17,6 +17,12 @@ slackbot:
   image:
     pullPolicy: IfNotPresent
 
+discordbot:
+  # Enable locally only when DISCORD_* secrets + a guild allowlist are configured.
+  enabled: false
+  image:
+    pullPolicy: IfNotPresent
+
 api:
   image:
     pullPolicy: IfNotPresent

@@ -12,6 +12,9 @@ Creates the required local-dev Kubernetes infra Secrets consumed by the Helm cha
 Requires OP_SERVICE_ACCOUNT_TOKEN, OP_VAULT, SLACK_BOT_TOKEN,
 SLACK_SIGNING_SECRET, and SLACKBOT_API_KEY in the shell environment.
 
+Optional (for the Discord ingress): DISCORD_BOT_TOKEN, DISCORD_PUBLIC_KEY,
+DISCORD_APPLICATION_ID, DISCORDBOT_API_KEY.
+
 Optional 1Password Connect bootstrap (when ironProxy.manager.secretSource is
 set to onepassword-connect in the Helm values):
   OP_CONNECT_CREDENTIALS_FILE  path to 1password-credentials.json; if set,
@@ -136,6 +139,15 @@ else
     --from-literal=POSTGRES_PASSWORD="$POSTGRES_PASSWORD"
     --from-literal=DATABASE_URL="$DATABASE_URL"
   )
+  # Discord ingress (discordbot) — optional; only needed when discordbot.enabled=true.
+  if [[ -n "${DISCORD_BOT_TOKEN:-}" ]]; then
+    secret_args+=(
+      --from-literal=DISCORD_BOT_TOKEN="$DISCORD_BOT_TOKEN"
+      --from-literal=DISCORD_PUBLIC_KEY="${DISCORD_PUBLIC_KEY:-}"
+      --from-literal=DISCORD_APPLICATION_ID="${DISCORD_APPLICATION_ID:-}"
+      --from-literal=DISCORDBOT_API_KEY="${DISCORDBOT_API_KEY:-$(rand_hex)}"
+    )
+  fi
   if [[ -n "${OP_CONNECT_TOKEN:-}" ]]; then
     secret_args+=(--from-literal=OP_CONNECT_TOKEN="$OP_CONNECT_TOKEN")
   fi

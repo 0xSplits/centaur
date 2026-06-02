@@ -192,6 +192,19 @@ slackbot:
   extraEnv: {}
   resources: {}
 
+discordbot:
+  # Off by default — requires a Discord app + Message Content Intent + a guild allowlist.
+  enabled: false
+  # Always exactly one replica (see templates/discordbot.yaml); not configurable.
+  image:
+    repository: centaur-discordbot
+    tag: latest
+    pullPolicy: Always
+  # Comma/space-separated Discord guild IDs. The bot is INERT (ignores all messages) until set.
+  guildAllowlist: ""
+  extraEnv: {}
+  resources: {}
+
 postgres:
   enabled: true
   image:

@@ -19,7 +19,7 @@ build:
       just _build-all-sequential
     else
       pids=()
-      for recipe in _build-api _build-iron-proxy _build-slackbot _build-agent; do
+      for recipe in _build-api _build-iron-proxy _build-slackbot _build-discordbot _build-agent; do
         just "$recipe" &
         pids+=("$!")
       done
@@ -34,6 +34,7 @@ _build-all-sequential:
     just _build-api
     just _build-iron-proxy
     just _build-slackbot
+    just _build-discordbot
     just _build-agent
 
 build-one service:
@@ -43,6 +44,7 @@ build-one service:
       api) just _build-api ;;
       iron-proxy) just _build-iron-proxy ;;
       slackbot) just _build-slackbot ;;
+      discordbot) just _build-discordbot ;;
       agent|sandbox) just _build-agent ;;
       *) echo "unknown service: {{service}}" >&2; exit 2 ;;
     esac
@@ -56,6 +58,9 @@ _build-iron-proxy:
 _build-slackbot:
     docker build -t centaur-slackbot:latest -f services/slackbot/Dockerfile .
 
+_build-discordbot:
+    docker build -t centaur-discordbot:latest -f services/discordbot/Dockerfile .
+
 _build-agent:
     docker build --target sandbox -t centaur-agent:latest -f services/sandbox/Dockerfile .
 
@@ -65,7 +70,7 @@ _build-agent:
 _import-k3s:
     #!/usr/bin/env bash
     set -euo pipefail
-    for img in centaur-api centaur-iron-proxy centaur-slackbot centaur-agent; do
+    for img in centaur-api centaur-iron-proxy centaur-slackbot centaur-discordbot centaur-agent; do
       echo "importing ${img}:latest into k3s containerd..."
       docker save "${img}:latest" | {{k3s_ctr}} images import -
     done
@@ -85,6 +90,7 @@ deploy:
           --set api.image.repository=ghcr.io/paradigmxyz/centaur/centaur-api
           --set ironProxy.image.repository=ghcr.io/paradigmxyz/centaur/centaur-iron-proxy
           --set slackbot.image.repository=ghcr.io/paradigmxyz/centaur/centaur-slackbot
+          --set discordbot.image.repository=ghcr.io/paradigmxyz/centaur/centaur-discordbot
           --set sandbox.image.repository=ghcr.io/paradigmxyz/centaur/centaur-agent
         )
         ;;

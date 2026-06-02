@@ -46,6 +46,10 @@ jobs:
             image: centaur-slackbot
             dockerfile: services/slackbot/Dockerfile
             target: ""
+          - service: discordbot
+            image: centaur-discordbot
+            dockerfile: services/discordbot/Dockerfile
+            target: ""
           - service: agent
             image: centaur-agent
             dockerfile: services/sandbox/Dockerfile

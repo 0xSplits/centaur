@@ -166,6 +166,13 @@
         "enabled": { "type": "boolean" }
       }
     },
+    "discordbot": {
+      "type": "object",
+      "properties": {
+        "enabled": { "type": "boolean" },
+        "guildAllowlist": { "type": "string" }
+      }
+    },
     "postgres": {
       "type": "object",
       "properties": {
