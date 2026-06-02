@@ -66,6 +66,11 @@ spec:
             matchLabels:
 {{ include "centaur.componentSelectorLabels" (dict "root" . "component" "slackbot") | nindent 14 }}
 {{- end }}
+{{- if .Values.discordbot.enabled }}
+        - podSelector:
+            matchLabels:
+{{ include "centaur.componentSelectorLabels" (dict "root" . "component" "discordbot") | nindent 14 }}
+{{- end }}
 {{- if .Values.ironControl.enabled }}
         - podSelector:
             matchLabels:
