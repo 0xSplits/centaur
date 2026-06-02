@@ -24,11 +24,16 @@ ticket: PE-7563
   creation module — only the message-derived rename. Open Q #1 resolved from source (large
   `durationMs` ⇒ one long-lived RESUME-backed connection, no IDENTIFY churn).
 
+- ✅ Phase 4 — deployment plumbing: Dockerfile (copies workspace packages), Justfile target +
+  k3s/ghcr, CI matrix entry, self-contained Helm template (Deployment `replicas:1`+`Recreate`,
+  Service, NetworkPolicy with direct `:443` egress), values + schema, optional Discord secrets.
+  *Helm rendering and the Docker build were not validated locally (no `helm`/registry build here).*
+
 **Still pending (need real infrastructure or are follow-ups):**
 - ⏳ Phase 0 spike must be **run** with real Discord credentials (Bun×discord.js, direct dispatch,
   threading) — only the user can.
-- ⏳ Phase 3 — the full `chat-sdk-emulate` test (final-answer-after-plan, reconnect dedup).
-- ⏳ Phase 4 — deployment plumbing (Dockerfile, Justfile, Helm, CI).
+- ⏳ Phase 3 — the full `chat-sdk-emulate` integration test (final-answer-after-plan, reconnect dedup).
+- ⏳ Validate `helm template` renders and the Docker image builds in CI.
 - Runtime acceptance criteria below remain unchecked until the spike/integration validate them.
 
 ## Enhancement Summary
