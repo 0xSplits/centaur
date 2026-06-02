@@ -7,7 +7,7 @@ RUN bun install -g pnpm@10.28.1
 
 # Manifests first for a cached install layer. Unlike the v1 slackbot, discordbot depends on
 # workspace packages, so their package.json files must be present to resolve `workspace:*` deps.
-COPY package.json pnpm-lock.yaml pnpm-workspace.yaml ./
+COPY package.json pnpm-lock.yaml pnpm-workspace.yaml .npmrc ./
 COPY packages/api-client/package.json packages/api-client/package.json
 COPY packages/harness-events/package.json packages/harness-events/package.json
 COPY packages/rendering/package.json packages/rendering/package.json
