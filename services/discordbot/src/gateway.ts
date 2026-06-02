@@ -2,13 +2,18 @@ import type { Chat, Logger } from "chat";
 import type { GatewayCapableAdapter } from "./types";
 
 /**
- * One year. `startGatewayListener` treats `durationMs` as a self-destruct timer; within that
- * window discord.js maintains a single Gateway session with native RESUME, so a very large value
- * gives us one long-lived connection rather than a re-IDENTIFY loop (which would burn the
- * 1000/24h IDENTIFY budget). If the connection ends before this elapses it's a fatal/login error
- * and we let the process exit so Kubernetes restarts the pod.
+ * `startGatewayListener` treats `durationMs` as a self-destruct timer backed by a single
+ * `setTimeout`; within that window discord.js maintains one Gateway session with native RESUME,
+ * so a large value gives us one long-lived connection rather than a re-IDENTIFY loop (which would
+ * burn the 1000/24h IDENTIFY budget). If the connection ends before this elapses it's a
+ * fatal/login error and we let the process exit so Kubernetes restarts the pod.
+ *
+ * This is capped at the maximum delay a 32-bit `setTimeout` can represent (2^31-1 ms ≈ 24.8 days).
+ * A larger value (e.g. one year) silently overflows and clamps to 1ms, firing the self-destruct
+ * almost immediately and crash-looping the pod. At ~24.8 days the timer forces at most one
+ * reconnect/IDENTIFY per window — negligible against the 1000/24h budget.
  */
-const LONG_RUNNING_MS = 365 * 24 * 60 * 60 * 1000;
+const LONG_RUNNING_MS = 2_147_483_647;
 
 export type GatewayController = {
   /** True once the listener has started and the connection has not ended. */
