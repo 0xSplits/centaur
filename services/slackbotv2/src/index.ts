@@ -1,9 +1,12 @@
+import { AsyncLocalStorage } from 'node:async_hooks'
+import { randomUUID } from 'node:crypto'
 import { Hono } from 'hono'
 import {
   Chat,
   StreamingPlan,
+  type Adapter,
   type Logger,
-  type Message,
+  type Message as ChatMessage,
   type StateAdapter,
   type Thread
 } from 'chat'
@@ -17,6 +20,8 @@ import {
 import {
   collectInitialContext,
   forwardToSessionApi,
+  isRetryableSessionApiError,
+  openSessionEventStream,
   serializeMessage,
   sessionStreamError,
   startingStreamNotification
@@ -28,6 +33,7 @@ import type {
   SlackbotV2ApiMessage,
   SlackbotV2MessageMode,
   SlackbotV2Options,
+  SlackbotV2RenderObligation,
   SlackbotV2RendererSource,
   SlackbotV2ThreadState,
   SlackbotV2Trace
@@ -62,6 +68,19 @@ type SlackAssistantAdapter = {
   setAssistantTitle?(channelId: string, threadTs: string, title: string): Promise<void>
 }
 
+type SlackbotV2RequestContext = {
+  retryableErrors: unknown[]
+  waitUntil(promise: Promise<unknown>): void
+}
+
+const requestContext = new AsyncLocalStorage<SlackbotV2RequestContext>()
+const RENDER_OBLIGATION_INDEX_KEY = 'slackbotv2:render:index'
+const RENDER_OBLIGATION_INDEX_MAX_LENGTH = 2000
+const RENDER_INDEX_TTL_MS = 30 * 24 * 60 * 60 * 1000
+const RENDER_RECOVERY_LEASE_TTL_MS = 2 * 60 * 1000
+const RENDER_RETRY_INITIAL_DELAY_MS = 250
+const RENDER_RETRY_MAX_DELAY_MS = 5_000
+
 export function createSlackbotV2(options: SlackbotV2Options): SlackbotV2 {
   const userName = options.userName ?? 'centaur'
   const logger = options.logger ?? noopLogger
@@ -73,10 +92,11 @@ export function createSlackbotV2(options: SlackbotV2Options): SlackbotV2 {
     userName,
     logger
   })
-  const chat = new Chat({
+  const state = options.state ?? createDefaultState(options, logger)
+  const chat = new Chat<{ slack: typeof slack }, SlackbotV2ThreadState>({
     userName,
     adapters: { slack },
-    state: options.state ?? createDefaultState(options, logger),
+    state,
     onLockConflict: 'force',
     logger
   })
@@ -86,7 +106,8 @@ export function createSlackbotV2(options: SlackbotV2Options): SlackbotV2 {
     await thread.subscribe()
     await syncThreadMessageToSession(thread, message, {
       mode: 'execute',
-      options
+      options,
+      state
     })
   })
 
@@ -94,7 +115,8 @@ export function createSlackbotV2(options: SlackbotV2Options): SlackbotV2 {
     if (!isAllowedSlackMessage(message, options, logger)) return
     await syncThreadMessageToSession(thread, message, {
       mode: message.isMention === true ? 'execute' : 'append',
-      options
+      options,
+      state
     })
   })
 
@@ -105,14 +127,45 @@ export function createSlackbotV2(options: SlackbotV2Options): SlackbotV2 {
     if (!isAllowedSlackWebhookBody(rawBody, options, logger)) {
       return new globalThis.Response('ok', { status: 200 })
     }
-    const response = await chat.webhooks.slack(c.req.raw, {
+    const awaitHandoff = shouldAwaitSlackHandoff(rawBody)
+    const handoffTasks: Promise<unknown>[] = []
+    const context: SlackbotV2RequestContext = {
+      retryableErrors: [],
       waitUntil: promise => waitUntil(c, promise)
+    }
+    const response = await requestContext.run(context, () => {
+      return chat.webhooks.slack(c.req.raw, {
+        waitUntil: promise => {
+          if (awaitHandoff) {
+            handoffTasks.push(promise)
+          } else {
+            waitUntil(c, promise)
+          }
+        }
+      })
     })
+    if (awaitHandoff && response.ok) {
+      try {
+        await Promise.all(handoffTasks)
+      } catch (error) {
+        if (isRetryableSessionApiError(error)) context.retryableErrors.push(error)
+      }
+      if (context.retryableErrors.length > 0) {
+        traceLog(options, 'slackbotv2_webhook_retry_requested', undefined, {
+          error: errorMessage(context.retryableErrors[0])
+        })
+        return new globalThis.Response('temporary upstream unavailable', { status: 503 })
+      }
+    }
     return new globalThis.Response(await response.text(), {
       headers: response.headers,
       status: response.status
     })
   })
+
+  if (options.recoverRenderObligationsOnStart !== false) {
+    scheduleRenderObligationRecovery(chat, state, options)
+  }
 
   return { app, chat }
 }
@@ -126,24 +179,27 @@ function createDefaultState(options: SlackbotV2Options, logger: Logger): StateAd
 }
 
 /**
- * Persists a Slack thread update into the session API. In execute mode it also starts and
- * renders a session stream unless another execution is already active for the same thread.
+ * Persists a Slack thread update into the session API. In execute mode the create/append/execute
+ * handoff completes before Slack is acknowledged; SSE rendering continues in background.
  */
 async function syncThreadMessageToSession(
   thread: Thread<SlackbotV2ThreadState>,
-  message: Message,
+  message: ChatMessage,
   input: {
     mode: SlackbotV2MessageMode
     options: SlackbotV2Options
+    state: StateAdapter
   }
 ): Promise<void> {
   const traceStartedAtMs = nowMs()
   const state = (await thread.state) ?? {}
   const messageIds = new Set(state.forwardedMessageIds ?? [])
-  const shouldStartExecution = input.mode === 'execute' && state.activeExecution !== true
-  const shouldIncludeContext = shouldStartExecution
+  const executedMessageIds = new Set(state.executedMessageIds ?? [])
+  const shouldStartExecution =
+    input.mode === 'execute' && state.activeExecution !== true && !executedMessageIds.has(message.id)
+  const shouldIncludeContext = shouldStartExecution && state.historyForwarded !== true
   const isDuplicateIncrementalMessage =
-    messageIds.has(message.id) && (!shouldIncludeContext || state.historyForwarded)
+    messageIds.has(message.id) && !shouldStartExecution && !shouldIncludeContext
   const trace: SlackbotV2Trace = {
     includeContext: shouldIncludeContext,
     messageId: message.id,
@@ -172,75 +228,422 @@ async function syncThreadMessageToSession(
   if (shouldIncludeContext && !state.historyForwarded) {
     const contextStartedAtMs = nowMs()
     context = await collectInitialContext(thread, message)
-    for (const item of context) {
-      messageIds.add(item.id)
-    }
     traceLog(input.options, 'slackbotv2_forward_context_collected', trace, {
       message_count: context.length,
       phase_ms: elapsedMs(contextStartedAtMs)
     })
   } else {
-    messageIds.add(serializedMessage.id)
     traceLog(input.options, 'slackbotv2_forward_context_skipped', trace, {
       message_count: 1
     })
   }
 
   let lastEventId = state.lastEventId ?? 0
+  const candidateMessages = context ?? [serializedMessage]
+  const messagesToAppend = candidateMessages.filter(item => !messageIds.has(item.id))
 
   const forwardInput: ForwardSessionInput = {
     afterEventId: lastEventId,
     executeMessage: shouldStartExecution ? serializedMessage : undefined,
-    messages: context ?? [serializedMessage],
+    messages: messagesToAppend,
     onEventId: eventId => {
       lastEventId = Math.max(lastEventId, eventId)
     },
-    openStream: shouldStartExecution,
+    openStream: false,
     threadId: thread.id,
     trace
   }
 
-  const commitForwardedState = async (): Promise<void> => {
+  const commitMessagesAppended = async (): Promise<void> => {
+    const latest = (await thread.state) ?? {}
+    const latestMessageIds = new Set(latest.forwardedMessageIds ?? [])
+    for (const item of messagesToAppend) latestMessageIds.add(item.id)
     await thread.setState({
-      activeExecution: state.activeExecution || shouldStartExecution,
-      forwardedMessageIds: Array.from(messageIds).slice(-1000),
-      historyForwarded: state.historyForwarded || shouldIncludeContext,
+      forwardedMessageIds: Array.from(latestMessageIds).slice(-1000),
+      historyForwarded: latest.historyForwarded || shouldIncludeContext,
       lastEventId
     })
-    traceLog(input.options, 'slackbotv2_forward_state_committed', trace, {
-      forwarded_message_count: Math.min(messageIds.size, 1000)
+    traceLog(input.options, 'slackbotv2_forward_messages_committed', trace, {
+      appended_message_count: messagesToAppend.length,
+      forwarded_message_count: Math.min(latestMessageIds.size, 1000)
+    })
+  }
+
+  const commitExecutionStarted = async (): Promise<void> => {
+    const latest = (await thread.state) ?? {}
+    const latestExecutedMessageIds = new Set(latest.executedMessageIds ?? [])
+    latestExecutedMessageIds.add(serializedMessage.id)
+    await thread.setState({
+      activeExecution: true,
+      executedMessageIds: Array.from(latestExecutedMessageIds).slice(-1000),
+      lastEventId,
+      renderObligation: {
+        afterEventId: lastEventId,
+        message: serializedMessage
+      }
+    })
+    await indexRenderObligation(input.state, {
+      options: input.options,
+      threadId: thread.id,
+      trace
+    })
+    traceLog(input.options, 'slackbotv2_forward_execution_committed', trace, {
+      executed_message_count: Math.min(latestExecutedMessageIds.size, 1000)
     })
   }
 
   if (!shouldStartExecution) {
-    await forwardToSessionApi(input.options, forwardInput)
-    await commitForwardedState()
+    try {
+      if (messagesToAppend.length > 0) {
+        await forwardToSessionApi(input.options, forwardInput, {
+          onMessagesAppended: commitMessagesAppended
+        })
+      }
+    } catch (error) {
+      if (isRetryableSessionApiError(error)) {
+        const context = requestContext.getStore()
+        if (context) {
+          context.retryableErrors.push(error)
+          try {
+            await input.state.delete(`dedupe:slack:${message.id}`)
+          } catch (deleteError) {
+            traceLog(input.options, 'slackbotv2_webhook_retry_dedupe_clear_failed', trace, {
+              error: errorMessage(deleteError)
+            })
+          }
+          traceLog(input.options, 'slackbotv2_webhook_retry_marked', trace, {
+            error: errorMessage(error)
+          })
+        }
+      }
+      throw error
+    }
     traceLog(input.options, 'slackbotv2_forward_complete', trace)
     return
   }
 
   try {
-    await thread.setState({ ...state, activeExecution: true })
+    await thread.setState({ activeExecution: true })
     traceLog(input.options, 'slackbotv2_forward_active_execution_marked', trace)
-    await renderExecutionStream(
+    await forwardToSessionApi(input.options, forwardInput, {
+      onExecutionStarted: commitExecutionStarted,
+      onMessagesAppended: commitMessagesAppended
+    })
+    scheduleExecutionRender(
       thread,
-      executeAndStreamSession(input.options, forwardInput, commitForwardedState),
       serializedMessage,
       input.options,
+      forwardInput,
+      () => lastEventId,
       trace
     )
-    traceLog(input.options, 'slackbotv2_render_complete', trace)
-  } finally {
-    const latest = (await thread.state) ?? {}
-    await thread.setState({
-      ...latest,
-      activeExecution: false,
-      lastEventId: Math.max(latest.lastEventId ?? 0, lastEventId)
-    })
     traceLog(input.options, 'slackbotv2_forward_complete', trace, {
       last_event_id: lastEventId
     })
+  } catch (error) {
+    const latest = (await thread.state) ?? {}
+    await thread.setState({
+      activeExecution: false,
+      lastEventId: Math.max(latest.lastEventId ?? 0, lastEventId)
+    })
+    if (isRetryableSessionApiError(error)) {
+      const context = requestContext.getStore()
+      if (context) {
+        context.retryableErrors.push(error)
+        try {
+          await input.state.delete(`dedupe:slack:${message.id}`)
+        } catch (deleteError) {
+          traceLog(input.options, 'slackbotv2_webhook_retry_dedupe_clear_failed', trace, {
+            error: errorMessage(deleteError)
+          })
+        }
+        traceLog(input.options, 'slackbotv2_webhook_retry_marked', trace, {
+          error: errorMessage(error)
+        })
+        throw error
+      }
+    }
+    await renderExecutionStream(thread, streamError(error), serializedMessage, input.options, trace)
+    traceLog(input.options, 'slackbotv2_forward_complete', trace, {
+      latest_active_execution: latest.activeExecution === true,
+      last_event_id: lastEventId
+    })
   }
+}
+
+function scheduleExecutionRender(
+  thread: Thread<SlackbotV2ThreadState>,
+  message: SlackbotV2ApiMessage,
+  options: SlackbotV2Options,
+  input: ForwardSessionInput,
+  getLastEventId: () => number,
+  trace?: SlackbotV2Trace
+): void {
+  const promise = (async () => {
+    let attempt = 0
+    while (true) {
+      const result = await renderExecutionAttempt(
+        thread,
+        message,
+        options,
+        input,
+        getLastEventId,
+        trace
+      )
+      if (result === 'complete') return
+      const delayMs = renderRetryDelayMs(attempt)
+      attempt += 1
+      traceLog(options, 'slackbotv2_render_retry_scheduled', trace, {
+        retry_delay_ms: delayMs,
+        retry_attempt: attempt
+      })
+      await sleep(delayMs)
+    }
+  })()
+  backgroundWaitUntil(promise)
+}
+
+async function renderExecutionAttempt(
+  thread: Thread<SlackbotV2ThreadState>,
+  message: SlackbotV2ApiMessage,
+  options: SlackbotV2Options,
+  input: ForwardSessionInput,
+  getLastEventId: () => number,
+  trace?: SlackbotV2Trace
+): Promise<'complete' | 'retry'> {
+  let rendered = false
+  let retry = false
+  try {
+    await renderExecutionStream(
+      thread,
+      streamSessionAfterHandoff(options, input),
+      message,
+      options,
+      trace
+    )
+    rendered = true
+    traceLog(options, 'slackbotv2_render_complete', trace)
+    return 'complete'
+  } catch (error) {
+    if (isRetryableSessionApiError(error)) {
+      retry = true
+      traceLog(options, 'slackbotv2_render_deferred', trace, {
+        error: errorMessage(error),
+        last_event_id: getLastEventId()
+      })
+      return 'retry'
+    }
+    traceLog(options, 'slackbotv2_render_failed', trace, {
+      error: errorMessage(error)
+    })
+    throw error
+  } finally {
+    const latest = (await thread.state) ?? {}
+    await thread.setState({
+      activeExecution: retry,
+      lastEventId: Math.max(latest.lastEventId ?? 0, getLastEventId()),
+      ...(rendered ? { renderObligation: null } : {})
+    })
+    traceLog(options, 'slackbotv2_render_finalized', trace, {
+      obligation_cleared: rendered,
+      retry_scheduled: retry,
+      last_event_id: getLastEventId()
+    })
+  }
+}
+
+function scheduleRenderObligationRecovery(
+  chat: Chat<Record<string, Adapter>, SlackbotV2ThreadState>,
+  state: StateAdapter,
+  options: SlackbotV2Options
+): void {
+  backgroundWaitUntil(
+    recoverRenderObligationsWithRetry(chat, state, options)
+  )
+}
+
+async function recoverRenderObligationsWithRetry(
+  chat: Chat<Record<string, Adapter>, SlackbotV2ThreadState>,
+  state: StateAdapter,
+  options: SlackbotV2Options
+): Promise<void> {
+  let attempt = 0
+  while (true) {
+    try {
+      const deferredCount = await recoverRenderObligations(chat, state, options)
+      if (deferredCount === 0) return
+      const delayMs = renderRetryDelayMs(attempt)
+      attempt += 1
+      traceLog(options, 'slackbotv2_render_recovery_retry_scheduled', undefined, {
+        deferred_count: deferredCount,
+        retry_delay_ms: delayMs,
+        retry_attempt: attempt
+      })
+      await sleep(delayMs)
+    } catch (error) {
+      traceLog(options, 'slackbotv2_render_recovery_failed', undefined, {
+        error: errorMessage(error)
+      })
+      return
+    }
+  }
+}
+
+async function recoverRenderObligations(
+  chat: Chat<Record<string, Adapter>, SlackbotV2ThreadState>,
+  state: StateAdapter,
+  options: SlackbotV2Options
+): Promise<number> {
+  const startedAtMs = nowMs()
+  await chat.initialize()
+  const indexedThreadIds = await state.getList<string>(RENDER_OBLIGATION_INDEX_KEY)
+  const threadIds = Array.from(new Set(indexedThreadIds))
+  let deferredCount = 0
+  traceLog(options, 'slackbotv2_render_recovery_scan', undefined, {
+    obligation_count: threadIds.length,
+    phase_ms: elapsedMs(startedAtMs)
+  })
+
+  for (const threadId of threadIds) {
+    const thread = chat.thread(threadId)
+    const threadState = await thread.state
+    const obligation = threadState?.renderObligation
+    if (!obligation) continue
+
+    const leaseToken = randomUUID()
+    const leaseAcquired = await state.setIfNotExists(
+      renderRecoveryLeaseKey(threadId),
+      leaseToken,
+      RENDER_RECOVERY_LEASE_TTL_MS
+    )
+    if (!leaseAcquired) {
+      traceLog(options, 'slackbotv2_render_recovery_lease_skipped', undefined, {
+        thread_id: threadId
+      })
+      continue
+    }
+
+    try {
+      if (await recoverRenderObligation(chat, state, options, threadId, obligation)) {
+        deferredCount += 1
+      }
+    } finally {
+      const activeLeaseToken = await state.get<string>(renderRecoveryLeaseKey(threadId))
+      if (activeLeaseToken === leaseToken) await state.delete(renderRecoveryLeaseKey(threadId))
+    }
+  }
+  return deferredCount
+}
+
+async function recoverRenderObligation(
+  chat: Chat<Record<string, Adapter>, SlackbotV2ThreadState>,
+  state: StateAdapter,
+  options: SlackbotV2Options,
+  threadId: string,
+  obligation: SlackbotV2RenderObligation
+): Promise<boolean> {
+  const trace: SlackbotV2Trace = {
+    includeContext: false,
+    messageId: obligation.message.id,
+    mode: 'execute',
+    openStream: true,
+    startedAtMs: nowMs(),
+    threadId
+  }
+  const thread = chat.thread(threadId)
+  const threadState = (await thread.state) ?? {}
+  let lastEventId = Math.max(threadState.lastEventId ?? 0, obligation.afterEventId)
+  const input: ForwardSessionInput = {
+    afterEventId: lastEventId,
+    messages: [],
+    onEventId: eventId => {
+      lastEventId = Math.max(lastEventId, eventId)
+    },
+    openStream: false,
+    threadId,
+    trace
+  }
+
+  let openedStream: AsyncIterable<SlackbotV2RendererSource>
+  try {
+    openedStream = await openSessionEventStream(options, input)
+  } catch (error) {
+    const retryable = isRetryableSessionApiError(error)
+    traceLog(options, 'slackbotv2_render_recovery_deferred', trace, {
+      error: errorMessage(error),
+      last_event_id: lastEventId,
+      retryable
+    })
+    if (retryable) return true
+    await renderRecoveredExecutionStream(thread, streamError(error), obligation.message, options, trace)
+    await thread.setState({
+      activeExecution: false,
+      lastEventId,
+      renderObligation: null
+    })
+    return false
+  }
+
+  let rendered = false
+  try {
+    await thread.setState({
+      activeExecution: true,
+      lastEventId
+    })
+    await renderRecoveredExecutionStream(
+      thread,
+      streamOpenedSession(input, openedStream),
+      obligation.message,
+      options,
+      trace
+    )
+    rendered = true
+    traceLog(options, 'slackbotv2_render_recovery_complete', trace)
+  } catch (error) {
+    traceLog(options, 'slackbotv2_render_recovery_render_failed', trace, {
+      error: errorMessage(error)
+    })
+    throw error
+  } finally {
+    const latest = (await thread.state) ?? {}
+    await thread.setState({
+      activeExecution: false,
+      lastEventId: Math.max(latest.lastEventId ?? 0, lastEventId),
+      ...(rendered ? { renderObligation: null } : {})
+    })
+    traceLog(options, 'slackbotv2_render_recovery_finalized', trace, {
+      obligation_cleared: rendered,
+      last_event_id: lastEventId
+    })
+  }
+  return false
+}
+
+async function indexRenderObligation(
+  state: StateAdapter,
+  input: {
+    options: SlackbotV2Options
+    threadId: string
+    trace?: SlackbotV2Trace
+  }
+): Promise<void> {
+  await state.appendToList(RENDER_OBLIGATION_INDEX_KEY, input.threadId, {
+    maxLength: RENDER_OBLIGATION_INDEX_MAX_LENGTH,
+    ttlMs: RENDER_INDEX_TTL_MS
+  })
+  traceLog(input.options, 'slackbotv2_render_obligation_indexed', input.trace)
+}
+
+async function* streamOpenedSession(
+  input: Pick<ForwardSessionInput, 'threadId' | 'trace'>,
+  stream: AsyncIterable<SlackbotV2RendererSource>
+): AsyncIterable<SlackbotV2RendererSource> {
+  yield startingStreamNotification(input.threadId)
+  for await (const event of stream) yield event
+}
+
+function renderRecoveryLeaseKey(threadId: string): string {
+  return `slackbotv2:render:lease:${threadId}`
 }
 
 async function renderExecutionStream(
@@ -268,24 +671,75 @@ async function renderExecutionStream(
   }
 }
 
-async function* executeAndStreamSession(
+async function renderRecoveredExecutionStream(
+  thread: Thread,
+  stream: AsyncIterable<SlackbotV2RendererSource>,
+  message: SlackbotV2ApiMessage,
   options: SlackbotV2Options,
-  input: ForwardSessionInput,
-  onSessionReady: () => Promise<void>
-): AsyncIterable<SlackbotV2RendererSource> {
-  yield startingStreamNotification(input.threadId)
-  traceLog(options, 'slackbotv2_stream_heartbeat_emitted', input.trace)
-
+  trace?: SlackbotV2Trace
+): Promise<void> {
+  const titleStartedAtMs = nowMs()
+  await setAssistantTitle(thread, titleFromMessage(message.text, options.userName))
+  await setAssistantStatus(thread, options.assistantStatus ?? 'Thinking...')
+  traceLog(options, 'slackbotv2_render_slack_metadata_set', trace, {
+    phase_ms: elapsedMs(titleStartedAtMs)
+  })
   try {
-    const stream = await forwardToSessionApi(options, input)
-    await onSessionReady()
-    if (!stream) return
-    for await (const event of stream) yield event
+    await thread.adapter.stream!(
+      thread.id,
+      codexAppServerToChatSdkStream(stream, rendererOptions(thread, options)),
+      {
+        recipientTeamId: message.teamId,
+        recipientUserId: message.author.userId,
+        taskDisplayMode: options.streamTaskDisplayMode ?? 'plan'
+      }
+    )
+  } finally {
+    await setAssistantStatus(thread, '')
+  }
+}
+
+async function* streamSessionAfterHandoff(
+  options: SlackbotV2Options,
+  input: ForwardSessionInput
+): AsyncIterable<SlackbotV2RendererSource> {
+  let stream: AsyncIterable<SlackbotV2RendererSource>
+  try {
+    stream = await openSessionEventStream(options, input)
   } catch (error) {
     traceLog(options, 'slackbotv2_forward_failed', input.trace, {
       error: errorMessage(error)
     })
+    if (isRetryableSessionApiError(error)) throw error
     yield sessionStreamError(error)
+    return
+  }
+
+  yield startingStreamNotification(input.threadId)
+  traceLog(options, 'slackbotv2_stream_heartbeat_emitted', input.trace)
+  for await (const event of stream) yield event
+}
+
+async function* streamError(error: unknown): AsyncIterable<SlackbotV2RendererSource> {
+  yield sessionStreamError(error)
+}
+
+function backgroundWaitUntil(promise: Promise<unknown>): void {
+  const context = requestContext.getStore()
+  if (context) {
+    context.waitUntil(promise)
+    return
+  }
+  void promise.catch(() => undefined)
+}
+
+function shouldAwaitSlackHandoff(rawBody: string): boolean {
+  try {
+    const payload = JSON.parse(rawBody) as { event?: { type?: unknown }; type?: unknown }
+    const eventType = payload.event?.type
+    return payload.type === 'event_callback' && (eventType === 'message' || eventType === 'app_mention')
+  } catch {
+    return false
   }
 }
 
@@ -300,6 +754,14 @@ function rendererOptions(thread: Thread, options: SlackbotV2Options): CodexAppSe
       }
     }
   }
+}
+
+function renderRetryDelayMs(attempt: number): number {
+  return Math.min(RENDER_RETRY_INITIAL_DELAY_MS * 2 ** attempt, RENDER_RETRY_MAX_DELAY_MS)
+}
+
+async function sleep(ms: number): Promise<void> {
+  await new Promise(resolve => setTimeout(resolve, ms))
 }
 
 async function setAssistantStatus(thread: Thread, status: string): Promise<void> {

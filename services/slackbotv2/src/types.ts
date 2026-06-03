@@ -34,6 +34,7 @@ export type SlackbotV2ApiMessage = {
   id: string
   isMention: boolean
   raw: unknown
+  teamId: string
   text: string
   threadId: string
   timestamp: string
@@ -77,6 +78,7 @@ export type SlackbotV2Options = {
   logger?: Logger
   maxDurationMs?: number
   postgresUrl?: string
+  recoverRenderObligationsOnStart?: boolean
   signingSecret: string
   slackApiUrl?: string
   state?: StateAdapter
@@ -94,9 +96,16 @@ export type SlackbotV2 = {
 
 export type SlackbotV2ThreadState = {
   activeExecution?: boolean
+  executedMessageIds?: string[]
   forwardedMessageIds?: string[]
   historyForwarded?: boolean
   lastEventId?: number
+  renderObligation?: SlackbotV2RenderObligation | null
+}
+
+export type SlackbotV2RenderObligation = {
+  afterEventId: number
+  message: SlackbotV2ApiMessage
 }
 
 export type SlackbotV2MessageMode = 'append' | 'execute'

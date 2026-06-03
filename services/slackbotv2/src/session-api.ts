@@ -15,6 +15,44 @@ import type {
 } from './types'
 import { elapsedMs, isJsonObject, nowMs, stringValue, toAsyncIterable, traceLog } from './utils'
 
+export class SessionApiError extends Error {
+  readonly action: string
+  readonly body: string
+  readonly retryable: boolean
+  readonly status: number
+  readonly statusText: string
+
+  constructor(input: {
+    action: string
+    body: string
+    retryable: boolean
+    status: number
+    statusText: string
+  }) {
+    const suffix = input.body ? `: ${input.body}` : ''
+    super(
+      `Centaur session ${input.action} failed: ${input.status} ${input.statusText}${suffix}`
+    )
+    this.name = 'SessionApiError'
+    this.action = input.action
+    this.body = input.body
+    this.retryable = input.retryable
+    this.status = input.status
+    this.statusText = input.statusText
+  }
+}
+
+export function isRetryableSessionApiError(error: unknown): boolean {
+  if (error instanceof SessionApiError) return error.retryable
+  if (!(error instanceof Error)) return false
+  return error.name === 'AbortError' || error.name === 'TypeError'
+}
+
+type ForwardSessionApiCallbacks = {
+  onExecutionStarted?(): Promise<void>
+  onMessagesAppended?(): Promise<void>
+}
+
 export async function collectInitialContext(
   thread: { allMessages: AsyncIterable<Message> },
   currentMessage: Message
@@ -56,27 +94,49 @@ export async function serializeMessage(message: Message): Promise<SlackbotV2ApiM
     id: message.id,
     isMention: message.isMention === true,
     raw: message.raw,
+    teamId: slackTeamId(message.raw) as string,
     text: message.text,
     threadId: message.threadId,
     timestamp: message.metadata.dateSent.toISOString()
   }
 }
 
+function slackTeamId(raw: unknown): string | undefined {
+  if (!isJsonObject(raw)) return undefined
+  const team = raw.team
+  if (typeof raw.team_id === 'string' && raw.team_id) return raw.team_id
+  if (typeof team === 'string' && team) return team
+  if (isJsonObject(team) && typeof team.id === 'string' && team.id) return team.id
+  const user = raw.user
+  if (isJsonObject(user) && typeof user.team_id === 'string' && user.team_id) {
+    return user.team_id
+  }
+  return undefined
+}
+
 export async function forwardToSessionApi(
   options: SlackbotV2Options,
-  input: ForwardSessionInput
+  input: ForwardSessionInput,
+  callbacks: ForwardSessionApiCallbacks = {}
 ): Promise<AsyncIterable<SlackbotV2RendererSource> | null> {
   const createStartedAtMs = nowMs()
   await createSession(options, input.threadId)
   traceLog(options, 'slackbotv2_session_create_complete', input.trace, {
     phase_ms: elapsedMs(createStartedAtMs)
   })
-  const appendStartedAtMs = nowMs()
-  await appendSessionMessages(options, input.threadId, input.messages)
-  traceLog(options, 'slackbotv2_session_append_complete', input.trace, {
-    message_count: input.messages.length,
-    phase_ms: elapsedMs(appendStartedAtMs)
-  })
+  if (input.messages.length > 0) {
+    const appendStartedAtMs = nowMs()
+    await appendSessionMessages(options, input.threadId, input.messages)
+    traceLog(options, 'slackbotv2_session_append_complete', input.trace, {
+      message_count: input.messages.length,
+      phase_ms: elapsedMs(appendStartedAtMs)
+    })
+    await callbacks.onMessagesAppended?.()
+  } else {
+    traceLog(options, 'slackbotv2_session_append_skipped', input.trace, {
+      message_count: 0
+    })
+  }
   if (!input.executeMessage) return null
 
   const executeStartedAtMs = nowMs()
@@ -84,8 +144,16 @@ export async function forwardToSessionApi(
   traceLog(options, 'slackbotv2_session_execute_complete', input.trace, {
     phase_ms: elapsedMs(executeStartedAtMs)
   })
+  await callbacks.onExecutionStarted?.()
   if (!input.openStream) return null
 
+  return openSessionEventStream(options, input)
+}
+
+export async function openSessionEventStream(
+  options: SlackbotV2Options,
+  input: Pick<ForwardSessionInput, 'afterEventId' | 'onEventId' | 'threadId' | 'trace'>
+): Promise<AsyncIterable<SlackbotV2RendererSource>> {
   const streamStartedAtMs = nowMs()
   const stream = await streamSessionNotifications(
     options,
@@ -219,8 +287,17 @@ async function ensureApiOk(response: Response, action: string): Promise<void> {
   } catch {
     body = ''
   }
-  const suffix = body ? `: ${body}` : ''
-  throw new Error(`Centaur session ${action} failed: ${response.status} ${response.statusText}${suffix}`)
+  throw new SessionApiError({
+    action,
+    body,
+    retryable: isRetryableApiStatus(response.status),
+    status: response.status,
+    statusText: response.statusText
+  })
+}
+
+function isRetryableApiStatus(status: number): boolean {
+  return status === 408 || status === 425 || status === 429 || status >= 500
 }
 
 async function streamSessionNotifications(
