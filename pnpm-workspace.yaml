@@ -2,6 +2,7 @@ packages:
   - packages/*
   - services/slackbot
   - services/slackbotv2
+  - services/discordbot
 
 patchedDependencies:
   '@chat-adapter/slack@4.30.0': patches/@chat-adapter__slack@4.30.0.patch
