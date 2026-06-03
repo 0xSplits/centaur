@@ -134,6 +134,16 @@ if secret_exists centaur-infra-env; then
   if [[ -n "${GITHUB_TOKEN:-}" ]]; then
     patch_data+=("\"GITHUB_TOKEN\":\"$(printf '%s' "$GITHUB_TOKEN" | base64 | tr -d '\n')\"")
   fi
+  # Discord ingress (discordbot) keys: added when DISCORD_BOT_TOKEN is in the env. DISCORD_* are
+  # overwritten on each run (so rotation works); DISCORDBOT_API_KEY is generated once if absent.
+  if [[ -n "${DISCORD_BOT_TOKEN:-}" ]]; then
+    patch_data+=("\"DISCORD_BOT_TOKEN\":\"$(printf '%s' "$DISCORD_BOT_TOKEN" | base64 | tr -d '\n')\"")
+    patch_data+=("\"DISCORD_PUBLIC_KEY\":\"$(printf '%s' "${DISCORD_PUBLIC_KEY:-}" | base64 | tr -d '\n')\"")
+    patch_data+=("\"DISCORD_APPLICATION_ID\":\"$(printf '%s' "${DISCORD_APPLICATION_ID:-}" | base64 | tr -d '\n')\"")
+    if ! secret_key_present DISCORDBOT_API_KEY; then
+      patch_data+=("\"DISCORDBOT_API_KEY\":\"$(printf '%s' "${DISCORDBOT_API_KEY:-$(rand_hex)}" | base64 | tr -d '\n')\"")
+    fi
+  fi
   # iron-control keys: top up only when absent so we never rotate them out from
   # under a running pod (its ActiveRecord-encrypted data would become
   # undecryptable). Generated values mirror the create path.
@@ -208,6 +218,14 @@ else
     --from-literal=IRON_CONTROL_AR_ENCRYPTION_KEY_DERIVATION_SALT="$(rand_hex)"
     --from-literal=IRON_CONTROL_SECRET_KEY_BASE="$(rand_hex)$(rand_hex)"
   )
+  if [[ -n "${DISCORD_BOT_TOKEN:-}" ]]; then
+    secret_args+=(
+      --from-literal=DISCORD_BOT_TOKEN="$DISCORD_BOT_TOKEN"
+      --from-literal=DISCORD_PUBLIC_KEY="${DISCORD_PUBLIC_KEY:-}"
+      --from-literal=DISCORD_APPLICATION_ID="${DISCORD_APPLICATION_ID:-}"
+      --from-literal=DISCORDBOT_API_KEY="${DISCORDBOT_API_KEY:-$(rand_hex)}"
+    )
+  fi
   if [[ -n "${OP_CONNECT_TOKEN:-}" ]]; then
     secret_args+=(--from-literal=OP_CONNECT_TOKEN="$OP_CONNECT_TOKEN")
   fi
