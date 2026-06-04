@@ -92,6 +92,10 @@ export function createDiscordbot(options: DiscordbotOptions): Discordbot {
     userName,
     adapters: { discord },
     state,
+    // Initial placeholder posted while the agent works, before any streamed
+    // content (the chat SDK default is a bare "..."). Overridable via options.
+    fallbackStreamingPlaceholderText:
+      options.streamingPlaceholderText ?? "✨ thinking...",
     // Serialize handlers per thread via the SDK's per-thread lock. The deprecated
     // `onLockConflict: 'force'` force-released the lock so two handlers ran concurrently on one
     // thread — two near-simultaneous mentions could both pass the `activeExecution` check and

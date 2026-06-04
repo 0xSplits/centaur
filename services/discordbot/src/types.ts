@@ -103,6 +103,8 @@ export type DiscordbotOptions = {
   recoverRenderObligationsOnStart?: boolean;
   state?: StateAdapter;
   stateKeyPrefix?: string;
+  /** Placeholder posted while the agent works, before streamed content. Defaults to "✨ thinking...". */
+  streamingPlaceholderText?: string;
   userName?: string;
 };
 
