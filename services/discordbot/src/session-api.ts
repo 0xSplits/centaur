@@ -157,6 +157,31 @@ export async function forwardToSessionApi(
   return openSessionEventStream(options, input);
 }
 
+/**
+ * Execute the session turn on its own (start the agent run), returning the
+ * execution. Split out of forwardToSessionApi so the render stream can run it
+ * AFTER posting the placeholder — the execute call blocks on cold sandbox
+ * spin-up. Idempotent via the request's idempotency_key, so a render retry
+ * won't re-spawn the sandbox.
+ */
+export async function executeSessionTurn(
+  options: DiscordbotOptions,
+  input: ForwardSessionInput,
+): Promise<DiscordbotExecuteSessionResponse | null> {
+  if (!input.executeMessage) return null;
+  const executeStartedAtMs = nowMs();
+  const execution = await executeSession(
+    options,
+    input.threadId,
+    input.executeMessage,
+  );
+  traceLog(options, "discordbot_session_execute_complete", input.trace, {
+    execution_id: execution.execution_id,
+    phase_ms: elapsedMs(executeStartedAtMs),
+  });
+  return execution;
+}
+
 export async function openSessionEventStream(
   options: DiscordbotOptions,
   input: Pick<

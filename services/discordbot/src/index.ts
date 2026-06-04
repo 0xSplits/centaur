@@ -23,6 +23,7 @@ import {
 import { deriveThreadName, renameThreadFromMessage } from "./discord-threading";
 import {
   collectInitialContext,
+  executeSessionTurn,
   forwardToSessionApi,
   isRetryableSessionApiError,
   openSessionEventStream,
@@ -296,10 +297,16 @@ async function syncThreadMessageToSession(
       "discordbot_forward_active_execution_marked",
       trace,
     );
-    await forwardToSessionApi(input.options, forwardInput, {
-      onExecutionStarted: commitExecutionStarted,
-      onMessagesAppended: commitMessagesAppended,
-    });
+    // Create + append the session message only (fast). The execute call blocks
+    // ~9s on cold sandbox spin-up (incl. the tool-server sidecar), so it's run
+    // inside the render stream below — after the "✨ thinking..." placeholder is
+    // posted — instead of before it. executeSession is idempotent
+    // (idempotency_key = message id), so a render retry won't re-spawn.
+    await forwardToSessionApi(
+      input.options,
+      { ...forwardInput, executeMessage: undefined, openStream: false },
+      { onMessagesAppended: commitMessagesAppended },
+    );
     scheduleExecutionRender(
       thread,
       serializedMessage,
@@ -308,6 +315,7 @@ async function syncThreadMessageToSession(
       () => lastEventId,
       shouldIncludeContext,
       trace,
+      commitExecutionStarted,
     );
     traceLog(input.options, "discordbot_forward_complete", trace, {
       last_event_id: lastEventId,
@@ -343,6 +351,9 @@ function scheduleExecutionRender(
   getLastEventId: () => number,
   isInitialExecution: boolean,
   trace?: DiscordbotTrace,
+  onExecutionStarted?: (
+    execution: DiscordbotExecuteSessionResponse,
+  ) => Promise<void>,
 ): void {
   const promise = (async () => {
     let attempt = 0;
@@ -355,6 +366,7 @@ function scheduleExecutionRender(
         getLastEventId,
         isInitialExecution,
         trace,
+        onExecutionStarted,
       );
       if (result === "complete") return;
       const delayMs = renderRetryDelayMs(attempt);
@@ -377,13 +389,16 @@ async function renderExecutionAttempt(
   getLastEventId: () => number,
   isInitialExecution: boolean,
   trace?: DiscordbotTrace,
+  onExecutionStarted?: (
+    execution: DiscordbotExecuteSessionResponse,
+  ) => Promise<void>,
 ): Promise<"complete" | "retry"> {
   let rendered = false;
   let retry = false;
   try {
     await renderExecutionStream(
       thread,
-      streamSessionAfterHandoff(options, input),
+      streamSessionAfterHandoff(options, input, onExecutionStarted),
       message,
       options,
       isInitialExecution,
@@ -690,7 +705,32 @@ async function renderRecoveredExecutionStream(
 async function* streamSessionAfterHandoff(
   options: DiscordbotOptions,
   input: ForwardSessionInput,
+  onExecutionStarted?: (
+    execution: DiscordbotExecuteSessionResponse,
+  ) => Promise<void>,
 ): AsyncIterable<DiscordbotRendererSource> {
+  // Post the placeholder BEFORE executing so the user sees "✨ thinking..."
+  // immediately, instead of waiting ~9s for the cold sandbox (incl. tool-server
+  // sidecar) to spin up. Execute runs here, inside the render stream, so a
+  // sandbox-spawn failure surfaces in the same message rather than hanging the
+  // placeholder (api-rs writes no event if the spawn itself fails).
+  yield startingStreamNotification(input.threadId);
+  traceLog(options, "discordbot_stream_heartbeat_emitted", input.trace);
+
+  if (input.executeMessage) {
+    try {
+      const execution = await executeSessionTurn(options, input);
+      if (execution) await onExecutionStarted?.(execution);
+    } catch (error) {
+      traceLog(options, "discordbot_forward_failed", input.trace, {
+        error: errorMessage(error),
+      });
+      if (isRetryableSessionApiError(error)) throw error;
+      yield sessionStreamError(error);
+      return;
+    }
+  }
+
   let stream: AsyncIterable<DiscordbotRendererSource>;
   try {
     stream = await openSessionEventStream(options, input);
@@ -703,8 +743,6 @@ async function* streamSessionAfterHandoff(
     return;
   }
 
-  yield startingStreamNotification(input.threadId);
-  traceLog(options, "discordbot_stream_heartbeat_emitted", input.trace);
   for await (const event of stream) yield event;
 }
 
