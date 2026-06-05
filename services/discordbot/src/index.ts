@@ -71,6 +71,9 @@ const RENDER_RECOVERY_LEASE_TTL_MS = 2 * 60 * 1000;
 const RENDER_RETRY_INITIAL_DELAY_MS = 250;
 const RENDER_RETRY_MAX_DELAY_MS = 5_000;
 const DISCORD_TASK_DETAILS_MAX_CHARS = 500;
+// Discord caps message content at 2000 chars; leave headroom so the honest
+// "[truncated ...]" suffix lands instead of the adapter's silent "..." cut.
+const DISCORD_FALLBACK_TEXT_MAX_CHARS = 1_900;
 const POSTGRES_CONNECT_INITIAL_DELAY_MS = 250;
 const POSTGRES_CONNECT_MAX_DELAY_MS = 10_000;
 
@@ -734,6 +737,11 @@ async function renderExecutionStream(
     traceLog(options, "discordbot_thread_named", trace);
   }
 
+  if (isPlainTextOnlyRequest(message.text)) {
+    await renderPlainTextExecutionStream(thread, stream, options, trace);
+    return;
+  }
+
   const stopTyping = startTypingKeepalive(thread, logger);
   try {
     // Deliberate delta from slackbotv2: no streamAfterFirstChunk deferral.
@@ -757,8 +765,121 @@ async function renderRecoveredExecutionStream(
   trace?: DiscordbotTrace,
 ): Promise<void> {
   // Recovered renders never rename the thread; naming happens on the initial execution.
-  // The discordSafe stream wrapping comes via renderExecutionStream.
+  // The discordSafe stream wrapping (and the plain-text-only branch) comes via
+  // renderExecutionStream.
   await renderExecutionStream(thread, stream, message, options, false, trace);
+}
+
+async function renderPlainTextExecutionStream(
+  thread: Thread,
+  stream: AsyncIterable<DiscordbotRendererSource>,
+  options: DiscordbotOptions,
+  trace?: DiscordbotTrace,
+): Promise<void> {
+  const logger = options.logger ?? noopLogger;
+  const fallback = new DiscordRenderFallback();
+  const stopTyping = startTypingKeepalive(thread, logger);
+  try {
+    const chatStream = fallback.collectChatSdk(
+      discordSafeChatSdkStream(
+        codexAppServerToChatSdkStream(
+          fallback.collectSource(stream),
+          rendererOptions(options),
+        ),
+      ),
+    );
+    for await (const _chunk of chatStream) {
+      void _chunk;
+    }
+    const text = truncateDiscordText(
+      fallback.text() || "Execution completed, but no final text was captured.",
+      DISCORD_FALLBACK_TEXT_MAX_CHARS,
+      "Discord final answer",
+    );
+    traceLog(options, "discordbot_render_plain_text_final", trace, {
+      chars: text.length,
+    });
+    await thread.post(text);
+  } finally {
+    stopTyping();
+  }
+}
+
+class DiscordRenderFallback {
+  private markdownText = "";
+  private terminalText = "";
+
+  async *collectSource(
+    stream: AsyncIterable<DiscordbotRendererSource>,
+  ): AsyncIterable<DiscordbotRendererSource> {
+    for await (const event of stream) {
+      this.captureTerminalText(event);
+      yield event;
+    }
+  }
+
+  async *collectChatSdk(
+    stream: AsyncIterable<ChatSDKStreamChunk>,
+  ): AsyncIterable<ChatSDKStreamChunk> {
+    for await (const chunk of stream) {
+      if (chunk.type === "markdown_text") this.markdownText += chunk.text;
+      yield chunk;
+    }
+  }
+
+  text(): string {
+    return (this.terminalText || this.markdownText).trim();
+  }
+
+  private captureTerminalText(event: DiscordbotRendererSource): void {
+    if (!event || typeof event !== "object") return;
+    const eventKind = String(
+      "eventKind" in event
+        ? event.eventKind
+        : "event" in event
+          ? event.event
+          : "",
+    );
+    if (
+      eventKind !== "session.execution_completed" &&
+      eventKind !== "session.execution_cancelled" &&
+      !isTerminalCodexAppServerEvent(event)
+    ) {
+      return;
+    }
+    const data =
+      "data" in event && event.data && typeof event.data === "object"
+        ? event.data
+        : event;
+    const text = terminalResultText(data);
+    if (text) this.terminalText = text;
+  }
+}
+
+function isTerminalCodexAppServerEvent(event: unknown): boolean {
+  if (!event || typeof event !== "object") return false;
+  const type = (event as { type?: unknown }).type;
+  return type === "result" || type === "turn.done" || type === "turn.completed";
+}
+
+function terminalResultText(event: unknown): string {
+  if (!event || typeof event !== "object") return "";
+  for (const key of ["result", "result_text", "text", "final_text"]) {
+    const value = (event as Record<string, unknown>)[key];
+    if (typeof value !== "string") continue;
+    const resultText = value.trim();
+    if (resultText) return resultText;
+  }
+  return "";
+}
+
+function isPlainTextOnlyRequest(text: string): boolean {
+  const normalized = text.toLowerCase();
+  return (
+    /\bplain\s+text\s+only\b/.test(normalized) ||
+    /\bno\s+interactive\s+blocks?\b/.test(normalized) ||
+    /\bno\s+dashboards?\b/.test(normalized)
+  );
 }
 
 async function* discordSafeChatSdkStream(
