@@ -775,10 +775,20 @@ function discordSafeChatSdkChunk(
   if (chunk.type !== "task_update") return chunk;
   const { output: _output, details, ...safeChunk } = chunk;
   void _output;
+  if (isCommandExecutionTask(chunk)) return safeChunk;
   return {
     ...safeChunk,
     ...(details ? { details: truncateDiscordTaskField(details) } : {}),
   };
+}
+
+function isCommandExecutionTask(
+  chunk: Extract<ChatSDKStreamChunk, { type: "task_update" }>,
+): boolean {
+  return (
+    chunk.id.startsWith("call_") ||
+    chunk.title.toLowerCase().includes("command execution")
+  );
 }
 
 function truncateDiscordTaskField(value: string): string {
