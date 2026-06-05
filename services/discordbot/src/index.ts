@@ -1,6 +1,7 @@
 import { randomUUID } from "node:crypto";
 import {
   codexAppServerToChatSdkStream,
+  type ChatSDKStreamChunk,
   type CodexAppServerToChatStreamOptions,
   type RendererEvent,
 } from "@centaur/rendering";
@@ -68,6 +69,7 @@ const RENDER_INDEX_TTL_MS = 30 * 24 * 60 * 60 * 1000;
 const RENDER_RECOVERY_LEASE_TTL_MS = 2 * 60 * 1000;
 const RENDER_RETRY_INITIAL_DELAY_MS = 250;
 const RENDER_RETRY_MAX_DELAY_MS = 5_000;
+const DISCORD_TASK_DETAILS_MAX_CHARS = 500;
 
 export function createDiscordbot(options: DiscordbotOptions): Discordbot {
   const userName = options.userName ?? "centaur";
@@ -651,6 +653,8 @@ async function* streamOpenedSession(
   input: Pick<ForwardSessionInput, "threadId" | "trace">,
   stream: AsyncIterable<DiscordbotRendererSource>,
 ): AsyncIterable<DiscordbotRendererSource> {
+  // Deliberate delta from slackbotv2 (which removed its synthetic starting
+  // task): the synthetic item drives the instant "✨ thinking..." placeholder.
   yield startingStreamNotification(input.threadId);
   for await (const event of stream) yield event;
 }
@@ -680,12 +684,14 @@ async function renderExecutionStream(
 
   const stopTyping = startTypingKeepalive(thread, logger);
   try {
-    await thread.post(
-      new StreamingPlan(
-        codexAppServerToChatSdkStream(stream, rendererOptions(options)),
-        {},
-      ),
+    // Deliberate delta from slackbotv2: no streamAfterFirstChunk deferral.
+    // The instant "✨ thinking..." placeholder covers the no-visible-output
+    // window, so the stream posts immediately instead of waiting for the
+    // first visible chunk.
+    const visibleStream = discordSafeChatSdkStream(
+      codexAppServerToChatSdkStream(stream, rendererOptions(options)),
     );
+    await thread.post(new StreamingPlan(visibleStream, {}));
   } finally {
     stopTyping();
   }
@@ -699,7 +705,36 @@ async function renderRecoveredExecutionStream(
   trace?: DiscordbotTrace,
 ): Promise<void> {
   // Recovered renders never rename the thread; naming happens on the initial execution.
+  // The discordSafe stream wrapping comes via renderExecutionStream.
   await renderExecutionStream(thread, stream, message, options, false, trace);
+}
+
+async function* discordSafeChatSdkStream(
+  stream: AsyncIterable<ChatSDKStreamChunk>,
+): AsyncIterable<ChatSDKStreamChunk> {
+  for await (const chunk of stream) {
+    yield discordSafeChatSdkChunk(chunk);
+  }
+}
+
+function discordSafeChatSdkChunk(
+  chunk: ChatSDKStreamChunk,
+): ChatSDKStreamChunk {
+  if (chunk.type !== "task_update") return chunk;
+  const { output: _output, details, ...safeChunk } = chunk;
+  void _output;
+  return {
+    ...safeChunk,
+    ...(details ? { details: truncateDiscordTaskField(details) } : {}),
+  };
+}
+
+function truncateDiscordTaskField(value: string): string {
+  if (value.length <= DISCORD_TASK_DETAILS_MAX_CHARS) return value;
+  const omitted = value.length - DISCORD_TASK_DETAILS_MAX_CHARS;
+  const suffix = `\n[truncated ${omitted} chars from Discord task details]`;
+  const keep = Math.max(0, DISCORD_TASK_DETAILS_MAX_CHARS - suffix.length);
+  return `${value.slice(0, keep).trimEnd()}${suffix}`;
 }
 
 async function* streamSessionAfterHandoff(

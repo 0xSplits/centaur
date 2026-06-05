@@ -70,8 +70,13 @@ export async function collectInitialContext(
   currentMessage: Message,
 ): Promise<DiscordbotApiMessage[]> {
   const messages: Message[] = [];
-  for await (const message of thread.allMessages) {
-    messages.push(message);
+  try {
+    for await (const message of thread.allMessages) {
+      messages.push(message);
+    }
+  } catch (error) {
+    if (!isDiscordThreadNotFoundError(error)) throw error;
+    return [await serializeMessage(currentMessage)];
   }
 
   const currentIndex = messages.findIndex(
@@ -88,6 +93,18 @@ export async function collectInitialContext(
     serialized.push(await serializeMessage(message));
   }
   return serialized;
+}
+
+// Discord analog of slackbotv2's isSlackThreadNotFoundError: the Discord
+// adapter throws a NetworkError carrying the raw Discord API body, e.g.
+// `Discord API error: 404 {"message": "Unknown Channel", "code": 10003}`.
+function isDiscordThreadNotFoundError(error: unknown): boolean {
+  if (!(error instanceof Error)) return false;
+  return (
+    error.message.includes("Unknown Channel") ||
+    error.message.includes("Unknown Message") ||
+    error.message.includes('"code": 10003')
+  );
 }
 
 export async function serializeMessage(
@@ -203,6 +220,8 @@ export async function openSessionEventStream(
   return stream;
 }
 
+// Deliberate delta from slackbotv2 (which removed this entirely): the
+// synthetic starting item drives the instant "✨ thinking..." placeholder.
 export function startingStreamNotification(threadId: string): JsonObject {
   return {
     method: "item/started",
