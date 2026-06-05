@@ -144,6 +144,7 @@ export type DiscordbotTrace = {
 
 export type ForwardSessionInput = {
   afterEventId: number;
+  executionId?: string;
   executeMessage?: DiscordbotApiMessage;
   messages: DiscordbotApiMessage[];
   onEventId(eventId: number): void;

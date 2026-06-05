@@ -203,7 +203,7 @@ export async function openSessionEventStream(
   options: DiscordbotOptions,
   input: Pick<
     ForwardSessionInput,
-    "afterEventId" | "onEventId" | "threadId" | "trace"
+    "afterEventId" | "executionId" | "onEventId" | "threadId" | "trace"
   >,
 ): Promise<AsyncIterable<DiscordbotRendererSource>> {
   const streamStartedAtMs = nowMs();
@@ -211,10 +211,12 @@ export async function openSessionEventStream(
     options,
     input.threadId,
     input.afterEventId,
+    input.executionId,
     input.onEventId,
   );
   traceLog(options, "discordbot_session_events_opened", input.trace, {
     after_event_id: input.afterEventId,
+    execution_id: input.executionId,
     phase_ms: elapsedMs(streamStartedAtMs),
   });
   return stream;
@@ -391,16 +393,17 @@ async function streamSessionNotifications(
   options: DiscordbotOptions,
   threadId: string,
   afterEventId: number,
+  executionId: string | undefined,
   onEventId: (eventId: number) => void,
 ): Promise<AsyncIterable<DiscordbotRendererSource>> {
   const fetchFn = options.fetch ?? fetch;
-  const response = await fetchFn(
-    `${apiSessionUrl(options.apiUrl, threadId, "events")}?after_event_id=${afterEventId}`,
-    {
-      method: "GET",
-      headers: apiHeaders(options, false),
-    },
-  );
+  const url = new URL(apiSessionUrl(options.apiUrl, threadId, "events"));
+  url.searchParams.set("after_event_id", String(afterEventId));
+  if (executionId) url.searchParams.set("execution_id", executionId);
+  const response = await fetchFn(url.toString(), {
+    method: "GET",
+    headers: apiHeaders(options, false),
+  });
   await ensureApiOk(response, "stream events", options);
   if (!response.body) return toAsyncIterable([]);
   return parseSessionEventStream(response.body, onEventId);

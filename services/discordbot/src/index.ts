@@ -564,6 +564,7 @@ async function recoverRenderObligation(
   );
   const input: ForwardSessionInput = {
     afterEventId: lastEventId,
+    executionId: obligation.executionId,
     messages: [],
     onEventId: (eventId) => {
       lastEventId = Math.max(lastEventId, eventId);
@@ -730,11 +731,28 @@ function discordSafeChatSdkChunk(
 }
 
 function truncateDiscordTaskField(value: string): string {
-  if (value.length <= DISCORD_TASK_DETAILS_MAX_CHARS) return value;
-  const omitted = value.length - DISCORD_TASK_DETAILS_MAX_CHARS;
-  const suffix = `\n[truncated ${omitted} chars from Discord task details]`;
-  const keep = Math.max(0, DISCORD_TASK_DETAILS_MAX_CHARS - suffix.length);
-  return `${value.slice(0, keep).trimEnd()}${suffix}`;
+  return truncateDiscordText(
+    value,
+    DISCORD_TASK_DETAILS_MAX_CHARS,
+    "Discord task details",
+  );
+}
+
+function truncateDiscordText(
+  value: string,
+  maxChars: number,
+  label: string,
+): string {
+  if (value.length <= maxChars) return value;
+  let omitted = value.length - maxChars;
+  while (true) {
+    const suffix = `\n[truncated ${omitted} chars from ${label}]`;
+    const keep = Math.max(0, maxChars - suffix.length);
+    const actualOmitted = value.length - keep;
+    if (actualOmitted === omitted)
+      return `${value.slice(0, keep).trimEnd()}${suffix}`;
+    omitted = actualOmitted;
+  }
 }
 
 async function* streamSessionAfterHandoff(
@@ -755,7 +773,12 @@ async function* streamSessionAfterHandoff(
   if (input.executeMessage) {
     try {
       const execution = await executeSessionTurn(options, input);
-      if (execution) await onExecutionStarted?.(execution);
+      if (execution) {
+        // Scope the event stream we open below to this execution (upstream
+        // #422 sets this where execute returns; for us that's in-stream).
+        input.executionId = execution.execution_id;
+        await onExecutionStarted?.(execution);
+      }
     } catch (error) {
       traceLog(options, "discordbot_forward_failed", input.trace, {
         error: errorMessage(error),
