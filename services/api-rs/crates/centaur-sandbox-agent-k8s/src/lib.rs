@@ -25,9 +25,11 @@ use tokio::time::{Instant, sleep};
 
 pub use generated::agents_x_k8s_io as crd;
 pub use iron_proxy::IronProxyConfig;
+pub use tools::{OverlayConfig, ToolsConfig};
 
 pub mod generated;
 mod iron_proxy;
+mod tools;
 
 const BACKEND_NAME: &str = "agent-sandbox-k8s";
 const DEFAULT_CONTAINER_NAME: &str = "agent";
@@ -53,6 +55,13 @@ pub struct AgentSandboxConfig {
     pub state_volume: Option<StateVolumeConfig>,
     pub iron_proxy: Option<IronProxyConfig>,
     pub iron_control: Option<IronControlSettings>,
+    /// When set, every sandbox gets a `tools-bootstrap` init container that
+    /// copies the source image's `/app/tools` into the agent's `/app/tools`, and
+    /// `TOOL_DIRS` is set so the agent's shim installer finds them.
+    pub tools: Option<ToolsConfig>,
+    /// When set, the gerard overlay tree is mounted into the sandbox (tools,
+    /// workflows, skills, system-prompt overlay).
+    pub overlay: Option<OverlayConfig>,
     pub ready_timeout: Duration,
 }
 
@@ -83,6 +92,8 @@ impl AgentSandboxConfig {
             state_volume: None,
             iron_proxy: None,
             iron_control: None,
+            tools: None,
+            overlay: None,
             ready_timeout: Duration::from_secs(60),
         }
     }
@@ -99,6 +110,16 @@ impl AgentSandboxConfig {
 
     pub fn iron_control(mut self, iron_control: IronControlSettings) -> Self {
         self.iron_control = Some(iron_control);
+        self
+    }
+
+    pub fn tools(mut self, tools: ToolsConfig) -> Self {
+        self.tools = Some(tools);
+        self
+    }
+
+    pub fn overlay(mut self, overlay: OverlayConfig) -> Self {
+        self.overlay = Some(overlay);
         self
     }
 }
@@ -453,13 +474,26 @@ fn build_agent_sandbox(
         "args",
         (!spec.args.is_empty()).then(|| spec.args.clone()),
     );
+    // Agent container env: spec env + tools/overlay wiring (deduped). `TOOL_DIRS`
+    // is set deterministically here (not via passthrough) so it always matches
+    // the value the api-rs pod computes for its own tool discovery.
+    let mut agent_env: Vec<(String, String)> = spec
+        .env
+        .iter()
+        .map(|env| (env.name.clone(), env.value.clone()))
+        .collect();
+    if config.tools.is_some() {
+        for (name, value) in tools::agent_env(config.overlay.as_ref()) {
+            upsert_env(&mut agent_env, &name, value);
+        }
+    }
     insert_optional(
         &mut container,
         "env",
-        (!spec.env.is_empty()).then(|| {
-            spec.env
+        (!agent_env.is_empty()).then(|| {
+            agent_env
                 .iter()
-                .map(|env| json!({ "name": env.name, "value": env.value }))
+                .map(|(name, value)| json!({ "name": name, "value": value }))
                 .collect::<Vec<_>>()
         }),
     );
@@ -467,7 +501,7 @@ fn build_agent_sandbox(
     insert_optional(&mut container, "resources", resources_json(spec));
 
     let (mut volumes, mut volume_mounts) = mount_json(spec);
-    let init_containers = overlay_json(spec, &mut volumes, &mut volume_mounts);
+    let mut init_containers = overlay_json(spec, &mut volumes, &mut volume_mounts);
     if let Some(state_volume) = &config.state_volume {
         volume_mounts.push(json!({
             "name": "state",
@@ -478,11 +512,30 @@ fn build_agent_sandbox(
         volume_mounts.push(iron_proxy::sandbox_ca_volume_mount_json());
         volumes.push(iron_proxy::sandbox_ca_volume_json(iron_proxy));
     }
+    // Tool sources (and the overlay tree) are bootstrapped into emptyDirs by init
+    // containers and mounted read-only into the agent at the same paths `TOOL_DIRS`
+    // points at.
+    if config.tools.is_some() {
+        volume_mounts.extend(tools::agent_volume_mounts_json(
+            true,
+            config.overlay.as_ref(),
+        ));
+        volumes.extend(tools::volumes_json(true, config.overlay.is_some()));
+    }
     insert_optional(
         &mut container,
         "volumeMounts",
         (!volume_mounts.is_empty()).then_some(volume_mounts),
     );
+
+    // Init containers: tools-bootstrap copies /app/tools out of the source image;
+    // overlay-bootstrap populates the overlay tree and stages AGENTS_OVERLAY.md.
+    if let Some(tools) = &config.tools {
+        init_containers.push(tools::tools_init_container_json(tools));
+    }
+    if let Some(overlay) = &config.overlay {
+        init_containers.push(tools::overlay_init_container_json(overlay));
+    }
 
     let mut pod_spec = json!({
         "containers": [container],
@@ -492,13 +545,13 @@ fn build_agent_sandbox(
     });
     insert_optional(
         &mut pod_spec,
-        "volumes",
-        (!volumes.is_empty()).then(|| std::mem::take(&mut volumes)),
+        "initContainers",
+        (!init_containers.is_empty()).then_some(init_containers),
     );
     insert_optional(
         &mut pod_spec,
-        "initContainers",
-        (!init_containers.is_empty()).then_some(init_containers),
+        "volumes",
+        (!volumes.is_empty()).then(|| std::mem::take(&mut volumes)),
     );
     insert_optional(
         &mut pod_spec,
@@ -670,6 +723,16 @@ where
 {
     if let Some(value) = value {
         target[key] = json!(value);
+    }
+}
+
+/// Override-or-append an env entry, so the agent container never emits a
+/// duplicate env name when we layer tools/overlay wiring over `spec.env`.
+fn upsert_env(env: &mut Vec<(String, String)>, name: &str, value: String) {
+    if let Some(entry) = env.iter_mut().find(|(existing, _)| existing == name) {
+        entry.1 = value;
+    } else {
+        env.push((name.to_owned(), value));
     }
 }
 

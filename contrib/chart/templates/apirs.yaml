@@ -235,6 +235,28 @@ spec:
                   name: {{ include "centaur.secretEnvName" . }}
                   key: {{ printf "%sIRON_CONTROL_INITIAL_API_KEY" .Values.secretManager.envPrefix }}
 {{- end }}
+{{- if .Values.toolServer.enabled }}
+            # Base tools source image (the shared api image). A tools-bootstrap
+            # init container copies its /app/tools into each sandbox so the agent
+            # installs the same tool CLI shims api-rs discovers, at the same path.
+            - name: KUBERNETES_TOOL_SERVER_IMAGE
+              value: {{ printf "%s:%s" .Values.api.image.repository .Values.api.image.tag | quote }}
+            - name: KUBERNETES_TOOL_SERVER_IMAGE_PULL_POLICY
+              value: {{ .Values.api.image.pullPolicy | quote }}
+{{- end }}
+{{- if .Values.overlay.image.repository }}
+            # Org overlay (tools/workflows/skills/system-prompt) mounted into
+            # api-rs sandboxes at overlay.mountPath via an overlay-bootstrap init
+            # container — the same path api-rs's own TOOL_DIRS points at.
+            - name: CENTAUR_OVERLAY_IMAGE
+              value: {{ printf "%s:%s" .Values.overlay.image.repository .Values.overlay.image.tag | quote }}
+            - name: CENTAUR_OVERLAY_IMAGE_PULL_POLICY
+              value: {{ .Values.overlay.image.pullPolicy | quote }}
+            - name: CENTAUR_OVERLAY_IMAGE_SOURCE_PATH
+              value: {{ .Values.overlay.image.sourcePath | quote }}
+            - name: CENTAUR_OVERLAY_MOUNT_PATH
+              value: {{ .Values.overlay.mountPath | quote }}
+{{- end }}
 {{- range $name, $value := .Values.apiRs.extraEnv }}
             - name: {{ $name }}
               value: {{ $value | quote }}

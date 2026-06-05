@@ -15,7 +15,8 @@ use centaur_iron_proxy::{
     ProxyFragment, SourceKind, SourcePolicy, harness_auth_fragment, infra_fragment,
 };
 use centaur_sandbox_agent_k8s::{
-    AgentSandboxBackend, AgentSandboxConfig, IronControlSettings, IronProxyConfig,
+    AgentSandboxBackend, AgentSandboxConfig, IronControlSettings, IronProxyConfig, OverlayConfig,
+    ToolsConfig,
 };
 use centaur_sandbox_core::{Mount, MountKind, OverlayImage, SandboxSpec};
 use centaur_sandbox_local::LocalSandboxBackend;
@@ -223,6 +224,10 @@ struct SandboxArgs {
     workflow_host_image: Option<String>,
     #[arg(long = "workflow-host-command", env = "WORKFLOW_HOST_COMMAND")]
     workflow_host_command: Option<String>,
+    #[command(flatten)]
+    tools_source: ToolsArgs,
+    #[command(flatten)]
+    overlay: OverlayArgs,
 }
 
 impl SandboxArgs {
@@ -668,6 +673,8 @@ impl TryFrom<&SandboxArgs> for AgentSandboxConfig {
             proxy.fragments = fragments;
         }
         config.iron_control = args.iron_control.settings();
+        config.tools = args.tools_source.to_config();
+        config.overlay = args.overlay.to_config();
         // iron-control is the only proxy mode: a per-sandbox proxy syncs its
         // secrets from the control plane, so configuring iron-proxy without
         // iron-control would produce a non-functional proxy. Fail fast.
@@ -678,6 +685,85 @@ impl TryFrom<&SandboxArgs> for AgentSandboxConfig {
             ));
         }
         Ok(config)
+    }
+}
+
+#[derive(Debug, ClapArgs)]
+struct ToolsArgs {
+    // Explicit `id`s avoid clap arg-id collisions with the other flattened
+    // structs (IronProxyArgs/OverlayArgs also carry `image`/`image_pull_policy`).
+    // The source image (the shared `centaur-api` image) carries `/app/tools`,
+    // which a `tools-bootstrap` init container copies into each sandbox.
+    #[arg(
+        id = "tools_source_image",
+        long = "kubernetes-tool-server-image",
+        env = "KUBERNETES_TOOL_SERVER_IMAGE"
+    )]
+    image: Option<String>,
+    #[arg(
+        id = "tools_source_image_pull_policy",
+        long = "kubernetes-tool-server-image-pull-policy",
+        env = "KUBERNETES_TOOL_SERVER_IMAGE_PULL_POLICY"
+    )]
+    image_pull_policy: Option<String>,
+}
+
+impl ToolsArgs {
+    /// `None` when no source image is configured (tools disabled).
+    fn to_config(&self) -> Option<ToolsConfig> {
+        let image = clean_optional_value(self.image.as_deref())?;
+        let mut config = ToolsConfig::new(image);
+        config.image_pull_policy = self.image_pull_policy.clone();
+        Some(config)
+    }
+}
+
+#[derive(Debug, ClapArgs)]
+struct OverlayArgs {
+    #[arg(
+        id = "overlay_image",
+        long = "centaur-overlay-image",
+        env = "CENTAUR_OVERLAY_IMAGE"
+    )]
+    image: Option<String>,
+    #[arg(
+        id = "overlay_image_pull_policy",
+        long = "centaur-overlay-image-pull-policy",
+        env = "CENTAUR_OVERLAY_IMAGE_PULL_POLICY"
+    )]
+    image_pull_policy: Option<String>,
+    #[arg(
+        id = "overlay_image_source_path",
+        long = "centaur-overlay-image-source-path",
+        env = "CENTAUR_OVERLAY_IMAGE_SOURCE_PATH",
+        default_value = "/overlay"
+    )]
+    source_path: String,
+    // The overlay tree mounts at the same path the api-rs pod uses
+    // (`overlay.mountPath`), so the agent's `<mount>/tools` matches the path
+    // api-rs discovered tools at.
+    #[arg(
+        id = "overlay_mount_path",
+        long = "centaur-overlay-mount-path",
+        env = "CENTAUR_OVERLAY_MOUNT_PATH",
+        default_value = "/app/overlay/org"
+    )]
+    mount_path: String,
+}
+
+impl OverlayArgs {
+    /// `None` when no overlay image is configured (overlay disabled).
+    fn to_config(&self) -> Option<OverlayConfig> {
+        let image = clean_optional_value(self.image.as_deref())?;
+        let mut config = OverlayConfig::new(image);
+        config.image_pull_policy = self.image_pull_policy.clone();
+        if let Some(path) = clean_optional_value(Some(self.source_path.as_str())) {
+            config.source_path = path;
+        }
+        if let Some(path) = clean_optional_value(Some(self.mount_path.as_str())) {
+            config.mount_path = path;
+        }
+        Some(config)
     }
 }
 
@@ -1168,6 +1254,30 @@ mod tests {
         );
         assert_eq!(config.ready_timeout, Duration::from_secs(42));
         assert!(config.iron_proxy.is_none());
+    }
+
+    #[test]
+    fn tools_and_overlay_config_read_from_flags() {
+        let args = Args::try_parse_from([
+            "centaur-api-server",
+            "--database-url",
+            "postgres://postgres:postgres@localhost/centaur",
+            "--session-sandbox-backend",
+            "agent-k8s",
+            "--kubernetes-sandbox-iron-proxy-mode",
+            "disabled",
+            "--kubernetes-tool-server-image",
+            "centaur-api:test",
+            "--centaur-overlay-image",
+            "centaur-overlay:test",
+        ])
+        .unwrap();
+        let config = AgentSandboxConfig::try_from(&args.sandbox).unwrap();
+        let tools = config.tools.expect("tools should be Some");
+        assert_eq!(tools.image, "centaur-api:test");
+        let overlay = config.overlay.expect("overlay should be Some");
+        assert_eq!(overlay.image, "centaur-overlay:test");
+        assert_eq!(overlay.mount_path, "/app/overlay/org");
     }
 
     #[test]
