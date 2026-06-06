@@ -31,6 +31,12 @@ const AGENT_UID: i64 = 1001;
 pub(crate) const BASE_TOOL_DIR: &str = "/app/tools";
 /// emptyDir the `tools-bootstrap` init container populates from the source image.
 const TOOLS_VOLUME: &str = "tools-root";
+/// Staging path where `tools-bootstrap` mounts the tools emptyDir. Must differ
+/// from `BASE_TOOL_DIR`: mounting the volume at `/app/tools` would shadow the
+/// source image's own tools tree, so the copy would read the empty volume and
+/// `cp` would reject the self-copy (exit 1, sandbox never starts). The agent
+/// container mounts the same volume at `BASE_TOOL_DIR`.
+const TOOLS_BOOTSTRAP_DIR: &str = "/tools-bootstrap";
 
 /// Shared overlay-tree volume (populated by `overlay-bootstrap`).
 const OVERLAY_VOLUME: &str = "overlay-root";
@@ -130,7 +136,7 @@ pub(crate) fn agent_env(overlay: Option<&OverlayConfig>) -> Vec<(String, String)
 pub(crate) fn tools_init_container_json(tools: &ToolsConfig) -> Value {
     let script = format!(
         "src=\"{BASE_TOOL_DIR}\"\n\
-         target=\"{BASE_TOOL_DIR}\"\n\
+         target=\"{TOOLS_BOOTSTRAP_DIR}\"\n\
          mkdir -p \"$target\"\n\
          cp -R \"$src\"/. \"$target\"/",
     );
@@ -139,7 +145,7 @@ pub(crate) fn tools_init_container_json(tools: &ToolsConfig) -> Value {
         "image": tools.image,
         "command": ["/bin/sh", "-ec", script],
         "volumeMounts": [
-            {"name": TOOLS_VOLUME, "mountPath": BASE_TOOL_DIR},
+            {"name": TOOLS_VOLUME, "mountPath": TOOLS_BOOTSTRAP_DIR},
         ],
         "securityContext": security_context_json(),
     });
@@ -270,9 +276,14 @@ mod tests {
         let c = tools_init_container_json(&tools);
         assert_eq!(c["name"], "tools-bootstrap");
         assert_eq!(c["image"], "centaur-api:test");
+        let script = c["command"][2].as_str().unwrap();
+        assert!(script.contains("src=\"/app/tools\""));
+        assert!(script.contains("target=\"/tools-bootstrap\""));
+        // The staging mount must NOT shadow the source image's /app/tools —
+        // that would make the copy a self-copy of the empty volume.
         let mount = &c["volumeMounts"][0];
         assert_eq!(mount["name"], TOOLS_VOLUME);
-        assert_eq!(mount["mountPath"], "/app/tools");
+        assert_eq!(mount["mountPath"], "/tools-bootstrap");
     }
 
     #[test]
