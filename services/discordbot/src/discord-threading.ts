@@ -3,7 +3,7 @@ import { parseDiscordThreadKey } from "./discord-allowlist";
 import type { DiscordbotOptions } from "./types";
 
 const DISCORD_THREAD_NAME_LIMIT = 100;
-const DEFAULT_DISCORD_API_URL = "https://discord.com/api/v10";
+export const DEFAULT_DISCORD_API_URL = "https://discord.com/api/v10";
 
 /**
  * Derive a Discord thread name from the triggering message text. The `@chat-adapter/discord`

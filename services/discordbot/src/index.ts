@@ -22,6 +22,7 @@ import {
   isAllowedDiscordMessage,
   isGuildAllowlistEmpty,
 } from "./discord-allowlist";
+import { fetchThreadStarterMessage } from "./discord-starter";
 import { deriveThreadName, renameThreadFromMessage } from "./discord-threading";
 import {
   collectInitialContext,
@@ -263,9 +264,22 @@ async function syncThreadMessageToSession(
   if (shouldIncludeContext && !state.historyForwarded) {
     const contextStartedAtMs = nowMs();
     context = await collectInitialContext(thread, message);
+    // Discord delta: a thread created from a message keeps that starter message
+    // in the parent channel, so thread history alone misses it (Slack's
+    // conversations.replies includes the parent). Prefer the fetched starter
+    // over any thread-starter stub already in the history.
+    const starter = await fetchThreadStarterMessage(
+      input.options,
+      thread.id,
+      input.options.logger ?? noopLogger,
+    );
+    if (starter) {
+      context = [starter, ...context.filter((item) => item.id !== starter.id)];
+    }
     traceLog(input.options, "discordbot_forward_context_collected", trace, {
       message_count: context.length,
       phase_ms: elapsedMs(contextStartedAtMs),
+      starter_included: starter !== null,
     });
   } else {
     traceLog(input.options, "discordbot_forward_context_skipped", trace, {

@@ -1,5 +1,6 @@
 import type { RustSessionStreamEvent } from "@centaur/harness-events";
 import type { Attachment, Message } from "chat";
+import { withDiscordEmbedText } from "./discord-starter";
 import type {
   DiscordbotApiAttachment,
   DiscordbotApiMessage,
@@ -127,7 +128,9 @@ export async function serializeMessage(
     id: message.id,
     isMention: message.isMention === true,
     raw: message.raw,
-    text: message.text,
+    // Discord delta: webhook-style messages (Sentry alerts etc.) carry their
+    // payload in embeds, which the chat adapter drops from `text`.
+    text: withDiscordEmbedText(message.text, message.raw),
     threadId: message.threadId,
     timestamp: message.metadata.dateSent.toISOString(),
   };
