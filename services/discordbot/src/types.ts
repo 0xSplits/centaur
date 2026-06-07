@@ -103,8 +103,6 @@ export type DiscordbotOptions = {
   recoverRenderObligationsOnStart?: boolean;
   state?: StateAdapter;
   stateKeyPrefix?: string;
-  /** Initial text of the progress message posted while the agent works. Defaults to "✨ thinking...". */
-  streamingPlaceholderText?: string;
   userName?: string;
 };
 

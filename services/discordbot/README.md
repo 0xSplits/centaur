@@ -12,11 +12,12 @@ unchanged (`discord:…` thread keys flow through identically).
   keyed by the new thread (`discord:{guild}:{channel}:{threadId}`).
 - **`@`-mention inside an existing thread** → the bot answers in that thread.
 - **Follow-ups inside an active thread** append to the same session without a re-mention.
-- **Two-message replies**: a run posts an instant "✨ thinking..." **progress message** that is
-  edited in place with a step timeline (reasoning excerpts, commands, tool calls) and finalized
-  (`✅ Done · 42s`) — never overwritten or deleted. The **answer** streams into a separate message
+- **Append-only narration**: a run instantly reacts 👀 on the triggering message, then posts the
+  agent's reasoning blurbs as their own *italic* messages as each thought completes (commands/tools
+  are not rendered — they just end a thought). The **answer** streams into a separate message
   created when the first answer text arrives, so it lands at the bottom of the thread even when
-  users chime in mid-run.
+  users chime in mid-run. On settle the 👀 flips to ✅ (or ❌); no bot message is ever edited or
+  deleted.
 
 ## Ingress model
 
@@ -60,7 +61,7 @@ DMs are denied unconditionally (DM intents are not requested).
    apply for it; below that it's a toggle.)
 4. **Invite the bot** (OAuth2 → URL Generator) with scope `bot` and permissions:
    _View Channels_, _Send Messages_, _Send Messages in Threads_, **Create Public Threads**,
-   _Embed Links_, _Read Message History_.
+   _Embed Links_, _Read Message History_, _Add Reactions_ (the 👀/✅ run-status indicator).
 5. Set `DISCORDBOT_GUILD_ALLOWLIST` to the server(s) you invited it to — the bot is **inert** until
    this is set.
 

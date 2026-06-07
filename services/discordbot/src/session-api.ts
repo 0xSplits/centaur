@@ -180,7 +180,7 @@ export async function forwardToSessionApi(
 /**
  * Execute the session turn on its own (start the agent run), returning the
  * execution. Split out of forwardToSessionApi so the render stream can run it
- * AFTER the progress message is posted — the execute call blocks on cold
+ * AFTER the 👀 working reaction lands — the execute call blocks on cold
  * sandbox spin-up. Idempotent via the request's idempotency_key, so a render
  * retry won't re-spawn the sandbox.
  */
@@ -226,8 +226,8 @@ export async function openSessionEventStream(
 }
 
 // Deliberate delta from slackbotv2 (which removed this entirely): the
-// synthetic starting item seeds the first "⏳ Thinking" step in the progress
-// message.
+// synthetic starting item primes the mapper's task state so answer deltas
+// stream immediately instead of waiting out the pre-stream grace period.
 export function startingStreamNotification(threadId: string): JsonObject {
   return {
     method: "item/started",

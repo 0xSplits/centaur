@@ -22,7 +22,7 @@ import {
   isAllowedDiscordMessage,
   isGuildAllowlistEmpty,
 } from "./discord-allowlist";
-import { DiscordProgressMessage } from "./discord-progress";
+import { DiscordNarrator } from "./discord-narrator";
 import { fetchThreadStarterMessage } from "./discord-starter";
 import { deriveThreadName, renameThreadFromMessage } from "./discord-threading";
 import {
@@ -79,7 +79,6 @@ const RENDER_INDEX_TTL_MS = 30 * 24 * 60 * 60 * 1000;
 const RENDER_RECOVERY_LEASE_TTL_MS = 2 * 60 * 1000;
 const RENDER_RETRY_INITIAL_DELAY_MS = 250;
 const RENDER_RETRY_MAX_DELAY_MS = 5_000;
-const PROGRESS_PLACEHOLDER_TEXT = "✨ thinking...";
 // Discord caps message content at 2000 chars; leave headroom so the honest
 // "[truncated ...]" suffix lands instead of the adapter's silent "..." cut.
 const DISCORD_FALLBACK_TEXT_MAX_CHARS = 1_900;
@@ -110,9 +109,9 @@ export function createDiscordbot(options: DiscordbotOptions): Discordbot {
     userName,
     adapters: { discord },
     state,
-    // No SDK-level streaming placeholder: instant feedback comes from the
-    // progress message renderExecutionStream posts itself, and the final answer
-    // must land as a NEW message at the bottom of the timeline — with null, the
+    // No SDK-level streaming placeholder: instant feedback is the 👀 reaction
+    // the narrator puts on the triggering message, and the final answer must
+    // land as a NEW message at the bottom of the timeline — with null, the
     // SDK's post+edit fallback only creates the answer message once the first
     // visible answer text arrives.
     fallbackStreamingPlaceholderText: null,
@@ -376,8 +375,8 @@ async function syncThreadMessageToSession(
     );
     // Create + append the session message only (fast). The execute call blocks
     // ~9s on cold sandbox spin-up (incl. the tool-server sidecar), so it's run
-    // inside the render stream below — after the "✨ thinking..." progress
-    // message is posted — instead of before it. executeSession is idempotent
+    // inside the render stream below — after the 👀 working reaction lands —
+    // instead of before it. executeSession is idempotent
     // (idempotency_key = message id), so a render retry won't re-spawn.
     await forwardToSessionApi(
       input.options,
@@ -733,8 +732,8 @@ async function* streamOpenedSession(
   stream: AsyncIterable<DiscordbotRendererSource>,
 ): AsyncIterable<DiscordbotRendererSource> {
   // Deliberate delta from slackbotv2 (which removed its synthetic starting
-  // task): the synthetic item seeds the first "⏳ Thinking" step in the
-  // progress message.
+  // task): the synthetic item primes the mapper's task state so answer deltas
+  // stream immediately instead of waiting out the pre-stream grace period.
   yield startingStreamNotification(input.threadId);
   for await (const event of stream) yield event;
 }
@@ -767,22 +766,19 @@ async function renderExecutionStream(
     return;
   }
 
-  // Two-message UX: a progress message posts instantly and is edited in place
-  // with the step timeline (chain of thought), while the final answer streams
-  // into a separate message created on first answer text. The progress message
-  // stays in the timeline as a record instead of being overwritten, and the
-  // answer lands at the bottom even when users chime in mid-run.
-  const progress = await DiscordProgressMessage.post(thread, {
-    logger,
-    placeholderText:
-      options.streamingPlaceholderText ?? PROGRESS_PLACEHOLDER_TEXT,
-  });
+  // Append-only narration: an instant 👀 reaction on the triggering message,
+  // then the agent's reasoning blurbs posted as their own italic messages as
+  // each thought completes, then the answer streamed into a separate message
+  // created on first answer text. On settle the 👀 flips to ✅/❌. No bot
+  // message is ever edited or deleted, so messages keep their place in the
+  // timeline even when users chime in mid-run.
+  const narrator = DiscordNarrator.start(thread, message, options, { logger });
   const stopTyping = startTypingKeepalive(thread, logger);
   try {
-    await renderSplitExecutionStreams(thread, stream, options, progress);
-    await progress.finish("done");
+    await renderSplitExecutionStreams(thread, stream, options, narrator);
+    await narrator.finish("done");
   } catch (error) {
-    await progress.finish(
+    await narrator.finish(
       isRetryableSessionApiError(error) ? "retrying" : "failed",
     );
     throw error;
@@ -792,8 +788,8 @@ async function renderExecutionStream(
 }
 
 /**
- * Consumes the renderer's chunk stream, routing task/plan updates to the
- * progress message and answer text to a separate streamed message. The answer
+ * Consumes the renderer's chunk stream, routing task updates to the narrator
+ * (reasoning blurbs) and answer text to a separate streamed message. The answer
  * post is created lazily on the first visible answer chunk; the chat SDK's
  * post+edit fallback then streams the rest into it.
  */
@@ -801,7 +797,7 @@ async function renderSplitExecutionStreams(
   thread: Thread,
   stream: AsyncIterable<DiscordbotRendererSource>,
   options: DiscordbotOptions,
-  progress: DiscordProgressMessage,
+  narrator: DiscordNarrator,
 ): Promise<void> {
   const answerText = new AsyncTextQueue();
   let answerPost: Promise<unknown> | null = null;
@@ -816,7 +812,7 @@ async function renderSplitExecutionStreams(
         answerText.push(chunk.text);
         continue;
       }
-      progress.update(chunk);
+      narrator.update(chunk);
     }
   } catch (error) {
     sourceFailed = true;
@@ -840,8 +836,8 @@ async function renderRecoveredExecutionStream(
   trace?: DiscordbotTrace,
 ): Promise<void> {
   // Recovered renders never rename the thread; naming happens on the initial execution.
-  // The progress/answer message split (and the plain-text-only branch) comes via
-  // renderExecutionStream.
+  // The narration/answer message split (and the plain-text-only branch) comes
+  // via renderExecutionStream.
   await renderExecutionStream(thread, stream, message, options, false, trace);
 }
 
@@ -979,12 +975,14 @@ async function* streamSessionAfterHandoff(
     execution: DiscordbotExecuteSessionResponse,
   ) => Promise<void>,
 ): AsyncIterable<DiscordbotRendererSource> {
-  // The progress message is already posted before this generator is consumed,
-  // so the user has instant feedback while the cold sandbox (incl. tool-server
-  // sidecar) spends ~9s spinning up. Execute runs here, inside the render
-  // stream, so a sandbox-spawn failure surfaces in the same render rather than
-  // hanging the progress message (api-rs writes no event if the spawn itself
-  // fails). The synthetic starting item seeds the first "⏳ Thinking" step.
+  // The 👀 working reaction is already queued before this generator is
+  // consumed, so the user has instant feedback while the cold sandbox (incl.
+  // tool-server sidecar) spends ~9s spinning up. Execute runs here, inside the
+  // render stream, so a sandbox-spawn failure surfaces in the same render
+  // rather than leaving the run looking alive forever (api-rs writes no event
+  // if the spawn itself fails). The synthetic starting item primes the
+  // mapper's task state so answer deltas stream without the pre-stream grace
+  // delay.
   yield startingStreamNotification(input.threadId);
   traceLog(options, "discordbot_stream_heartbeat_emitted", input.trace);
 
