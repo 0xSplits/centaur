@@ -103,7 +103,7 @@ export type DiscordbotOptions = {
   recoverRenderObligationsOnStart?: boolean;
   state?: StateAdapter;
   stateKeyPrefix?: string;
-  /** Placeholder posted while the agent works, before streamed content. Defaults to "✨ thinking...". */
+  /** Initial text of the progress message posted while the agent works. Defaults to "✨ thinking...". */
   streamingPlaceholderText?: string;
   userName?: string;
 };

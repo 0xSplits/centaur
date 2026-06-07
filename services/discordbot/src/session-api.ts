@@ -180,9 +180,9 @@ export async function forwardToSessionApi(
 /**
  * Execute the session turn on its own (start the agent run), returning the
  * execution. Split out of forwardToSessionApi so the render stream can run it
- * AFTER posting the placeholder — the execute call blocks on cold sandbox
- * spin-up. Idempotent via the request's idempotency_key, so a render retry
- * won't re-spawn the sandbox.
+ * AFTER the progress message is posted — the execute call blocks on cold
+ * sandbox spin-up. Idempotent via the request's idempotency_key, so a render
+ * retry won't re-spawn the sandbox.
  */
 export async function executeSessionTurn(
   options: DiscordbotOptions,
@@ -226,7 +226,8 @@ export async function openSessionEventStream(
 }
 
 // Deliberate delta from slackbotv2 (which removed this entirely): the
-// synthetic starting item drives the instant "✨ thinking..." placeholder.
+// synthetic starting item seeds the first "⏳ Thinking" step in the progress
+// message.
 export function startingStreamNotification(threadId: string): JsonObject {
   return {
     method: "item/started",

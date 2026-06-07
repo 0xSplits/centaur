@@ -12,6 +12,11 @@ unchanged (`discord:…` thread keys flow through identically).
   keyed by the new thread (`discord:{guild}:{channel}:{threadId}`).
 - **`@`-mention inside an existing thread** → the bot answers in that thread.
 - **Follow-ups inside an active thread** append to the same session without a re-mention.
+- **Two-message replies**: a run posts an instant "✨ thinking..." **progress message** that is
+  edited in place with a step timeline (reasoning excerpts, commands, tool calls) and finalized
+  (`✅ Done · 42s`) — never overwritten or deleted. The **answer** streams into a separate message
+  created when the first answer text arrives, so it lands at the bottom of the thread even when
+  users chime in mid-run.
 
 ## Ingress model
 

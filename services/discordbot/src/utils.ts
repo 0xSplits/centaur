@@ -59,3 +59,41 @@ export async function* toAsyncIterable<T>(
     yield item;
   }
 }
+
+/**
+ * Single-consumer async queue bridging a producer loop to an AsyncIterable
+ * consumer (e.g. the chat SDK's streaming post). push() never blocks; end()
+ * lets the consumer drain the remaining items and finish.
+ */
+export class AsyncTextQueue implements AsyncIterable<string> {
+  private readonly values: string[] = [];
+  private done = false;
+  private wake: (() => void) | null = null;
+
+  push(value: string): void {
+    this.values.push(value);
+    this.wake?.();
+  }
+
+  end(): void {
+    this.done = true;
+    this.wake?.();
+  }
+
+  async *[Symbol.asyncIterator](): AsyncIterator<string> {
+    while (true) {
+      const value = this.values.shift();
+      if (value !== undefined) {
+        yield value;
+        continue;
+      }
+      if (this.done) return;
+      await new Promise<void>((resolve) => {
+        this.wake = () => {
+          this.wake = null;
+          resolve();
+        };
+      });
+    }
+  }
+}
