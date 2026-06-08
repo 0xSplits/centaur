@@ -112,6 +112,13 @@ fn security_context_json() -> Value {
     })
 }
 
+pub(crate) fn pod_security_context_json() -> Value {
+    json!({
+        "fsGroup": AGENT_UID,
+        "fsGroupChangePolicy": "OnRootMismatch",
+    })
+}
+
 /// `TOOL_DIRS` for the agent: base tools plus the overlay's tools when present.
 /// Matches the value the api-rs Deployment computes for its own `TOOL_DIRS`.
 pub(crate) fn agent_tool_dirs(overlay: Option<&OverlayConfig>) -> String {

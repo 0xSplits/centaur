@@ -546,6 +546,9 @@ fn build_agent_sandbox(
         "automountServiceAccountToken": false,
         "enableServiceLinks": false,
     });
+    if config.tools.is_some() || config.overlay.is_some() {
+        pod_spec["securityContext"] = tools::pod_security_context_json();
+    }
     insert_optional(
         &mut pod_spec,
         "initContainers",
@@ -902,6 +905,22 @@ mod tests {
         let init_containers = pod_spec.init_containers.as_ref().unwrap();
         assert_eq!(init_containers.len(), 1);
         assert_eq!(init_containers[0].name, "overlay-bootstrap");
+    }
+
+    #[test]
+    fn bootstrap_empty_dirs_are_writable_by_agent_uid() {
+        let spec = SandboxSpec::new("centaur-agent:latest");
+        let config = AgentSandboxConfig::new("centaur").tools(ToolsConfig::new("api:test"));
+
+        let sandbox = build_agent_sandbox(&SandboxId::new("asbx-test"), &spec, &config).unwrap();
+        let pod_spec = &sandbox.spec.pod_template.spec;
+
+        let security_context = pod_spec.security_context.as_ref().unwrap();
+        assert_eq!(security_context.fs_group, Some(1001));
+        assert_eq!(
+            security_context.fs_group_change_policy.as_deref(),
+            Some("OnRootMismatch")
+        );
     }
 
     #[test]
