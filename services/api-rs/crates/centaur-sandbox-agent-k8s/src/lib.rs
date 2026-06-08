@@ -482,7 +482,7 @@ fn build_agent_sandbox(
         .iter()
         .map(|env| (env.name.clone(), env.value.clone()))
         .collect();
-    if config.tools.is_some() {
+    if config.tools.is_some() || config.overlay.is_some() {
         for (name, value) in tools::agent_env(config.overlay.as_ref()) {
             upsert_env(&mut agent_env, &name, value);
         }
@@ -512,15 +512,18 @@ fn build_agent_sandbox(
         volume_mounts.push(iron_proxy::sandbox_ca_volume_mount_json());
         volumes.push(iron_proxy::sandbox_ca_volume_json(iron_proxy));
     }
-    // Tool sources (and the overlay tree) are bootstrapped into emptyDirs by init
-    // containers and mounted read-only into the agent at the same paths `TOOL_DIRS`
-    // points at.
-    if config.tools.is_some() {
+    // Tool sources and overlay sources are bootstrapped independently into
+    // emptyDirs by init containers and mounted read-only into the agent at the
+    // same paths `TOOL_DIRS` points at.
+    if config.tools.is_some() || config.overlay.is_some() {
         volume_mounts.extend(tools::agent_volume_mounts_json(
-            true,
+            config.tools.is_some(),
             config.overlay.as_ref(),
         ));
-        volumes.extend(tools::volumes_json(true, config.overlay.is_some()));
+        volumes.extend(tools::volumes_json(
+            config.tools.is_some(),
+            config.overlay.is_some(),
+        ));
     }
     insert_optional(
         &mut container,
@@ -859,6 +862,46 @@ mod tests {
             .expect("main container overlay mount");
         assert_eq!(overlay_mount.mount_path, "/opt/centaur/overlay");
         assert_eq!(overlay_mount.read_only, Some(true));
+    }
+
+    #[test]
+    fn builds_agent_sandbox_spec_with_overlay_without_tools() {
+        let spec = SandboxSpec::new("centaur-agent:latest");
+        let config = AgentSandboxConfig::new("centaur").overlay(OverlayConfig::new("overlay:test"));
+
+        let sandbox = build_agent_sandbox(&SandboxId::new("asbx-test"), &spec, &config).unwrap();
+        let pod_spec = &sandbox.spec.pod_template.spec;
+        let container = &pod_spec.containers[0];
+
+        let env = container.env.as_ref().unwrap();
+        assert!(env.iter().any(|env| {
+            env.name == "TOOL_DIRS"
+                && env.value.as_deref() == Some("/app/tools:/app/overlay/org/tools")
+        }));
+        assert!(env.iter().any(|env| {
+            env.name == "CENTAUR_OVERLAY_DIR" && env.value.as_deref() == Some("/app/overlay/org")
+        }));
+
+        let volumes = pod_spec.volumes.as_ref().unwrap();
+        assert!(
+            volumes
+                .iter()
+                .any(|volume| { volume.name == "overlay-root" && volume.empty_dir.is_some() })
+        );
+        assert!(
+            volumes
+                .iter()
+                .any(|volume| { volume.name == "overlay-prompt" && volume.empty_dir.is_some() })
+        );
+        assert!(!volumes.iter().any(|volume| volume.name == "tools-root"));
+
+        let mounts = container.volume_mounts.as_ref().unwrap();
+        assert!(mounts.iter().any(|mount| mount.name == "overlay-root"));
+        assert!(mounts.iter().any(|mount| mount.name == "overlay-prompt"));
+
+        let init_containers = pod_spec.init_containers.as_ref().unwrap();
+        assert_eq!(init_containers.len(), 1);
+        assert_eq!(init_containers[0].name, "overlay-bootstrap");
     }
 
     #[test]
