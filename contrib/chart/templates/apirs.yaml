@@ -236,13 +236,15 @@ spec:
                   key: {{ printf "%sIRON_CONTROL_INITIAL_API_KEY" .Values.secretManager.envPrefix }}
 {{- end }}
 {{- if .Values.toolServer.enabled }}
-            # Base tools source image (the shared api image). A tools-bootstrap
-            # init container copies its /app/tools into each sandbox so the agent
-            # installs the same tool CLI shims api-rs discovers, at the same path.
+            # Base tools source image: the same api-rs image this Deployment runs.
+            # api-rs discovers its tools from /app/tools in its own container, so
+            # sourcing the tools-bootstrap copy from the identical image guarantees
+            # each sandbox installs the exact tool set api-rs granted creds for —
+            # any other image risks a silent /app/tools content drift.
             - name: KUBERNETES_TOOL_SERVER_IMAGE
-              value: {{ printf "%s:%s" .Values.api.image.repository .Values.api.image.tag | quote }}
+              value: {{ printf "%s:%s" .Values.apiRs.image.repository .Values.apiRs.image.tag | quote }}
             - name: KUBERNETES_TOOL_SERVER_IMAGE_PULL_POLICY
-              value: {{ .Values.api.image.pullPolicy | quote }}
+              value: {{ .Values.apiRs.image.pullPolicy | quote }}
 {{- end }}
 {{- if .Values.overlay.image.repository }}
             # Org overlay (tools/workflows/skills/system-prompt) mounted into
