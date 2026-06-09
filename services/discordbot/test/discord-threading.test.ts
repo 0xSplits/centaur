@@ -2,6 +2,7 @@ import { describe, expect, it } from "bun:test";
 import type { Logger } from "chat";
 import {
   deriveThreadName,
+  isThreadCreatedForMessage,
   renameThreadFromMessage,
 } from "../src/discord-threading";
 import type { DiscordbotFetch } from "../src/types";
@@ -36,6 +37,21 @@ describe("deriveThreadName", () => {
     const long = "a".repeat(200);
     const name = deriveThreadName(long, "centaur");
     expect(name.length).toBe(100);
+  });
+});
+
+describe("isThreadCreatedForMessage", () => {
+  it("is true when the thread was spawned from the triggering message", () => {
+    // Discord gives a thread the id of the message it was created from.
+    expect(isThreadCreatedForMessage("discord:G1:C1:M9", "M9")).toBe(true);
+  });
+
+  it("is false when the message arrived in a pre-existing thread", () => {
+    expect(isThreadCreatedForMessage("discord:G1:C1:T9", "M9")).toBe(false);
+  });
+
+  it("is false when the key carries no thread segment", () => {
+    expect(isThreadCreatedForMessage("discord:G1:C1", "M9")).toBe(false);
   });
 });
 

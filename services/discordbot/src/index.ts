@@ -24,7 +24,11 @@ import {
 } from "./discord-allowlist";
 import { DiscordNarrator } from "./discord-narrator";
 import { fetchThreadStarterMessage } from "./discord-starter";
-import { deriveThreadName, renameThreadFromMessage } from "./discord-threading";
+import {
+  deriveThreadName,
+  isThreadCreatedForMessage,
+  renameThreadFromMessage,
+} from "./discord-threading";
 import {
   collectInitialContext,
   executeSessionTurn,
@@ -751,7 +755,11 @@ async function renderExecutionStream(
   trace?: DiscordbotTrace,
 ): Promise<void> {
   const logger = options.logger ?? noopLogger;
-  if (isInitialExecution && options.nameThreads !== false) {
+  if (
+    isInitialExecution &&
+    options.nameThreads !== false &&
+    isThreadCreatedForMessage(thread.id, message.id)
+  ) {
     await renameThreadFromMessage(
       options,
       thread.id,

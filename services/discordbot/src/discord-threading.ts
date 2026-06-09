@@ -24,6 +24,22 @@ export function deriveThreadName(text: string, userName = "centaur"): string {
 }
 
 /**
+ * Whether the thread was just auto-created for this triggering message, versus the message having
+ * arrived inside a pre-existing thread. Discord gives a thread spawned from a message the same id as
+ * that message (the adapter's own "thread already exists" fallback relies on this), so a key whose
+ * thread segment equals the message id is one we just created and should name. A message that landed
+ * in an existing thread carries that thread's own id instead, and renaming it would clobber a title
+ * the user (or an earlier run) already set.
+ */
+export function isThreadCreatedForMessage(
+  threadKey: string,
+  messageId: string,
+): boolean {
+  const { threadId } = parseDiscordThreadKey(threadKey);
+  return threadId !== undefined && threadId === messageId;
+}
+
+/**
  * Best-effort rename of the thread the session lives in. No-ops when the key carries no thread
  * segment (i.e. the message was not threaded). Failures are swallowed — naming is cosmetic and
  * must never block streaming.
