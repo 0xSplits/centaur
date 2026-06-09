@@ -125,7 +125,7 @@ enum SecretsCmd {
 
 #[derive(Args, Debug)]
 struct SecretSelector {
-    /// Secret OID (`ssr_`/`ots_`/`gas_`/`pgs_`/`hms_`) or `foreign_id`. A
+    /// Secret OID (`ssr_`/`ots_`/`gas_`/`pgs_`/`hms_`/`aas_`) or `foreign_id`. A
     /// `foreign_id` is resolved by trying each secret type in turn.
     secret: String,
 }
@@ -769,7 +769,11 @@ fn print_secrets(rows: &[(&str, Option<String>, String, String)], namespace: &st
 // broker credentials
 // ---------------------------------------------------------------------------
 
-async fn broker_create(cli: &Cli, client: &IronControlClient, args: &BrokerCreateArgs) -> Result<()> {
+async fn broker_create(
+    cli: &Cli,
+    client: &IronControlClient,
+    args: &BrokerCreateArgs,
+) -> Result<()> {
     let token_endpoint_headers = args
         .token_endpoint_headers
         .iter()
@@ -797,20 +801,32 @@ async fn broker_create(cli: &Cli, client: &IronControlClient, args: &BrokerCreat
         "broker credential {} ({}) upserted{}",
         record.foreign_id.as_deref().unwrap_or(&args.foreign_id),
         record.id,
-        record.status.as_deref().map(|s| format!(" — status {s}")).unwrap_or_default(),
+        record
+            .status
+            .as_deref()
+            .map(|s| format!(" — status {s}"))
+            .unwrap_or_default(),
     );
     Ok(())
 }
 
 async fn broker_list(cli: &Cli, client: &IronControlClient, args: &FilterArgs) -> Result<()> {
     let labels = filter_labels(args)?;
-    let mut found = client.list_broker_credentials(&cli.namespace, &labels).await?;
+    let mut found = client
+        .list_broker_credentials(&cli.namespace, &labels)
+        .await?;
     apply_filter(&mut found, args.filter.as_deref(), |c| {
-        (c.foreign_id.clone().unwrap_or_default(), c.name.clone().unwrap_or_default())
+        (
+            c.foreign_id.clone().unwrap_or_default(),
+            c.name.clone().unwrap_or_default(),
+        )
     });
     found.sort_by(|a, b| a.foreign_id.cmp(&b.foreign_id));
     if found.is_empty() {
-        println!("no broker credentials found in namespace {:?}", cli.namespace);
+        println!(
+            "no broker credentials found in namespace {:?}",
+            cli.namespace
+        );
         return Ok(());
     }
     let width = found
@@ -833,14 +849,18 @@ async fn broker_list(cli: &Cli, client: &IronControlClient, args: &FilterArgs) -
 }
 
 async fn broker_show(cli: &Cli, client: &IronControlClient, args: &BrokerSelector) -> Result<()> {
-    let detail = client.get_broker_credential_detail(&cli.namespace, &args.credential).await?;
+    let detail = client
+        .get_broker_credential_detail(&cli.namespace, &args.credential)
+        .await?;
     println!("broker credential: {}", args.credential);
     println!("{}", serde_json::to_string_pretty(&detail)?);
     Ok(())
 }
 
 async fn broker_delete(cli: &Cli, client: &IronControlClient, args: &BrokerSelector) -> Result<()> {
-    client.delete_broker_credential(&cli.namespace, &args.credential).await?;
+    client
+        .delete_broker_credential(&cli.namespace, &args.credential)
+        .await?;
     println!("broker credential {}: deleted", args.credential);
     Ok(())
 }
@@ -961,7 +981,9 @@ async fn revoke_secrets(
 fn grant_secret_from_oid(oid: &str) -> Result<GrantSecret> {
     match GrantSecret::from_oid(oid) {
         Some(secret) => Ok(secret),
-        None => bail!("--secret expects a secret OID (ssr_/ots_/gas_/pgs_/hms_), got {oid:?}"),
+        None => {
+            bail!("--secret expects a secret OID (ssr_/ots_/gas_/pgs_/hms_/aas_), got {oid:?}")
+        }
     }
 }
 

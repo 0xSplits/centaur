@@ -3,7 +3,7 @@
 //! iron-control wraps every request and single-resource response in a
 //! ``{ "data": ... }`` envelope; [`DataEnvelope`] handles both directions.
 //! Object IDs are typed-prefix strings (``prn_``, ``role_``, ``ssr_``,
-//! ``gas_``, ``ots_``, ``hms_``, ``bcr_``, ``grant_``, ``prx_``). Resources with a ``foreign_id``
+//! ``gas_``, ``ots_``, ``hms_``, ``aas_``, ``bcr_``, ``grant_``, ``prx_``). Resources with a ``foreign_id``
 //! support upsert: a PUT whose path segment is a ``foreign_id`` (not an OID)
 //! creates the resource if absent and updates it otherwise.
 
@@ -72,7 +72,10 @@ impl SecretSource {
     /// whose current access token iron-control delivers inline. When
     /// ``credential_id`` is a ``foreign_id`` (rather than a ``bcr_`` OID),
     /// ``credential_namespace`` is required so iron-control can resolve it.
-    pub fn token_broker(credential_id: impl Into<String>, credential_namespace: impl Into<String>) -> Self {
+    pub fn token_broker(
+        credential_id: impl Into<String>,
+        credential_namespace: impl Into<String>,
+    ) -> Self {
         Self {
             source_type: "token_broker".to_owned(),
             secret: None,
@@ -210,6 +213,41 @@ pub struct GcpAuthSecretInput {
     pub keyfile: Option<SecretSource>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub credentials_provider: Option<Value>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub rules: Vec<RequestRule>,
+}
+
+// ---------------------------------------------------------------------------
+// AWS auth secrets
+// ---------------------------------------------------------------------------
+
+/// Request body for ``POST``/``PUT /api/v1/aws_auth_secrets``. iron-proxy
+/// re-signs outbound AWS SigV4 requests: the tool signs each request with
+/// throwaway placeholder credentials, and iron-proxy reads the region/service
+/// from the inbound signature's credential scope, strips the signature, and
+/// re-signs with the real keys it resolves from ``access_key_id`` /
+/// ``secret_access_key`` (and optional ``session_token`` for STS). The real keys
+/// never reach the sandbox. ``allowed_regions`` / ``allowed_services`` scope
+/// which regions/services the proxy will sign for (empty = unscoped).
+// Not `Eq`: holds `SecretSource` values (arbitrary `Value` config).
+#[derive(Clone, Debug, PartialEq, Serialize)]
+pub struct AwsAuthSecretInput {
+    pub namespace: String,
+    pub foreign_id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub labels: BTreeMap<String, String>,
+    pub access_key_id: SecretSource,
+    pub secret_access_key: SecretSource,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub session_token: Option<SecretSource>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub allowed_regions: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub allowed_services: Vec<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub rules: Vec<RequestRule>,
 }
@@ -439,6 +477,7 @@ pub const SECRET_TYPES: &[(&str, &str, &str)] = &[
     ("gcp_auth", "gcp_auth_secrets", "gas_"),
     ("pg_dsn", "pg_dsn_secrets", "pgs_"),
     ("hmac", "hmac_secrets", "hms_"),
+    ("aws_auth", "aws_auth_secrets", "aas_"),
 ];
 
 // ---------------------------------------------------------------------------
@@ -460,6 +499,7 @@ pub enum GrantSecret {
     OAuthToken(String),
     PgDsn(String),
     Hmac(String),
+    AwsAuth(String),
 }
 
 impl GrantSecret {
@@ -476,6 +516,7 @@ impl GrantSecret {
             "gcp_auth" => Self::GcpAuth(id),
             "pg_dsn" => Self::PgDsn(id),
             "hmac" => Self::Hmac(id),
+            "aws_auth" => Self::AwsAuth(id),
             _ => return None,
         })
     }
@@ -501,6 +542,8 @@ pub struct Grant {
     pub pg_dsn_secret_id: Option<String>,
     #[serde(default)]
     pub hmac_secret_id: Option<String>,
+    #[serde(default)]
+    pub aws_auth_secret_id: Option<String>,
 }
 
 impl Grant {
@@ -512,6 +555,7 @@ impl Grant {
             .or(self.gcp_auth_secret_id.as_deref())
             .or(self.pg_dsn_secret_id.as_deref())
             .or(self.hmac_secret_id.as_deref())
+            .or(self.aws_auth_secret_id.as_deref())
     }
 
     /// The granted secret's ``(type label, REST collection, OID)``, whichever
@@ -528,6 +572,8 @@ impl Grant {
             Some(("pg_dsn", "pg_dsn_secrets", id))
         } else if let Some(id) = &self.hmac_secret_id {
             Some(("hmac", "hmac_secrets", id))
+        } else if let Some(id) = &self.aws_auth_secret_id {
+            Some(("aws_auth", "aws_auth_secrets", id))
         } else {
             None
         }

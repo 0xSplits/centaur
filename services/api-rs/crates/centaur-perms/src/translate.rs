@@ -10,16 +10,16 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use centaur_iron_control::{
-    GcpAuthSecretInput, HmacSecretHeader, HmacSecretInput, InjectConfig, OAuthTokenSecretInput,
-    PgDsnSecretInput, ReplaceConfig, RequestRule, SecretInput, SecretSource, StaticSecretInput,
-    gcp_auth_scopes_or_default, managed_labels, slugify, source_from_placeholder,
-    unique_foreign_id,
+    AwsAuthSecretInput, GcpAuthSecretInput, HmacSecretHeader, HmacSecretInput, InjectConfig,
+    OAuthTokenSecretInput, PgDsnSecretInput, ReplaceConfig, RequestRule, SecretInput, SecretSource,
+    StaticSecretInput, gcp_auth_scopes_or_default, managed_labels, slugify,
+    source_from_placeholder, unique_foreign_id,
 };
 use centaur_iron_proxy::SourcePolicy;
 
 use crate::tools::{
-    BrokerTokenSecret, FieldSource, GcpAuthSecret, HmacSignSecret, HttpSecret, OAuthTokenSecret,
-    ParsedSecret, PgDsnSecret, SecretMode,
+    AwsAuthSecret, BrokerTokenSecret, FieldSource, GcpAuthSecret, HmacSignSecret, HttpSecret,
+    OAuthTokenSecret, ParsedSecret, PgDsnSecret, SecretMode,
 };
 
 /// The result of translating a tool's secrets: the iron-control inputs to upsert.
@@ -89,6 +89,15 @@ pub fn translate(
                     namespace,
                     role_foreign_id,
                     broker,
+                    &mut used,
+                )));
+            }
+            ParsedSecret::AwsAuth(aws) => {
+                out.inputs.push(SecretInput::AwsAuth(aws_input(
+                    namespace,
+                    role_foreign_id,
+                    aws,
+                    policy,
                     &mut used,
                 )));
             }
@@ -249,6 +258,37 @@ fn hmac_input(
             .collect(),
         credentials: field_sources(&hmac.credentials, policy),
         rules: rules_from_hosts(&hmac.hosts),
+    }
+}
+
+/// Translate an `aws_auth` secret into an [`AwsAuthSecretInput`]. iron-control
+/// delivers each granted AWS auth secret to iron-proxy as its own `aws_auth`
+/// transform with its own rules (like a `gcp_auth`/`hmac_sign` secret), so the
+/// `foreign_id` is role-prefixed and deduped (`{role}-aws-{slug}`). The
+/// credential refs resolve through the deployment's [`SourcePolicy`] like every
+/// other secret source.
+fn aws_input(
+    namespace: &str,
+    role: &str,
+    aws: &AwsAuthSecret,
+    policy: &SourcePolicy,
+    used: &mut BTreeSet<String>,
+) -> AwsAuthSecretInput {
+    AwsAuthSecretInput {
+        namespace: namespace.to_owned(),
+        foreign_id: unique_foreign_id(format!("{role}-aws-{}", slugify(&aws.name)), used),
+        name: Some(format!("AWS Auth ({role})")),
+        description: None,
+        labels: managed_labels(),
+        access_key_id: source_from_placeholder(policy, &aws.access_key_id_ref, None),
+        secret_access_key: source_from_placeholder(policy, &aws.secret_access_key_ref, None),
+        session_token: aws
+            .session_token_ref
+            .as_ref()
+            .map(|r| source_from_placeholder(policy, r, None)),
+        allowed_regions: aws.allowed_regions.clone(),
+        allowed_services: aws.allowed_services.clone(),
+        rules: rules_from_hosts(&aws.hosts),
     }
 }
 

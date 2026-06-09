@@ -180,6 +180,25 @@ pub struct BrokerTokenSecret {
     pub inject_formatter: String,
 }
 
+/// A `type = "aws_auth"` secret: AWS SigV4 re-signing handled by iron-proxy's
+/// `aws_auth` transform. The tool's AWS SDK signs each request with throwaway
+/// *placeholder* credentials; iron-proxy reads the region/service from the
+/// inbound signature's credential scope, strips it, and re-signs with the real
+/// credentials resolved from `access_key_id_ref`/`secret_access_key_ref` (and
+/// optional `session_token_ref` for STS). The real keys never reach the sandbox.
+/// `allowed_regions`/`allowed_services` scope which regions/services the proxy
+/// will sign for; `hosts` becomes the iron-control request rules.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AwsAuthSecret {
+    pub name: String,
+    pub hosts: Vec<String>,
+    pub access_key_id_ref: String,
+    pub secret_access_key_ref: String,
+    pub session_token_ref: Option<String>,
+    pub allowed_regions: Vec<String>,
+    pub allowed_services: Vec<String>,
+}
+
 /// One parsed `[tool.centaur]` secret entry.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ParsedSecret {
@@ -189,6 +208,7 @@ pub enum ParsedSecret {
     PgDsn(PgDsnSecret),
     Hmac(HmacSignSecret),
     BrokerToken(BrokerTokenSecret),
+    AwsAuth(AwsAuthSecret),
 }
 
 impl ParsedSecret {
@@ -201,6 +221,7 @@ impl ParsedSecret {
             ParsedSecret::PgDsn(s) => &s.name,
             ParsedSecret::Hmac(s) => &s.name,
             ParsedSecret::BrokerToken(s) => &s.name,
+            ParsedSecret::AwsAuth(s) => &s.name,
         }
     }
 }
@@ -401,9 +422,12 @@ pub fn parse_secret(entry: &Value, default_hosts: &[String]) -> Result<ParsedSec
             &secret_ref,
         )?)),
         "hmac_sign" => Ok(ParsedSecret::Hmac(parse_hmac(table, &name)?)),
-        "brokered_token" => {
-            Ok(ParsedSecret::BrokerToken(parse_broker_token(table, &name, default_hosts)?))
-        }
+        "brokered_token" => Ok(ParsedSecret::BrokerToken(parse_broker_token(
+            table,
+            &name,
+            default_hosts,
+        )?)),
+        "aws_auth" => Ok(ParsedSecret::AwsAuth(parse_aws(table, &name)?)),
         other => bail!("unknown secret type {other:?} for secret {name:?}"),
     }
 }
@@ -623,6 +647,59 @@ fn parse_hmac(table: &toml::Table, name: &str) -> Result<HmacSignSecret> {
         timestamp_format,
         allow_chunked_body,
     })
+}
+
+/// Port of the `aws_auth` branch of `_parse_secret`. `hosts` is required (no
+/// tool-level fallback, matching the Python loader), `access_key_id` and
+/// `secret_access_key` are required non-empty credential refs, `session_token`
+/// is an optional ref, and `allowed_regions`/`allowed_services` are optional
+/// scoping arrays of non-empty strings.
+fn parse_aws(table: &toml::Table, name: &str) -> Result<AwsAuthSecret> {
+    let hosts = non_empty_str_array(table.get("hosts")).ok_or_else(|| {
+        eyre!("aws_auth entry {name:?} 'hosts' must be a non-empty array of non-empty strings")
+    })?;
+    let access_key_id_ref = opt_str(table, "access_key_id")
+        .ok_or_else(|| eyre!("aws_auth entry {name:?} requires a non-empty 'access_key_id'"))?;
+    let secret_access_key_ref = opt_str(table, "secret_access_key")
+        .ok_or_else(|| eyre!("aws_auth entry {name:?} requires a non-empty 'secret_access_key'"))?;
+    let session_token_ref = match table.get("session_token") {
+        None => None,
+        Some(_) => Some(opt_str(table, "session_token").ok_or_else(|| {
+            eyre!("aws_auth entry {name:?} 'session_token' must be a non-empty string")
+        })?),
+    };
+    let allowed_regions = aws_str_array(table.get("allowed_regions"), name, "allowed_regions")?;
+    let allowed_services = aws_str_array(table.get("allowed_services"), name, "allowed_services")?;
+    Ok(AwsAuthSecret {
+        name: name.to_owned(),
+        hosts,
+        access_key_id_ref,
+        secret_access_key_ref,
+        session_token_ref,
+        allowed_regions,
+        allowed_services,
+    })
+}
+
+/// An optional `aws_auth` scoping array: absent yields `[]`, present must be an
+/// array of non-empty strings.
+fn aws_str_array(value: Option<&Value>, name: &str, key: &str) -> Result<Vec<String>> {
+    let Some(value) = value else {
+        return Ok(vec![]);
+    };
+    let arr = value.as_array().ok_or_else(|| {
+        eyre!("aws_auth entry {name:?} {key:?} must be an array of non-empty strings")
+    })?;
+    arr.iter()
+        .map(|item| {
+            item.as_str()
+                .filter(|s| !s.is_empty())
+                .map(str::to_owned)
+                .ok_or_else(|| {
+                    eyre!("aws_auth entry {name:?} {key:?} must be an array of non-empty strings")
+                })
+        })
+        .collect()
 }
 
 /// The default injection for a `brokered_token` secret: the broker's current

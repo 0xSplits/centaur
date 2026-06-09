@@ -13,10 +13,10 @@ use serde_json::{Value, json};
 
 use crate::error::{IronControlError, Result};
 use crate::models::{
-    BrokerCredentialInput, BrokerCredentialRecord, DataEnvelope, EffectiveConfig,
-    GcpAuthSecretInput, Grant, GrantSecret, Grantee, HmacSecretInput, IdentityInput,
-    OAuthTokenSecretInput, PgDsnSecretInput, Principal, Proxy, ProxyInput, Role, SecretRecord,
-    StaticSecretInput,
+    AwsAuthSecretInput, BrokerCredentialInput, BrokerCredentialRecord, DataEnvelope,
+    EffectiveConfig, GcpAuthSecretInput, Grant, GrantSecret, Grantee, HmacSecretInput,
+    IdentityInput, OAuthTokenSecretInput, PgDsnSecretInput, Principal, Proxy, ProxyInput, Role,
+    SecretRecord, StaticSecretInput,
 };
 
 const API_PREFIX: &str = "/api/v1";
@@ -265,10 +265,21 @@ impl IronControlClient {
         .await
     }
 
+    /// Upsert an AWS auth secret by ``foreign_id``.
+    pub async fn upsert_aws_auth_secret(&self, input: &AwsAuthSecretInput) -> Result<SecretRecord> {
+        self.write(
+            Method::PUT,
+            &upsert_path("aws_auth_secrets", &input.foreign_id),
+            input,
+        )
+        .await
+    }
+
     /// Fetch a secret's identity (id, ``foreign_id``, ``name``) by OID. The
     /// ``collection`` is the resource path segment for the secret's type
     /// (``static_secrets``, ``oauth_token_secrets``, ``gcp_auth_secrets``,
-    /// ``pg_dsn_secrets``, ``hmac_secrets``) — see [`Grant::secret_target`].
+    /// ``pg_dsn_secrets``, ``hmac_secrets``, ``aws_auth_secrets``) — see
+    /// [`Grant::secret_target`].
     pub async fn get_secret(&self, collection: &str, oid: &str) -> Result<SecretRecord> {
         let path = format!("{API_PREFIX}/{collection}/{}", urlencoding::encode(oid));
         let resp = self.send(Method::GET, &path, None::<&Value>).await?;
@@ -328,14 +339,19 @@ impl IronControlClient {
         namespace: &str,
         labels: &[(String, String)],
     ) -> Result<Vec<BrokerCredentialRecord>> {
-        self.list_collection("broker_credentials", namespace, labels).await
+        self.list_collection("broker_credentials", namespace, labels)
+            .await
     }
 
     /// Fetch a broker credential's full resource object (every field
     /// iron-control returns; secret material is never echoed) by OID (``bcr_``)
     /// or ``foreign_id``. Returned as a raw [`Value`] so callers can render the
     /// read-only health fields without modeling them all.
-    pub async fn get_broker_credential_detail(&self, namespace: &str, ident: &str) -> Result<Value> {
+    pub async fn get_broker_credential_detail(
+        &self,
+        namespace: &str,
+        ident: &str,
+    ) -> Result<Value> {
         let path = resource_path("broker_credentials", "bcr_", namespace, ident, "");
         let resp = self.send(Method::GET, &path, None::<&Value>).await?;
         decode_data(resp, Method::GET, &path).await
@@ -481,6 +497,7 @@ fn grant_body(grantee: &Grantee, secret: &GrantSecret) -> Value {
         GrantSecret::OAuthToken(id) => ("oauth_token_secret_id", id),
         GrantSecret::PgDsn(id) => ("pg_dsn_secret_id", id),
         GrantSecret::Hmac(id) => ("hmac_secret_id", id),
+        GrantSecret::AwsAuth(id) => ("aws_auth_secret_id", id),
     };
     map.insert(key.to_owned(), json!(id));
     Value::Object(map)
@@ -581,6 +598,45 @@ mod tests {
             body,
             json!({ "role_id": "role_infra", "oauth_token_secret_id": "ots_slack" })
         );
+    }
+
+    #[test]
+    fn grant_body_role_aws_auth() {
+        let body = grant_body(
+            &Grantee::Role("role_cw".to_owned()),
+            &GrantSecret::AwsAuth("aas_cloudwatch".to_owned()),
+        );
+        assert_eq!(
+            body,
+            json!({ "role_id": "role_cw", "aws_auth_secret_id": "aas_cloudwatch" })
+        );
+    }
+
+    #[test]
+    fn aws_auth_input_serializes_sources_and_scopes() {
+        let input = AwsAuthSecretInput {
+            namespace: "default".to_owned(),
+            foreign_id: "tool-cloudwatch-aws-cloudwatch".to_owned(),
+            name: Some("AWS Auth (tool-cloudwatch)".to_owned()),
+            description: None,
+            labels: std::collections::BTreeMap::new(),
+            access_key_id: SecretSource::env("AWS_ACCESS_KEY_ID"),
+            secret_access_key: SecretSource::env("AWS_SECRET_ACCESS_KEY"),
+            session_token: None,
+            allowed_regions: vec![],
+            allowed_services: vec!["logs".to_owned(), "monitoring".to_owned()],
+            rules: vec![RequestRule::host("logs.us-east-1.amazonaws.com")],
+        };
+        let body = serde_json::to_value(&input).unwrap();
+        assert_eq!(
+            body["access_key_id"],
+            json!({ "source_type": "env", "config": { "var": "AWS_ACCESS_KEY_ID" } })
+        );
+        assert_eq!(body["allowed_services"], json!(["logs", "monitoring"]));
+        // Omitted optionals don't serialize.
+        assert!(body.get("session_token").is_none());
+        assert!(body.get("allowed_regions").is_none());
+        assert!(body.get("description").is_none());
     }
 
     #[test]

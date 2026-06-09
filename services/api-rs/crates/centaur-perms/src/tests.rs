@@ -33,6 +33,10 @@ fn secret_type_routes_by_oid_prefix() {
     );
     assert_eq!(secret_type_for_oid("pgs_4").map(|t| t.0), Some("pg_dsn"));
     assert_eq!(secret_type_for_oid("hms_5").map(|t| t.0), Some("hmac"));
+    assert_eq!(
+        secret_type_for_oid("aas_6").map(|t| t.1),
+        Some("aws_auth_secrets")
+    );
     // A bare foreign_id is not an OID — callers fall back to lookup.
     assert!(secret_type_for_oid("falconx-hmac").is_none());
 }
@@ -257,6 +261,79 @@ fn hmac_requires_hosts() {
     );
 }
 
+const CLOUDWATCH_AWS: &str = r#"{ type = "aws_auth", name = "cloudwatch", access_key_id = "AWS_ACCESS_KEY_ID", secret_access_key = "AWS_SECRET_ACCESS_KEY", hosts = ["logs.*.amazonaws.com", "monitoring.*.amazonaws.com"], allowed_services = ["logs", "monitoring"] }"#;
+
+#[test]
+fn parses_aws_auth_secret() {
+    let parsed = tools::parse_secret(&entry(CLOUDWATCH_AWS), &[]).unwrap();
+    let ParsedSecret::AwsAuth(aws) = parsed else {
+        panic!("expected aws_auth")
+    };
+    assert_eq!(aws.name, "cloudwatch");
+    assert_eq!(
+        aws.hosts,
+        vec![
+            "logs.*.amazonaws.com".to_owned(),
+            "monitoring.*.amazonaws.com".to_owned()
+        ]
+    );
+    assert_eq!(aws.access_key_id_ref, "AWS_ACCESS_KEY_ID");
+    assert_eq!(aws.secret_access_key_ref, "AWS_SECRET_ACCESS_KEY");
+    assert_eq!(aws.session_token_ref, None);
+    assert_eq!(
+        aws.allowed_services,
+        vec!["logs".to_owned(), "monitoring".to_owned()]
+    );
+    assert!(aws.allowed_regions.is_empty());
+}
+
+#[test]
+fn parses_aws_auth_with_session_token_and_regions() {
+    let parsed = tools::parse_secret(
+        &entry(
+            r#"{ type = "aws_auth", name = "cw", access_key_id = "AKID", secret_access_key = "SAK", session_token = "STS_TOKEN", hosts = ["logs.us-east-1.amazonaws.com"], allowed_regions = ["us-east-1"] }"#,
+        ),
+        &[],
+    )
+    .unwrap();
+    let ParsedSecret::AwsAuth(aws) = parsed else {
+        panic!("expected aws_auth")
+    };
+    assert_eq!(aws.session_token_ref.as_deref(), Some("STS_TOKEN"));
+    assert_eq!(aws.allowed_regions, vec!["us-east-1".to_owned()]);
+}
+
+#[test]
+fn aws_auth_requires_access_key_id() {
+    let err = tools::parse_secret(
+        &entry(
+            r#"{ type = "aws_auth", name = "X", secret_access_key = "SAK", hosts = ["logs.amazonaws.com"] }"#,
+        ),
+        &[],
+    )
+    .unwrap_err();
+    assert!(
+        err.to_string()
+            .contains("requires a non-empty 'access_key_id'"),
+        "{err}"
+    );
+}
+
+#[test]
+fn aws_auth_requires_hosts() {
+    let err = tools::parse_secret(
+        &entry(
+            r#"{ type = "aws_auth", name = "X", access_key_id = "AKID", secret_access_key = "SAK" }"#,
+        ),
+        &[],
+    )
+    .unwrap_err();
+    assert!(
+        err.to_string().contains("'hosts' must be a non-empty"),
+        "{err}"
+    );
+}
+
 #[test]
 fn parses_pg_dsn_secret() {
     let parsed = tools::parse_secret(
@@ -310,7 +387,9 @@ fn translates_http_replace_to_static_input() {
         .unwrap(),
     ];
     let out = translate::translate("default", "tool-slack", &secrets, &SourcePolicy::env());
-    let SecretInput::Static(input) = &out.inputs[0] else { panic!("expected static") };
+    let SecretInput::Static(input) = &out.inputs[0] else {
+        panic!("expected static")
+    };
     assert_eq!(input.foreign_id, "tool-slack-slack-bot-token");
     assert_eq!(input.name, "SLACK_BOT_TOKEN");
     let replace = input.replace_config.as_ref().unwrap();
@@ -386,7 +465,9 @@ fn translates_pg_dsn_to_input_with_roundtrip_foreign_id() {
         .unwrap(),
     ];
     let out = translate::translate("default", "tool-reshift", &secrets, &SourcePolicy::env());
-    let SecretInput::PgDsn(input) = &out.inputs[0] else { panic!("expected pg_dsn") };
+    let SecretInput::PgDsn(input) = &out.inputs[0] else {
+        panic!("expected pg_dsn")
+    };
     // The foreign_id is not role-prefixed: it must round-trip back to the
     // sandbox DSN env var (`RESHIFT_DSN`) that api-rs derives from it.
     assert_eq!(input.foreign_id, "reshift");
@@ -404,7 +485,9 @@ fn translates_pg_dsn_to_input_with_roundtrip_foreign_id() {
 fn translates_hmac_to_input() {
     let secrets = vec![tools::parse_secret(&entry(FALCONX_HMAC), &[]).unwrap()];
     let out = translate::translate("default", "tool-falconx", &secrets, &SourcePolicy::env());
-    let SecretInput::Hmac(input) = &out.inputs[0] else { panic!("expected hmac") };
+    let SecretInput::Hmac(input) = &out.inputs[0] else {
+        panic!("expected hmac")
+    };
     assert_eq!(input.foreign_id, "tool-falconx-hmac-falconx-p1");
     assert_eq!(input.name, "FALCONX_P1");
     assert_eq!(input.signature_algorithm, "sha256");
@@ -431,6 +514,62 @@ fn translates_hmac_to_input() {
 }
 
 #[test]
+fn translates_aws_auth_to_input() {
+    let secrets = vec![tools::parse_secret(&entry(CLOUDWATCH_AWS), &[]).unwrap()];
+    let out = translate::translate("default", "tool-cloudwatch", &secrets, &SourcePolicy::env());
+    let SecretInput::AwsAuth(input) = &out.inputs[0] else {
+        panic!("expected aws_auth")
+    };
+    assert_eq!(input.foreign_id, "tool-cloudwatch-aws-cloudwatch");
+    assert_eq!(input.name.as_deref(), Some("AWS Auth (tool-cloudwatch)"));
+    // Credential refs resolve via the deployment source policy (env here).
+    assert_eq!(input.access_key_id.source_type, "env");
+    assert_eq!(
+        input.access_key_id.config,
+        serde_json::json!({ "var": "AWS_ACCESS_KEY_ID" })
+    );
+    assert_eq!(
+        input.secret_access_key.config,
+        serde_json::json!({ "var": "AWS_SECRET_ACCESS_KEY" })
+    );
+    assert!(input.session_token.is_none());
+    assert_eq!(
+        input.allowed_services,
+        vec!["logs".to_owned(), "monitoring".to_owned()]
+    );
+    assert!(input.allowed_regions.is_empty());
+    let hosts: Vec<_> = input
+        .rules
+        .iter()
+        .filter_map(|r| r.host.as_deref())
+        .collect();
+    assert_eq!(
+        hosts,
+        vec!["logs.*.amazonaws.com", "monitoring.*.amazonaws.com"]
+    );
+}
+
+#[test]
+fn translates_aws_auth_session_token_through_policy() {
+    let secrets = vec![
+        tools::parse_secret(
+            &entry(
+                r#"{ type = "aws_auth", name = "cw", access_key_id = "AKID", secret_access_key = "SAK", session_token = "STS_TOKEN", hosts = ["logs.us-east-1.amazonaws.com"] }"#,
+            ),
+            &[],
+        )
+        .unwrap(),
+    ];
+    let out = translate::translate("default", "tool-cw", &secrets, &SourcePolicy::env());
+    let SecretInput::AwsAuth(input) = &out.inputs[0] else {
+        panic!("expected aws_auth")
+    };
+    let session = input.session_token.as_ref().unwrap();
+    assert_eq!(session.source_type, "env");
+    assert_eq!(session.config, serde_json::json!({ "var": "STS_TOKEN" }));
+}
+
+#[test]
 fn translates_brokered_token_to_token_broker_static_secret() {
     let secrets = vec![
         tools::parse_secret(
@@ -440,7 +579,9 @@ fn translates_brokered_token_to_token_broker_static_secret() {
         .unwrap(),
     ];
     let out = translate::translate("default", "tool-codex", &secrets, &SourcePolicy::env());
-    let SecretInput::Static(input) = &out.inputs[0] else { panic!("expected static") };
+    let SecretInput::Static(input) = &out.inputs[0] else {
+        panic!("expected static")
+    };
     assert_eq!(input.foreign_id, "tool-codex-openai-codex");
     assert_eq!(input.name, "openai-codex");
     // Sourced from the broker credential (created out of band), not env/1password.
@@ -614,7 +755,12 @@ fn real_slack_tool_parses_and_translates() {
     };
     let manifest = tools::find_tool(&[tools_dir], "slack").unwrap();
     assert_eq!(manifest.name, "slack");
-    let out = translate::translate("default", "tool-slack", &manifest.all_secrets().cloned().collect::<Vec<_>>(), &SourcePolicy::env());
+    let out = translate::translate(
+        "default",
+        "tool-slack",
+        &manifest.all_secrets().cloned().collect::<Vec<_>>(),
+        &SourcePolicy::env(),
+    );
     assert!(
         out.inputs.iter().any(
             |i| matches!(i, SecretInput::Static(s) if s.foreign_id == "tool-slack-slack-bot-token")
