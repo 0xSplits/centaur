@@ -31,15 +31,35 @@ ironProxy:
   secretSource: onepassword
   secretTtl: 10m
 
-# Tool-server sidecar — runs alongside the sandbox container in each sandbox
-# Pod and exposes the same /tools/* surface the API used to. Same image as
-# the API; the sidecar runs uvicorn against api.tool_server_app.
-# When toolServer.enabled is false (default), the sandbox pod has no
-# sidecar — currently the API still serves /tools so this is a no-op
-# until the API drops its router (Phase 5).
+# Base tools delivery for api-rs sandboxes. When enabled, a tools-bootstrap init
+# container git-clones `repo` at `ref` into each sandbox's /app/tools (the
+# repo-cache architecture — clone a repo into a pre-provisioned dir — without the
+# shared node cache), so adding a tool is a push to the repo, not an image
+# rebuild. `port` is legacy (the deprecated tool-server sidecar) and unused here.
 toolServer:
   enabled: true
   port: 8001
+  # owner/name of the GitHub repo carrying the tools tree. REQUIRED when enabled;
+  # override for forks. Private repos additionally need githubToken below.
+  repo: paradigmxyz/centaur
+  # Branch, tag, or commit to check out; empty = the repo's default branch. Pin
+  # this to the tool set the api-rs image was built with so the creds api-rs
+  # grants match the tools the sandbox installs.
+  ref: ""
+  # Subdirectory in the repo holding the tools tree (mounted at /app/tools).
+  subdir: tools
+  # Git-capable image the clone init container runs in; empty fields fall back to
+  # sandbox.image (which carries git).
+  runnerImage:
+    repository: ""
+    tag: ""
+    pullPolicy: ""
+  # GitHub token for private-repo clones (fed to git via GIT_ASKPASS). Leave the
+  # secret name empty for public repos; point it at the repo-cache token secret
+  # to reuse the same credential.
+  githubToken:
+    existingSecretName: ""
+    secretKey: token
 
 # iron-control — Rails control plane for authenticated API access + encrypted
 # secret storage. Off by default; enable per-environment. Uses a dedicated

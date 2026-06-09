@@ -15,8 +15,8 @@ use centaur_iron_proxy::{
     ProxyFragment, SourceKind, SourcePolicy, harness_auth_fragment, infra_fragment,
 };
 use centaur_sandbox_agent_k8s::{
-    AgentSandboxBackend, AgentSandboxConfig, IronControlSettings, IronProxyConfig, OverlayConfig,
-    ToolsConfig,
+    AgentSandboxBackend, AgentSandboxConfig, GitHubTokenRef, IronControlSettings, IronProxyConfig,
+    OverlayConfig, ToolsConfig,
 };
 use centaur_sandbox_core::{Mount, MountKind, OverlayImage, SandboxSpec};
 use centaur_sandbox_local::LocalSandboxBackend;
@@ -690,30 +690,76 @@ impl TryFrom<&SandboxArgs> for AgentSandboxConfig {
 
 #[derive(Debug, ClapArgs)]
 struct ToolsArgs {
-    // Explicit `id`s avoid clap arg-id collisions with the other flattened
-    // structs (IronProxyArgs/OverlayArgs also carry `image`/`image_pull_policy`).
-    // The source image (the shared `centaur-api` image) carries `/app/tools`,
-    // which a `tools-bootstrap` init container copies into each sandbox.
+    // Tools are git-cloned into each sandbox at boot by a `tools-bootstrap` init
+    // container (repo-cache-style) rather than baked into an image, so adding a
+    // tool needs no image rebuild. Explicit `id`s avoid clap arg-id collisions
+    // with sibling flattened structs.
     #[arg(
-        id = "tools_source_image",
-        long = "kubernetes-tool-server-image",
-        env = "KUBERNETES_TOOL_SERVER_IMAGE"
+        id = "tools_source_repo",
+        long = "kubernetes-tools-repo",
+        env = "KUBERNETES_TOOLS_REPO"
+    )]
+    repo: Option<String>,
+    #[arg(
+        id = "tools_source_ref",
+        long = "kubernetes-tools-ref",
+        env = "KUBERNETES_TOOLS_REF"
+    )]
+    git_ref: Option<String>,
+    #[arg(
+        id = "tools_source_subdir",
+        long = "kubernetes-tools-subdir",
+        env = "KUBERNETES_TOOLS_SUBDIR",
+        default_value = "tools"
+    )]
+    source_subdir: String,
+    // Git-capable image the clone init container runs (the sandbox image carries git).
+    #[arg(
+        id = "tools_runner_image",
+        long = "kubernetes-tools-runner-image",
+        env = "KUBERNETES_TOOLS_RUNNER_IMAGE"
     )]
     image: Option<String>,
     #[arg(
-        id = "tools_source_image_pull_policy",
-        long = "kubernetes-tool-server-image-pull-policy",
-        env = "KUBERNETES_TOOL_SERVER_IMAGE_PULL_POLICY"
+        id = "tools_runner_image_pull_policy",
+        long = "kubernetes-tools-runner-image-pull-policy",
+        env = "KUBERNETES_TOOLS_RUNNER_IMAGE_PULL_POLICY"
     )]
     image_pull_policy: Option<String>,
+    // Secret + key holding a GitHub token for private-repo clones (optional).
+    #[arg(
+        id = "tools_github_token_secret",
+        long = "kubernetes-tools-github-token-secret",
+        env = "KUBERNETES_TOOLS_GITHUB_TOKEN_SECRET"
+    )]
+    github_token_secret: Option<String>,
+    #[arg(
+        id = "tools_github_token_secret_key",
+        long = "kubernetes-tools-github-token-secret-key",
+        env = "KUBERNETES_TOOLS_GITHUB_TOKEN_SECRET_KEY",
+        default_value = "token"
+    )]
+    github_token_secret_key: String,
 }
 
 impl ToolsArgs {
-    /// `None` when no source image is configured (tools disabled).
+    /// `None` when no repo or runner image is configured (tools disabled).
     fn to_config(&self) -> Option<ToolsConfig> {
+        let repo = clean_optional_value(self.repo.as_deref())?;
         let image = clean_optional_value(self.image.as_deref())?;
-        let mut config = ToolsConfig::new(image);
+        let mut config = ToolsConfig::new(repo, image);
         config.image_pull_policy = self.image_pull_policy.clone();
+        config.git_ref = clean_optional_value(self.git_ref.as_deref());
+        if let Some(subdir) = clean_optional_value(Some(self.source_subdir.as_str())) {
+            config.source_subdir = subdir;
+        }
+        if let Some(secret_name) = clean_optional_value(self.github_token_secret.as_deref()) {
+            config.github_token = Some(GitHubTokenRef {
+                secret_name,
+                secret_key: clean_optional_value(Some(self.github_token_secret_key.as_str()))
+                    .unwrap_or_else(|| "token".to_owned()),
+            });
+        }
         Some(config)
     }
 }
@@ -1266,15 +1312,27 @@ mod tests {
             "agent-k8s",
             "--kubernetes-sandbox-iron-proxy-mode",
             "disabled",
-            "--kubernetes-tool-server-image",
-            "centaur-api:test",
+            "--kubernetes-tools-repo",
+            "paradigmxyz/centaur",
+            "--kubernetes-tools-ref",
+            "main",
+            "--kubernetes-tools-runner-image",
+            "centaur-agent:test",
+            "--kubernetes-tools-github-token-secret",
+            "centaur-repo-cache-github-token",
             "--centaur-overlay-image",
             "centaur-overlay:test",
         ])
         .unwrap();
         let config = AgentSandboxConfig::try_from(&args.sandbox).unwrap();
         let tools = config.tools.expect("tools should be Some");
-        assert_eq!(tools.image, "centaur-api:test");
+        assert_eq!(tools.repo, "paradigmxyz/centaur");
+        assert_eq!(tools.git_ref.as_deref(), Some("main"));
+        assert_eq!(tools.source_subdir, "tools");
+        assert_eq!(tools.image, "centaur-agent:test");
+        let token = tools.github_token.expect("token should be Some");
+        assert_eq!(token.secret_name, "centaur-repo-cache-github-token");
+        assert_eq!(token.secret_key, "token");
         let overlay = config.overlay.expect("overlay should be Some");
         assert_eq!(overlay.image, "centaur-overlay:test");
         assert_eq!(overlay.mount_path, "/app/overlay/org");

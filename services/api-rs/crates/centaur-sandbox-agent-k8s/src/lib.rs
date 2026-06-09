@@ -25,7 +25,7 @@ use tokio::time::{Instant, sleep};
 
 pub use generated::agents_x_k8s_io as crd;
 pub use iron_proxy::IronProxyConfig;
-pub use tools::{OverlayConfig, ToolsConfig};
+pub use tools::{GitHubTokenRef, OverlayConfig, ToolsConfig};
 
 pub mod generated;
 mod iron_proxy;
@@ -56,8 +56,8 @@ pub struct AgentSandboxConfig {
     pub iron_proxy: Option<IronProxyConfig>,
     pub iron_control: Option<IronControlSettings>,
     /// When set, every sandbox gets a `tools-bootstrap` init container that
-    /// copies the source image's `/app/tools` into the agent's `/app/tools`, and
-    /// `TOOL_DIRS` is set so the agent's shim installer finds them.
+    /// git-clones the tools repo into the agent's `/app/tools`, and `TOOL_DIRS`
+    /// is set so the agent's shim installer finds them.
     pub tools: Option<ToolsConfig>,
     /// When set, the gerard overlay tree is mounted into the sandbox (tools,
     /// workflows, skills, system-prompt overlay).
@@ -521,7 +521,7 @@ fn build_agent_sandbox(
             config.overlay.as_ref(),
         ));
         volumes.extend(tools::volumes_json(
-            config.tools.is_some(),
+            config.tools.as_ref(),
             config.overlay.is_some(),
         ));
     }
@@ -531,7 +531,7 @@ fn build_agent_sandbox(
         (!volume_mounts.is_empty()).then_some(volume_mounts),
     );
 
-    // Init containers: tools-bootstrap copies /app/tools out of the source image;
+    // Init containers: tools-bootstrap git-clones the tools repo into /app/tools;
     // overlay-bootstrap populates the overlay tree and stages AGENTS_OVERLAY.md.
     if let Some(tools) = &config.tools {
         init_containers.push(tools::tools_init_container_json(tools));
@@ -910,7 +910,8 @@ mod tests {
     #[test]
     fn bootstrap_empty_dirs_are_writable_by_agent_uid() {
         let spec = SandboxSpec::new("centaur-agent:latest");
-        let config = AgentSandboxConfig::new("centaur").tools(ToolsConfig::new("api:test"));
+        let config =
+            AgentSandboxConfig::new("centaur").tools(ToolsConfig::new("paradigmxyz/centaur", "api:test"));
 
         let sandbox = build_agent_sandbox(&SandboxId::new("asbx-test"), &spec, &config).unwrap();
         let pod_spec = &sandbox.spec.pod_template.spec;
