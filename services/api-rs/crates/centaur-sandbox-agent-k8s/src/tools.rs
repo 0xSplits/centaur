@@ -163,12 +163,41 @@ pub(crate) fn agent_env(overlay: Option<&OverlayConfig>) -> Vec<(String, String)
     env
 }
 
+/// Routes the tools clone through the per-sandbox egress proxy. The sandbox
+/// NetworkPolicy only allows egress to the proxy, api-rs, and DNS — a direct
+/// clone to github.com is blocked whenever iron-proxy is enabled. The proxy
+/// MITMs TLS (github.com is in the baseline allowlist), so git must trust the
+/// firewall CA it re-signs with.
+pub(crate) struct CloneProxy {
+    /// Per-sandbox proxy URL (the `HTTPS_PROXY` value `apply_proxy_env` set).
+    pub https_proxy: String,
+    /// Path to the firewall CA cert inside the container.
+    pub ca_cert_path: String,
+    /// Mount of the pod's existing `firewall-ca` volume for the init container.
+    pub ca_volume_mount: Value,
+}
+
 /// The `tools-bootstrap` init container: clones `repo` at `git_ref` (sparse, on
 /// `source_subdir`) and copies that subtree into the shared `tools-root` emptyDir
-/// the agent mounts read-only at `/app/tools`.
-pub(crate) fn tools_init_container_json(tools: &ToolsConfig) -> Value {
+/// the agent mounts read-only at `/app/tools`. With a `CloneProxy`, the clone
+/// rides the per-sandbox iron-proxy like all other sandbox egress.
+pub(crate) fn tools_init_container_json(
+    tools: &ToolsConfig,
+    clone_proxy: Option<&CloneProxy>,
+) -> Value {
     let repo_url = format!("https://github.com/{}.git", tools.repo);
     let subdir = &tools.source_subdir;
+
+    let proxy_exports = match clone_proxy {
+        Some(proxy) => format!(
+            "export HTTPS_PROXY=\"{https_proxy}\"\n\
+             export https_proxy=\"{https_proxy}\"\n\
+             export GIT_SSL_CAINFO=\"{ca_cert_path}\"\n",
+            https_proxy = proxy.https_proxy,
+            ca_cert_path = proxy.ca_cert_path,
+        ),
+        None => String::new(),
+    };
 
     // GIT_ASKPASS feeds the token as the HTTPS password (user x-access-token),
     // matching the repo-cache DaemonSet. Wired only when a token secret is mounted.
@@ -197,6 +226,7 @@ pub(crate) fn tools_init_container_json(tools: &ToolsConfig) -> Value {
 
     let script = format!(
         "set -e\n\
+         {proxy_exports}\
          {askpass}\
          export GIT_TERMINAL_PROMPT=0\n\
          git config --global --add safe.directory '*'\n\
@@ -216,6 +246,9 @@ pub(crate) fn tools_init_container_json(tools: &ToolsConfig) -> Value {
             "mountPath": GITHUB_TOKEN_DIR,
             "readOnly": true,
         }));
+    }
+    if let Some(proxy) = clone_proxy {
+        volume_mounts.push(proxy.ca_volume_mount.clone());
     }
 
     let mut container = json!({
@@ -360,7 +393,7 @@ mod tests {
     fn tools_init_clones_repo_into_emptydir() {
         let mut tools = ToolsConfig::new("paradigmxyz/centaur", "centaur-agent:test");
         tools.git_ref = Some("main".to_owned());
-        let c = tools_init_container_json(&tools);
+        let c = tools_init_container_json(&tools, None);
         assert_eq!(c["name"], "tools-bootstrap");
         assert_eq!(c["image"], "centaur-agent:test");
         let script = c["command"][2].as_str().unwrap();
@@ -375,9 +408,38 @@ mod tests {
     }
 
     #[test]
+    fn tools_init_with_proxy_exports_proxy_env_and_mounts_ca() {
+        let tools = ToolsConfig::new("paradigmxyz/centaur", "centaur-agent:test");
+        let proxy = CloneProxy {
+            https_proxy: "http://asbx-test-iron-proxy:8080".to_owned(),
+            ca_cert_path: "/firewall-certs/ca-cert.pem".to_owned(),
+            ca_volume_mount: json!({
+                "name": "firewall-ca",
+                "mountPath": "/firewall-certs",
+                "readOnly": true,
+            }),
+        };
+        let c = tools_init_container_json(&tools, Some(&proxy));
+        let script = c["command"][2].as_str().unwrap();
+        // Proxy exports come before the clone so git CONNECTs through iron-proxy
+        // and trusts the CA it re-signs TLS with.
+        assert!(script.contains("export HTTPS_PROXY=\"http://asbx-test-iron-proxy:8080\""));
+        assert!(script.contains("export https_proxy=\"http://asbx-test-iron-proxy:8080\""));
+        assert!(script.contains("export GIT_SSL_CAINFO=\"/firewall-certs/ca-cert.pem\""));
+        assert!(script.find("export HTTPS_PROXY").unwrap() < script.find("git clone").unwrap());
+        let mounts = c["volumeMounts"].as_array().unwrap();
+        assert_eq!(mounts.len(), 2);
+        assert!(
+            mounts
+                .iter()
+                .any(|m| m["name"] == "firewall-ca" && m["mountPath"] == "/firewall-certs")
+        );
+    }
+
+    #[test]
     fn tools_init_default_ref_checks_out_clone_head() {
         let tools = ToolsConfig::new("paradigmxyz/centaur", "centaur-agent:test");
-        let script = tools_init_container_json(&tools)["command"][2]
+        let script = tools_init_container_json(&tools, None)["command"][2]
             .as_str()
             .unwrap()
             .to_owned();
@@ -393,7 +455,7 @@ mod tests {
             secret_name: "centaur-repo-cache-github-token".to_owned(),
             secret_key: "token".to_owned(),
         });
-        let c = tools_init_container_json(&tools);
+        let c = tools_init_container_json(&tools, None);
         let script = c["command"][2].as_str().unwrap();
         assert!(script.contains("GIT_ASKPASS=/tmp/git-askpass"));
         assert!(script.contains("/tools-github-token/token"));

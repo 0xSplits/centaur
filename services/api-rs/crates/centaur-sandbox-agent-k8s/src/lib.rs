@@ -534,7 +534,21 @@ fn build_agent_sandbox(
     // Init containers: tools-bootstrap git-clones the tools repo into /app/tools;
     // overlay-bootstrap populates the overlay tree and stages AGENTS_OVERLAY.md.
     if let Some(tools) = &config.tools {
-        init_containers.push(tools::tools_init_container_json(tools));
+        // The sandbox NetworkPolicy only allows egress to the per-sandbox proxy
+        // (plus api-rs and DNS), so when iron-proxy is on the clone must ride it.
+        // `apply_proxy_env` ran before this builder, so the resolved proxy URL is
+        // on the spec env; absent (proxy disabled/unresolved) the clone goes direct.
+        let clone_proxy = config.iron_proxy.as_ref().and_then(|_| {
+            spec.env
+                .iter()
+                .find(|env| env.name == "HTTPS_PROXY")
+                .map(|env| tools::CloneProxy {
+                    https_proxy: env.value.clone(),
+                    ca_cert_path: iron_proxy::FIREWALL_CA_CERT_PATH.to_owned(),
+                    ca_volume_mount: iron_proxy::sandbox_ca_volume_mount_json(),
+                })
+        });
+        init_containers.push(tools::tools_init_container_json(tools, clone_proxy.as_ref()));
     }
     if let Some(overlay) = &config.overlay {
         init_containers.push(tools::overlay_init_container_json(overlay));
@@ -905,6 +919,50 @@ mod tests {
         let init_containers = pod_spec.init_containers.as_ref().unwrap();
         assert_eq!(init_containers.len(), 1);
         assert_eq!(init_containers[0].name, "overlay-bootstrap");
+    }
+
+    #[test]
+    fn tools_clone_rides_iron_proxy_when_enabled() {
+        // apply_proxy_env runs before build_agent_sandbox in create(), so the
+        // resolved per-sandbox proxy URL arrives on the spec env.
+        let spec = SandboxSpec::new("centaur-agent:latest")
+            .env("HTTPS_PROXY", "http://asbx-test-iron-proxy:8080");
+        let config = AgentSandboxConfig::new("centaur")
+            .tools(ToolsConfig::new("paradigmxyz/centaur", "api:test"))
+            .iron_proxy(IronProxyConfig::new("proxy:test", "ca-cert", "ca-key"));
+
+        let sandbox = build_agent_sandbox(&SandboxId::new("asbx-test"), &spec, &config).unwrap();
+        let pod_spec = &sandbox.spec.pod_template.spec;
+        let bootstrap = &pod_spec.init_containers.as_ref().unwrap()[0];
+        assert_eq!(bootstrap.name, "tools-bootstrap");
+        let script = &bootstrap.command.as_ref().unwrap()[2];
+        assert!(script.contains("export HTTPS_PROXY=\"http://asbx-test-iron-proxy:8080\""));
+        assert!(script.contains("export GIT_SSL_CAINFO=\"/firewall-certs/ca-cert.pem\""));
+        assert!(
+            bootstrap
+                .volume_mounts
+                .as_ref()
+                .unwrap()
+                .iter()
+                .any(|mount| mount.name == "firewall-ca")
+        );
+
+        // Without iron-proxy the clone goes direct: no proxy exports, no CA mount.
+        let spec = SandboxSpec::new("centaur-agent:latest");
+        let config = AgentSandboxConfig::new("centaur")
+            .tools(ToolsConfig::new("paradigmxyz/centaur", "api:test"));
+        let sandbox = build_agent_sandbox(&SandboxId::new("asbx-test"), &spec, &config).unwrap();
+        let bootstrap = &sandbox.spec.pod_template.spec.init_containers.as_ref().unwrap()[0];
+        let script = &bootstrap.command.as_ref().unwrap()[2];
+        assert!(!script.contains("HTTPS_PROXY"));
+        assert!(
+            !bootstrap
+                .volume_mounts
+                .as_ref()
+                .unwrap()
+                .iter()
+                .any(|mount| mount.name == "firewall-ca")
+        );
     }
 
     #[test]

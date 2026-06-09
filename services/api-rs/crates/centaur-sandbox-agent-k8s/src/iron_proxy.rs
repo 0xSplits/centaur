@@ -27,7 +27,7 @@ use crate::{
 const IRON_PROXY_LABEL: &str = "centaur.ai/iron-proxy";
 const IRON_CONTROL_PROXY_ID_ANNOTATION: &str = "centaur.ai/iron-control-proxy-id";
 const FIREWALL_CA_MOUNT_PATH: &str = "/firewall-certs";
-const FIREWALL_CA_CERT_PATH: &str = "/firewall-certs/ca-cert.pem";
+pub(crate) const FIREWALL_CA_CERT_PATH: &str = "/firewall-certs/ca-cert.pem";
 const PROXY_MANAGEMENT_PORT: u16 = 9092;
 const PROXY_HEALTH_PORT: u16 = 9090;
 // Managed-mode proxies carry no rendered config; these local listen/TLS
