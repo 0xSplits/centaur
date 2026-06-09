@@ -3,7 +3,7 @@ import type { Logger, Thread } from "chat";
 import { parseDiscordThreadKey } from "./discord-allowlist";
 import { DEFAULT_DISCORD_API_URL } from "./discord-threading";
 import type { DiscordbotApiMessage, DiscordbotOptions } from "./types";
-import { errorMessage, nowMs } from "./utils";
+import { errorMessage } from "./utils";
 
 export type DiscordNarratorChunk = Exclude<
   ChatSDKStreamChunk,
@@ -18,32 +18,39 @@ const REACTION_WORKING = "👀";
 const REACTION_DONE = "✅";
 const REACTION_FAILED = "❌";
 
-// Discord caps message content at 2000 chars; headroom keeps every post safe.
-const NARRATOR_MESSAGE_MAX_CHARS = 1_900;
-// A single blurb is truncated to this, and a thought still pending at this size
-// is flushed early so long reasoning doesn't sit invisible for the whole run.
-const NARRATOR_BLURB_MAX_CHARS = 600;
-// Thoughts that complete within this window merge into one message; also keeps
-// posts well under Discord's per-channel message budget.
-const NARRATOR_MIN_POST_GAP_MS = 1_500;
-// Runaway runs stop narrating past this many posted messages.
-const NARRATOR_MAX_POSTS = 12;
-// Fragments shorter than this aren't worth a message of their own.
-const NARRATOR_MIN_BLURB_CHARS = 12;
+const TRACE_FILENAME = "reasoning.txt";
+const TRACE_MESSAGE_TEXT = "Full reasoning trace:";
+// Discord rejects uploads past 10 MiB on un-boosted servers; stay safely under.
+const TRACE_MAX_BYTES = 8 * 1024 * 1024;
+const TRACE_TRUNCATION_NOTE = "[trace truncated]";
+
+type TraceEntry =
+  | { kind: "thinking"; text: string }
+  | { kind: "plan"; title: string }
+  | {
+      kind: "task";
+      title: string;
+      status: DiscordTaskChunk["status"];
+      details?: string;
+      output?: string;
+    };
 
 export type DiscordNarratorOptions = {
   logger: Logger;
-  maxPosts?: number;
-  minPostGapMs?: number;
 };
 
 /**
- * The Discord-side chain-of-thought surface, fully append-only: the triggering
- * message gets an instant 👀 reaction while the agent works, the agent's
- * reasoning blurbs post as their own italic messages as each thought completes,
- * and on settle the 👀 is swapped for ✅ (or ❌). No bot message is ever edited
- * or deleted. Commands, tools, and plan updates are not rendered; they just
- * mark where a thought ends.
+ * The Discord-side chain-of-thought surface: the triggering message gets an
+ * instant 👀 reaction while the agent works, the full reasoning trace —
+ * thoughts, tool/command tasks (with details and output), and plan updates —
+ * accumulates silently, and on settle it posts once as a reasoning.txt
+ * attachment before the 👀 is swapped for ✅ (or ❌). A "retrying" settle also
+ * posts the partial trace so the attempt's reasoning isn't lost when the retry
+ * starts a fresh narrator. No bot message is ever edited or deleted.
+ *
+ * The trace rides its own trailing message rather than the answer post: the
+ * answer streams via the chat SDK's post+edit path, which can't carry file
+ * uploads, and the trace isn't complete until the run settles anyway.
  *
  * Reactions go through the raw Discord REST API rather than the adapter: a
  * thread-starter message lives in the PARENT channel (same delta that
@@ -54,19 +61,19 @@ export class DiscordNarrator {
   private readonly thread: Thread;
   private readonly botOptions: DiscordbotOptions;
   private readonly logger: Logger;
-  private readonly minPostGapMs: number;
-  private readonly maxPosts: number;
   private readonly reactionChannelId: string | undefined;
   private readonly reactionMessageId: string;
   // Current thought, keyed by chunk id: reasoning deltas have unique ids and
   // concatenate; a commentary item re-uses its id and replaces its body.
   private pendingParts = new Map<string, string>();
-  private queuedBlurbs: string[] = [];
-  private postedCount = 0;
-  private droppedBlurbs = 0;
-  private lastPostAtMs = 0;
+  private entries: TraceEntry[] = [];
+  // Tool/command tasks update in place (running → complete, output arrives
+  // late) but keep their position from first appearance.
+  private taskEntries = new Map<
+    string,
+    Extract<TraceEntry, { kind: "task" }>
+  >();
   private sawError = false;
-  private timer: ReturnType<typeof setTimeout> | null = null;
   private chain: Promise<void> = Promise.resolve();
   private finished = false;
 
@@ -79,8 +86,6 @@ export class DiscordNarrator {
     this.thread = thread;
     this.botOptions = botOptions;
     this.logger = options.logger;
-    this.minPostGapMs = options.minPostGapMs ?? NARRATOR_MIN_POST_GAP_MS;
-    this.maxPosts = options.maxPosts ?? NARRATOR_MAX_POSTS;
     const { channelId, threadId } = parseDiscordThreadKey(thread.id);
     // A thread-starter message (id == thread id) lives in the parent channel;
     // anything else lives in the thread itself.
@@ -103,38 +108,51 @@ export class DiscordNarrator {
 
   update(chunk: DiscordNarratorChunk): void {
     if (this.finished) return;
+    if (chunk.type === "plan_update") {
+      this.flushPendingThought();
+      this.entries.push({ kind: "plan", title: chunk.title });
+      return;
+    }
     if (chunk.type !== "task_update") return;
     if (chunk.status === "error") this.sawError = true;
     if (chunk.title === "Thinking") {
       if (chunk.details) this.pendingParts.set(chunk.id, chunk.details);
-      if (
-        chunk.status === "complete" ||
-        this.pendingText().length >= NARRATOR_BLURB_MAX_CHARS
-      ) {
-        this.flushPending();
-      }
+      if (chunk.status === "complete") this.flushPendingThought();
       return;
     }
     // Any other task means the model moved on — the current thought is over.
-    this.flushPending();
+    this.flushPendingThought();
+    const existing = this.taskEntries.get(chunk.id);
+    if (existing) {
+      existing.status = chunk.status;
+      if (chunk.details) existing.details = chunk.details;
+      if (chunk.output) existing.output = chunk.output;
+      return;
+    }
+    const entry: Extract<TraceEntry, { kind: "task" }> = {
+      kind: "task",
+      title: chunk.title,
+      status: chunk.status,
+      ...(chunk.details ? { details: chunk.details } : {}),
+      ...(chunk.output ? { output: chunk.output } : {}),
+    };
+    this.taskEntries.set(chunk.id, entry);
+    this.entries.push(entry);
   }
 
   /**
-   * Posts any remaining thought, then settles the reaction: ✅ on success,
-   * ❌ on failure, and 👀 stays put for "retrying" (the retry attempt re-adds
-   * it; the PUT is idempotent). Never throws — narration is cosmetic. A "done"
-   * outcome downgrades to "failed" when an error task was seen (the renderer
-   * surfaces in-stream failures as error tasks, not throws).
+   * Posts the accumulated trace as a reasoning.txt attachment (when there is
+   * one), then settles the reaction: ✅ on success, ❌ on failure, and 👀 stays
+   * put for "retrying" (the retry attempt re-adds it; the PUT is idempotent).
+   * Never throws — narration is cosmetic. A "done" outcome downgrades to
+   * "failed" when an error task was seen (the renderer surfaces in-stream
+   * failures as error tasks, not throws).
    */
   async finish(outcome: DiscordNarratorOutcome): Promise<void> {
     if (this.finished) return;
     this.finished = true;
-    if (this.timer) {
-      clearTimeout(this.timer);
-      this.timer = null;
-    }
-    this.flushPendingText();
-    this.enqueueBlurbPost();
+    this.flushPendingThought();
+    this.enqueueTracePost();
     const failed =
       outcome === "failed" || (outcome === "done" && this.sawError);
     if (outcome !== "retrying") {
@@ -144,62 +162,32 @@ export class DiscordNarrator {
       this.enqueueReaction("DELETE", REACTION_WORKING);
     }
     await this.chain;
-    if (this.droppedBlurbs) {
-      this.logger.debug("discordbot_narrator_blurbs_dropped", {
-        dropped: this.droppedBlurbs,
-      });
-    }
   }
 
-  private pendingText(): string {
-    return Array.from(this.pendingParts.values()).join("").trim();
-  }
-
-  private flushPending(): void {
-    this.flushPendingText();
-    this.schedulePost();
-  }
-
-  private flushPendingText(): void {
-    const text = this.pendingText();
+  private flushPendingThought(): void {
+    const text = Array.from(this.pendingParts.values()).join("").trim();
     this.pendingParts = new Map();
-    if (text.length < NARRATOR_MIN_BLURB_CHARS) return;
-    this.queuedBlurbs.push(truncateBlurb(text));
+    if (!text) return;
+    this.entries.push({ kind: "thinking", text });
   }
 
-  private schedulePost(): void {
-    if (this.timer || !this.queuedBlurbs.length) return;
-    const delayMs = Math.max(
-      0,
-      this.minPostGapMs - (nowMs() - this.lastPostAtMs),
-    );
-    this.timer = setTimeout(() => {
-      this.timer = null;
-      this.enqueueBlurbPost();
-    }, delayMs);
-  }
-
-  private enqueueBlurbPost(): void {
-    if (!this.queuedBlurbs.length) return;
-    if (this.postedCount >= this.maxPosts) {
-      this.droppedBlurbs += this.queuedBlurbs.length;
-      this.queuedBlurbs = [];
-      return;
-    }
-    const blurbs = this.queuedBlurbs;
-    this.queuedBlurbs = [];
-    this.postedCount += 1;
-    this.lastPostAtMs = nowMs();
-    const content = clipMessage(
-      blurbs.map((blurb) => italicize(blurb)).join("\n\n"),
-    );
+  private enqueueTracePost(): void {
+    const trace = renderTrace(this.entries);
+    if (!trace) return;
     this.chain = this.chain.then(async () => {
       try {
         await this.thread.adapter.postMessage(this.thread.id, {
-          markdown: content,
+          markdown: TRACE_MESSAGE_TEXT,
+          files: [
+            {
+              data: Buffer.from(trace, "utf8"),
+              filename: TRACE_FILENAME,
+              mimeType: "text/plain",
+            },
+          ],
         });
       } catch (error) {
-        this.logger.warn("discordbot_narrator_post_failed", {
+        this.logger.warn("discordbot_narrator_trace_post_failed", {
           error: errorMessage(error),
         });
       }
@@ -240,21 +228,28 @@ export class DiscordNarrator {
   }
 }
 
-/** Discord italics don't span newlines, so wrap each non-empty line. */
-function italicize(text: string): string {
-  return text
-    .split("\n")
-    .map((line) => (line.trim() ? `*${line.trim()}*` : ""))
-    .join("\n")
-    .replace(/\n{3,}/g, "\n\n");
+function renderTrace(entries: TraceEntry[]): string {
+  const sections = entries.map((entry) => {
+    if (entry.kind === "thinking") return `[thinking]\n${entry.text}`;
+    if (entry.kind === "plan") return `[plan] ${entry.title}`;
+    const header = `[${entry.title}] (${entry.status})`;
+    const body = [
+      entry.details?.trim(),
+      entry.output?.trim() ? `--- output ---\n${entry.output.trim()}` : "",
+    ]
+      .filter(Boolean)
+      .join("\n");
+    return body ? `${header}\n${body}` : header;
+  });
+  return clipTrace(sections.join("\n\n").trim());
 }
 
-function truncateBlurb(text: string): string {
-  if (text.length <= NARRATOR_BLURB_MAX_CHARS) return text;
-  return `${text.slice(0, NARRATOR_BLURB_MAX_CHARS - 1).trimEnd()}…`;
-}
-
-function clipMessage(content: string): string {
-  if (content.length <= NARRATOR_MESSAGE_MAX_CHARS) return content;
-  return content.slice(0, NARRATOR_MESSAGE_MAX_CHARS);
+function clipTrace(text: string): string {
+  if (Buffer.byteLength(text, "utf8") <= TRACE_MAX_BYTES) return text;
+  const budget = TRACE_MAX_BYTES - TRACE_TRUNCATION_NOTE.length - 1;
+  let keep = budget;
+  while (Buffer.byteLength(text.slice(0, keep), "utf8") > budget) {
+    keep = Math.floor(keep * 0.9);
+  }
+  return `${text.slice(0, keep).trimEnd()}\n${TRACE_TRUNCATION_NOTE}`;
 }
