@@ -218,12 +218,14 @@ pub(crate) fn tools_init_container_json(
     // without one we check out the cloned default branch.
     let checkout = match &tools.git_ref {
         Some(git_ref) => format!(
-            "git -C \"$src\" -c gc.auto=0 fetch --quiet origin {git_ref}\n\
+            "git -C \"$src\" -c gc.auto=0 fetch --quiet origin \"{git_ref}\"\n\
              git -C \"$src\" checkout --quiet --detach FETCH_HEAD"
         ),
         None => "git -C \"$src\" checkout --quiet".to_owned(),
     };
 
+    // repo/ref/subdir are operator config, but quote them anyway so a stray
+    // space or metacharacter breaks loudly in git instead of in the shell.
     let script = format!(
         "set -e\n\
          {proxy_exports}\
@@ -231,8 +233,8 @@ pub(crate) fn tools_init_container_json(
          export GIT_TERMINAL_PROMPT=0\n\
          git config --global --add safe.directory '*'\n\
          src=\"$(mktemp -d)\"\n\
-         git clone --quiet --filter=blob:none --no-checkout {repo_url} \"$src\"\n\
-         git -C \"$src\" sparse-checkout set {subdir}\n\
+         git clone --quiet --filter=blob:none --no-checkout \"{repo_url}\" \"$src\"\n\
+         git -C \"$src\" sparse-checkout set \"{subdir}\"\n\
          {checkout}\n\
          target=\"{TOOLS_BOOTSTRAP_DIR}\"\n\
          mkdir -p \"$target\"\n\
@@ -397,9 +399,11 @@ mod tests {
         assert_eq!(c["name"], "tools-bootstrap");
         assert_eq!(c["image"], "centaur-agent:test");
         let script = c["command"][2].as_str().unwrap();
-        assert!(script.contains("git clone --quiet --filter=blob:none --no-checkout https://github.com/paradigmxyz/centaur.git"));
-        assert!(script.contains("sparse-checkout set tools"));
-        assert!(script.contains("fetch --quiet origin main"));
+        assert!(script.contains(
+            "git clone --quiet --filter=blob:none --no-checkout \"https://github.com/paradigmxyz/centaur.git\""
+        ));
+        assert!(script.contains("sparse-checkout set \"tools\""));
+        assert!(script.contains("fetch --quiet origin \"main\""));
         assert!(script.contains("cp -R \"$src/tools/.\" \"$target\"/"));
         // No token configured => no askpass, single (tools) volume mount.
         assert!(!script.contains("GIT_ASKPASS"));
