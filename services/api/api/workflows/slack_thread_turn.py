@@ -12,10 +12,11 @@ from api.workflow_engine import Delivery, WorkflowContext
 
 WORKFLOW_NAME = "slack_thread_turn"
 
-_EXECUTION_HARNESSES = frozenset({"amp", "claude-code", "codex", "pi-mono"})
+_EXECUTION_HARNESSES = frozenset({"amp", "claude-code", "codex", "opencode", "pi-mono"})
 _PROMPT_FLAG_ALIASES = {
     "claude": "claude-code",
     "pi": "pi-mono",
+    "oc": "opencode",
 }
 _PROMPT_FLAG_SKIP = frozenset({"engine", "model", "opus", "sonnet", "haiku"})
 _PROMPT_FLAG_VALUE_SKIP = frozenset({"engine", "model"})

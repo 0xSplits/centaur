@@ -260,6 +260,8 @@ def _engine_model_label(
         return _resolve_codex_model_label(explicit or None)
     if engine_name == "amp":
         return f"amp-{explicit}" if explicit else "amp"
+    if engine_name == "opencode":
+        return f"opencode-{explicit}" if explicit else "opencode"
     if explicit:
         return explicit
     return engine_name or "centaur"

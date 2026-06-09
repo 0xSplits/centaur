@@ -124,6 +124,7 @@ pub enum HarnessType {
     Codex,
     Amp,
     ClaudeCode,
+    OpenCode,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, AsRefStr, Display, EnumString)]
@@ -257,6 +258,10 @@ mod tests {
             HarnessType::from_str("claudecode").unwrap(),
             HarnessType::ClaudeCode
         );
+        assert_eq!(
+            HarnessType::from_str("opencode").unwrap(),
+            HarnessType::OpenCode
+        );
     }
 
     #[test]
@@ -264,6 +269,10 @@ mod tests {
         assert_eq!(
             serde_json::to_value(HarnessType::ClaudeCode).unwrap(),
             serde_json::json!("claudecode")
+        );
+        assert_eq!(
+            serde_json::to_value(HarnessType::OpenCode).unwrap(),
+            serde_json::json!("opencode")
         );
         assert_eq!(
             serde_json::from_value::<HarnessType>(serde_json::json!("codex")).unwrap(),

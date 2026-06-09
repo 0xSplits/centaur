@@ -50,12 +50,17 @@ if [ -n "${TOOL_DIRS:-}" ]; then
 fi
 
 if [ -d "$STATE_DIR" ] && [ -w "$STATE_DIR" ]; then
-    mkdir -p "$STATE_DIR/workspace" "$STATE_DIR/uploads" "$STATE_DIR/branches" "$STATE_DIR/codex" "$STATE_DIR/claude"
+    mkdir -p "$STATE_DIR/workspace" "$STATE_DIR/uploads" "$STATE_DIR/branches" "$STATE_DIR/codex" "$STATE_DIR/claude" "$STATE_DIR/opencode"
     rm -rf "$HOME_DIR/.codex" "$HOME_DIR/.claude" "$HOME_DIR/uploads" "$HOME_DIR/branches"
     ln -s "$STATE_DIR/codex" "$HOME_DIR/.codex"
     ln -s "$STATE_DIR/claude" "$HOME_DIR/.claude"
     ln -s "$STATE_DIR/uploads" "$HOME_DIR/uploads"
     ln -s "$STATE_DIR/branches" "$HOME_DIR/branches"
+    # opencode stores session history under its XDG data dir; persist it so
+    # OPENCODE_CONTINUE_SESSION_ID can resume across warm-pool claims.
+    mkdir -p "$HOME_DIR/.local/share"
+    rm -rf "$HOME_DIR/.local/share/opencode"
+    ln -s "$STATE_DIR/opencode" "$HOME_DIR/.local/share/opencode"
     export CENTAUR_PERSISTENT_STATE=1
 fi
 
@@ -177,6 +182,78 @@ case "$CLAUDE_CODE_AUTH_MODE" in
         exit 1
         ;;
 esac
+
+# ── opencode settings ────────────────────────────────────────────────────────
+# opencode is provider-agnostic: the model provider and model are fully
+# configurable through env vars, which the entrypoint renders into the global
+# opencode.json. Authentication mirrors the codex/claude stub-key model — the
+# provider's apiKey points at a placeholder env var that iron-proxy rewrites to
+# the real credential on the wire (selected by OPENCODE_AUTH_MODE).
+#
+#   OPENCODE_PROVIDER    provider id (default: anthropic)
+#   OPENCODE_MODEL       bare model id (default: claude-opus-4-8)
+#   OPENCODE_AUTH_MODE   anthropic | openai | api_key (default: anthropic)
+#   OPENCODE_BASE_URL    optional custom OpenAI-compatible base URL
+#   OPENCODE_PROVIDER_NPM optional AI-SDK adapter package for custom providers
+#   OPENCODE_API_KEY_ENV optional override of the placeholder env var name
+mkdir -p "$HOME_DIR/.config/opencode"
+OPENCODE_PROVIDER="${OPENCODE_PROVIDER:-anthropic}"
+OPENCODE_MODEL="${OPENCODE_MODEL:-claude-opus-4-8}"
+OPENCODE_AUTH_MODE="${OPENCODE_AUTH_MODE:-anthropic}"
+# Default the placeholder env var to the provider family's stub key.
+if [ -z "${OPENCODE_API_KEY_ENV:-}" ]; then
+    case "$OPENCODE_AUTH_MODE" in
+        openai) OPENCODE_API_KEY_ENV="OPENAI_API_KEY" ;;
+        *) OPENCODE_API_KEY_ENV="ANTHROPIC_API_KEY" ;;
+    esac
+fi
+export OPENCODE_PROVIDER OPENCODE_MODEL OPENCODE_AUTH_MODE OPENCODE_API_KEY_ENV
+# The wrapper and the local server must share a password so loopback requests
+# authenticate regardless of the server's default policy.
+if [ -z "${OPENCODE_SERVER_PASSWORD:-}" ]; then
+    OPENCODE_SERVER_PASSWORD="$(head -c 24 /dev/urandom | base64 | tr -d '/+=')"
+fi
+export OPENCODE_SERVER_PASSWORD
+OPENCODE_PROVIDER="$OPENCODE_PROVIDER" \
+OPENCODE_MODEL="$OPENCODE_MODEL" \
+OPENCODE_BASE_URL="${OPENCODE_BASE_URL:-}" \
+OPENCODE_PROVIDER_NPM="${OPENCODE_PROVIDER_NPM:-}" \
+OPENCODE_API_KEY_ENV="$OPENCODE_API_KEY_ENV" \
+python3 - "$HOME_DIR/.config/opencode/opencode.json" <<'PYEOF'
+import json
+import os
+import sys
+
+provider = os.environ["OPENCODE_PROVIDER"]
+model = os.environ["OPENCODE_MODEL"]
+base_url = os.environ.get("OPENCODE_BASE_URL", "").strip()
+npm = os.environ.get("OPENCODE_PROVIDER_NPM", "").strip()
+key_env = os.environ["OPENCODE_API_KEY_ENV"]
+
+options = {"apiKey": "{env:%s}" % key_env}
+if base_url:
+    options["baseURL"] = base_url
+
+provider_block = {"options": options}
+if npm:
+    provider_block["npm"] = npm
+
+# model may already be provider-qualified ("anthropic/claude-..."); only prefix
+# the provider when it is a bare model id.
+qualified_model = model if "/" in model else f"{provider}/{model}"
+
+config = {
+    "$schema": "https://opencode.ai/config.json",
+    "model": qualified_model,
+    "provider": {provider: provider_block},
+    # Non-interactive sandbox: never prompt, never auto-update.
+    "autoupdate": False,
+}
+
+with open(sys.argv[1], "w") as f:
+    json.dump(config, f, indent=2)
+    f.write("\n")
+PYEOF
 
 # ── Pi-mono settings ─────────────────────────────────────────────────────────
 mkdir -p "$HOME_DIR/.pi/agent/extensions"

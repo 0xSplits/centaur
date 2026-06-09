@@ -844,7 +844,7 @@ def _normalize_pi_event(event: dict) -> list[dict]:
 # Main dispatcher
 # ---------------------------------------------------------------------------
 
-_ENGINE_HARNESSES = {"amp", "claude-code", "codex", "pi-mono"}
+_ENGINE_HARNESSES = {"amp", "claude-code", "codex", "opencode", "pi-mono"}
 
 
 def normalize_harness_event(engine: str, event: dict) -> list[dict]:

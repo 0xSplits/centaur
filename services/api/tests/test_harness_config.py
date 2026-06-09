@@ -25,3 +25,19 @@ def test_default_harness_ignores_unknown_values(monkeypatch):
     monkeypatch.setenv("CENTAUR_DEFAULT_HARNESS", "unknown")
 
     assert default_harness() == "codex"
+
+
+def test_default_harness_supports_opencode_alias(monkeypatch):
+    from api.harness_config import default_harness
+
+    monkeypatch.setenv("CENTAUR_DEFAULT_HARNESS", "opencode")
+    assert default_harness() == "opencode"
+
+    monkeypatch.setenv("CENTAUR_DEFAULT_HARNESS", "oc")
+    assert default_harness() == "opencode"
+
+
+def test_build_harness_cmd_opencode():
+    from api.sandbox.config import build_harness_cmd
+
+    assert build_harness_cmd("opencode") == ["opencode-app-wrapper"]

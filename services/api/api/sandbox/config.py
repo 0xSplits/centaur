@@ -23,6 +23,9 @@ _HARNESS_STUB_KEYS = (
     "OPENAI_API_KEY",
     "AMP_API_KEY",
     "GITHUB_TOKEN",
+    # Generic placeholder for opencode custom providers whose apiKey points at
+    # OPENCODE_API_KEY; iron-proxy rewrites it to the real credential on the wire.
+    "OPENCODE_API_KEY",
 )
 
 _SANDBOX_PASSTHROUGH_ENV_KEYS = (
@@ -161,6 +164,8 @@ def build_harness_cmd(engine: str, model: str | None = None) -> list[str]:
         return ["codex-app-wrapper"]
     if engine == "claude-code":
         return ["claude-app-wrapper"]
+    if engine == "opencode":
+        return ["opencode-app-wrapper"]
     return ["sleep", "infinity"]
 
 

@@ -1934,6 +1934,34 @@ class ToolManager:
                 inject_header="chatgpt-account-id",
             ),
         ),
+        # opencode is provider-agnostic; OPENCODE_AUTH_MODE selects which
+        # provider family's credential iron-proxy injects. The default
+        # (unset -> "api_key") and the explicit "anthropic" both target the
+        # Anthropic provider; "openai" targets api.openai.com.
+        ("opencode", "api_key"): (
+            HttpSecret(
+                name="ANTHROPIC_API_KEY",
+                secret_ref="ANTHROPIC_API_KEY",
+                hosts=("api.anthropic.com",),
+                match_headers=("X-Api-Key",),
+            ),
+        ),
+        ("opencode", "anthropic"): (
+            HttpSecret(
+                name="ANTHROPIC_API_KEY",
+                secret_ref="ANTHROPIC_API_KEY",
+                hosts=("api.anthropic.com",),
+                match_headers=("X-Api-Key",),
+            ),
+        ),
+        ("opencode", "openai"): (
+            HttpSecret(
+                name="OPENAI_API_KEY",
+                secret_ref="OPENAI_API_KEY",
+                hosts=("api.openai.com",),
+                match_headers=("Authorization",),
+            ),
+        ),
     }
 
     # Maps an engine to the env-var name (in ``sandbox.extraEnv``) that
@@ -1942,6 +1970,7 @@ class ToolManager:
     _HARNESS_AUTH_MODE_ENV: ClassVar[dict[str, str]] = {
         "claude-code": "CLAUDE_CODE_AUTH_MODE",
         "codex": "CODEX_AUTH_MODE",
+        "opencode": "OPENCODE_AUTH_MODE",
     }
 
     @classmethod

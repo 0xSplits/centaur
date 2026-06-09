@@ -24,6 +24,11 @@ pub fn harness_auth_fragment(engine: &str, auth_mode: &str) -> Result<Option<Pro
         ("codex", "access_token") => CODEX_ACCESS_TOKEN_FRAGMENT,
         ("claude-code", "api_key") => CLAUDE_CODE_API_KEY_FRAGMENT,
         ("claude-code", "access_token") => CLAUDE_CODE_ACCESS_TOKEN_FRAGMENT,
+        // opencode is provider-agnostic; OPENCODE_AUTH_MODE selects the
+        // provider family. The default (api_key) and explicit anthropic both
+        // rewrite the Anthropic key; openai targets api.openai.com.
+        ("opencode", "api_key" | "anthropic") => CLAUDE_CODE_API_KEY_FRAGMENT,
+        ("opencode", "openai") => CODEX_API_KEY_FRAGMENT,
         _ => return Ok(None),
     };
     load_fragment_str(yaml).map(Some)

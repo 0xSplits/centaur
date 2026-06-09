@@ -1499,6 +1499,10 @@ class KubernetesExecutorBackend(SandboxBackend):
             env.append(f"CLAUDE_MODEL={model}")
         if engine == "claude-code" and resume_thread_id:
             env.append(f"CLAUDE_CONTINUE_SESSION_ID={resume_thread_id}")
+        if engine == "opencode" and model:
+            env.append(f"OPENCODE_MODEL={model}")
+        if engine == "opencode" and resume_thread_id:
+            env.append(f"OPENCODE_CONTINUE_SESSION_ID={resume_thread_id}")
         if persona:
             env.append(f"AGENT_PERSONA={persona}")
         if repo:

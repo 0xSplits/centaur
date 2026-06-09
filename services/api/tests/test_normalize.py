@@ -221,3 +221,35 @@ class TestAutoDetect:
     def test_detect_amp_fallback(self):
         result = normalize_harness_event("", {"type": "result", "result": "ok"})
         assert result == [{"type": "result", "text": "ok"}]
+
+
+class TestOpenCode:
+    """opencode routes through the amp-like normalizer (wrapper emits that shape)."""
+
+    def test_result_event(self):
+        result = normalize_harness_event(
+            "opencode", {"type": "result", "subtype": "success", "result": "done"}
+        )
+        assert result == [{"type": "result", "text": "done"}]
+
+    def test_system_init(self):
+        result = normalize_harness_event(
+            "opencode",
+            {"type": "system", "subtype": "init", "session_id": "ses_1"},
+        )
+        assert result == [
+            {"type": "system", "subtype": "init", "session_id": "ses_1"}
+        ]
+
+    def test_stream_text_delta(self):
+        evt = {
+            "type": "stream_event",
+            "event": {
+                "type": "content_block_delta",
+                "delta": {"type": "text_delta", "text": "hi"},
+            },
+        }
+        result = normalize_harness_event("opencode", evt)
+        assert result == [
+            {"type": "assistant", "message": {"content": [{"type": "text", "text": "hi"}]}}
+        ]

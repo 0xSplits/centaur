@@ -457,3 +457,22 @@ class TestMessagesToContentBlocks:
             {"type": "text", "text": "first"},
             {"type": "text", "text": "second"},
         ]
+
+
+class TestOpenCode:
+    """opencode reuses the claude-code wire shapes emitted by its wrapper."""
+
+    def test_result_signals_turn_done(self):
+        event = {"type": "result", "subtype": "success", "result": "all done"}
+        assert is_turn_done("opencode", event) is True
+
+    def test_error_signals_turn_done(self):
+        assert is_turn_done("opencode", {"type": "error", "message": "boom"}) is True
+
+    def test_extract_result_from_result_event(self):
+        event = {"type": "result", "subtype": "success", "result": "the answer"}
+        assert extract_result("opencode", event) == "the answer"
+
+    def test_extract_thread_id_from_init(self):
+        event = {"type": "system", "subtype": "init", "session_id": "ses_abc123"}
+        assert extract_thread_id("opencode", event) == "ses_abc123"

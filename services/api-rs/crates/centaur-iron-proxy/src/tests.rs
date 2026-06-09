@@ -14,6 +14,29 @@ fn harness_auth_fragments_are_baked_in() {
 
     assert!(harness_auth_fragment("codex", "bogus").unwrap().is_none());
 
+    // opencode reuses the provider-family fragments: the default (api_key) and
+    // "anthropic" rewrite the Anthropic key; "openai" targets api.openai.com.
+    let opencode_default = harness_auth_fragment("opencode", "api_key")
+        .unwrap()
+        .unwrap();
+    let opencode_anthropic = harness_auth_fragment("opencode", "anthropic")
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        placeholder_env(&[opencode_default]).get("ANTHROPIC_API_KEY"),
+        Some(&"ANTHROPIC_API_KEY".to_owned())
+    );
+    assert_eq!(
+        placeholder_env(&[opencode_anthropic]).get("ANTHROPIC_API_KEY"),
+        Some(&"ANTHROPIC_API_KEY".to_owned())
+    );
+    assert!(
+        harness_auth_fragment("opencode", "openai")
+            .unwrap()
+            .is_some()
+    );
+    assert!(harness_auth_fragment("opencode", "bogus").unwrap().is_none());
+
     let infra = infra_fragment().unwrap();
     let placeholders = placeholder_env(&[infra]);
     for name in ["AMP_API_KEY", "GITHUB_TOKEN", "SLACK_BOT_TOKEN"] {

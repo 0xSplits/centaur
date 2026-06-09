@@ -28,10 +28,17 @@ class ClaudeCodeAdapter(HarnessAdapter):
     pass
 
 
+class OpenCodeAdapter(HarnessAdapter):
+    # opencode reads ``AGENTS.md`` natively from the workspace root, so no
+    # prompt-file rewriting is needed (same as Codex).
+    pass
+
+
 ADAPTERS = {
     "amp-wrapper": AmpAdapter,
     "codex-app-wrapper": CodexAdapter,
     "claude-app-wrapper": ClaudeCodeAdapter,
+    "opencode-app-wrapper": OpenCodeAdapter,
 }
 
 

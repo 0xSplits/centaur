@@ -718,6 +718,22 @@ class TestHarnessSecretSelection:
         assert "ANTHROPIC_API_KEY" in names
         assert "anthropic-claude" not in names
 
+    def test_opencode_defaults_to_anthropic(self) -> None:
+        tm = ToolManager.__new__(ToolManager)
+        tm.tools = {}
+        names = self._names(tm.secrets_for_sandbox("opencode", {}))
+        assert "ANTHROPIC_API_KEY" in names
+        assert "OPENAI_API_KEY" not in names
+
+    def test_opencode_openai_mode_swaps_provider(self) -> None:
+        tm = ToolManager.__new__(ToolManager)
+        tm.tools = {}
+        names = self._names(
+            tm.secrets_for_sandbox("opencode", {"OPENCODE_AUTH_MODE": "openai"})
+        )
+        assert "OPENAI_API_KEY" in names
+        assert "ANTHROPIC_API_KEY" not in names
+
     def test_unknown_engine_gets_no_harness_extras(self) -> None:
         tm = ToolManager.__new__(ToolManager)
         tm.tools = {}

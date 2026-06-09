@@ -55,6 +55,7 @@ RUN useradd -m -s /bin/bash -u 1001 agent \
 ARG CLAUDE_CODE_VERSION=2.1.154
 ARG CODEX_VERSION=0.130.0
 ARG PI_CODING_AGENT_VERSION=0.67.2
+ARG OPENCODE_VERSION=1.16.2
 ARG NUSHELL_VERSION=0.112.2
 ARG KUBECTL_VERSION=v1.34.2
 
@@ -93,10 +94,12 @@ RUN --mount=type=cache,target=/root/.npm,sharing=locked \
       "@anthropic-ai/claude-code@${CLAUDE_CODE_VERSION}" \
       "@openai/codex@${CODEX_VERSION}" \
       "@mariozechner/pi-coding-agent@${PI_CODING_AGENT_VERSION}" \
+      "opencode-ai@${OPENCODE_VERSION}" \
       agent-browser@0.26.0 \
     && find /usr/lib/node_modules -type f \( -name '*.map' -o -name '*.tsbuildinfo' \) -delete \
     && claude --version | grep -F "${CLAUDE_CODE_VERSION}" \
-    && codex --version | grep -F "${CODEX_VERSION}"
+    && codex --version | grep -F "${CODEX_VERSION}" \
+    && opencode --version | grep -F "${OPENCODE_VERSION}"
 
 # ── agent-browser system deps (must run as root before USER agent) ───────────
 # Chrome for Testing doesn't provide Linux ARM64 builds; fall back to system chromium
@@ -198,6 +201,7 @@ COPY --link --chmod=755 services/sandbox/md2docx.py /usr/local/bin/md2docx
 COPY --link --chmod=755 services/sandbox/amp-wrapper.py /usr/local/bin/amp-wrapper
 COPY --link --chmod=755 services/sandbox/codex-app-wrapper.py /usr/local/bin/codex-app-wrapper
 COPY --link --chmod=755 services/sandbox/claude-app-wrapper.py /usr/local/bin/claude-app-wrapper
+COPY --link --chmod=755 services/sandbox/opencode-app-wrapper.py /usr/local/bin/opencode-app-wrapper
 COPY --link --chmod=755 services/sandbox/harness_adapter.py /usr/local/bin/harness-adapter
 COPY --link --chmod=755 services/sandbox/git-branch.sh /usr/local/bin/git-branch
 COPY --link --chmod=755 services/sandbox/install_tool_shims.py /usr/local/bin/install-tool-shims

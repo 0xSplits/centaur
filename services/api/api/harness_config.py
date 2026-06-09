@@ -8,6 +8,8 @@ _DEFAULT_HARNESS_ALIASES: dict[str, str] = {
     "claude": "claude-code",
     "claude-code": "claude-code",
     "codex": "codex",
+    "oc": "opencode",
+    "opencode": "opencode",
     "pi": "pi-mono",
     "pi-mono": "pi-mono",
 }

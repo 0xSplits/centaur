@@ -38,7 +38,7 @@ def is_turn_done(engine: str, event: dict) -> bool:
         if "restarting (" in error_msg and "giving up" not in error_msg:
             return False
         return True
-    if engine in ("amp", "claude-code"):
+    if engine in ("amp", "claude-code", "opencode"):
         if t == "result":
             return True
         if t == "assistant":
@@ -75,7 +75,7 @@ def extract_result(engine: str, event: dict) -> str | None:
             if isinstance(text, str) and text:
                 return text
         return _extract_error_message(event) or None
-    if engine in ("amp", "claude-code"):
+    if engine in ("amp", "claude-code", "opencode"):
         if t == "result":
             result = event.get("result")
             if isinstance(result, str) and result:
@@ -115,7 +115,7 @@ def extract_result(engine: str, event: dict) -> str | None:
 def extract_thread_id(engine: str, event: dict) -> str | None:
     """Return the harness thread/session id from *event*, or ``None``."""
     t = event.get("type", "")
-    if engine in ("amp", "claude-code"):
+    if engine in ("amp", "claude-code", "opencode"):
         if t == "system" and event.get("subtype") == "init":
             return event.get("session_id") or None
         if t == "assistant":
