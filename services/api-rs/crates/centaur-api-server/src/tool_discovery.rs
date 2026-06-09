@@ -361,6 +361,7 @@ enum ToolSecret {
     OAuthToken(OAuthTokenSecret),
     GcpAuth(GcpAuthSecret),
     PgDsn(PgDsnSecret),
+    AwsAuth(AwsAuthSecret),
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
@@ -417,6 +418,24 @@ struct PgDsnSecret {
     database: String,
 }
 
+/// A `type = "aws_auth"` secret. The in-sandbox AWS SDK signs each request with
+/// throwaway placeholder credentials (`access_key_id_ref`/`secret_access_key_ref`
+/// and the optional `session_token_ref`); iron-proxy's `aws_auth` transform reads
+/// the region/service from the inbound signature scope and re-signs with the real
+/// keys resolved from those refs. `allowed_regions`/`allowed_services` scope which
+/// the proxy will sign for; `hosts` become the request rules. Mirrors the
+/// `centaur-perms` parser so both producers agree on the metadata.
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+struct AwsAuthSecret {
+    name: String,
+    hosts: Vec<String>,
+    access_key_id_ref: String,
+    secret_access_key_ref: String,
+    session_token_ref: Option<String>,
+    allowed_regions: Vec<String>,
+    allowed_services: Vec<String>,
+}
+
 fn parse_secret_list(
     value: Option<&TomlValue>,
     default_hosts: &[String],
@@ -468,6 +487,7 @@ fn parse_secret(
         "oauth_token" => parse_oauth_token_secret(table, name),
         "gcp_auth" => parse_gcp_auth_secret(table, name, secret_ref),
         "pg_dsn" => parse_pg_dsn_secret(table, name, secret_ref),
+        "aws_auth" => parse_aws_auth_secret(table, name),
         "brokered_token" | "hmac_sign" => Err(ToolDiscoveryError::Invalid(format!(
             "api-rs iron-control tool discovery does not yet support secret type {:?}",
             optional_str(table, "type").unwrap_or("unknown")
@@ -604,6 +624,33 @@ fn parse_pg_dsn_secret(
     }))
 }
 
+fn parse_aws_auth_secret(
+    table: &toml::Table,
+    name: String,
+) -> Result<ToolSecret, ToolDiscoveryError> {
+    // `hosts` is required (no tool-level fallback, matching the centaur-perms
+    // loader); the credential refs are placeholders the proxy re-signs with.
+    let hosts = required_string_array(table.get("hosts"), "hosts")?;
+    let access_key_id_ref = required_str(table, "access_key_id")?.to_owned();
+    let secret_access_key_ref = required_str(table, "secret_access_key")?.to_owned();
+    let session_token_ref = match table.get("session_token") {
+        None => None,
+        Some(_) => Some(required_str(table, "session_token")?.to_owned()),
+    };
+    let allowed_regions = optional_string_array(table.get("allowed_regions"))?.unwrap_or_default();
+    let allowed_services =
+        optional_string_array(table.get("allowed_services"))?.unwrap_or_default();
+    Ok(ToolSecret::AwsAuth(AwsAuthSecret {
+        name,
+        hosts,
+        access_key_id_ref,
+        secret_access_key_ref,
+        session_token_ref,
+        allowed_regions,
+        allowed_services,
+    }))
+}
+
 fn parse_oauth_fields(
     value: Option<&TomlValue>,
     secret_name: &str,
@@ -647,6 +694,7 @@ fn fragment_from_secrets(secrets: Vec<ToolSecret>) -> Result<ProxyFragment, Tool
         fragment.transforms.push(transform);
     }
     fragment.transforms.extend(gcp_auth_transforms(&secrets)?);
+    fragment.transforms.extend(aws_auth_transforms(&secrets)?);
     if let Some(transform) = oauth_token_transform(&secrets)? {
         fragment.transforms.push(transform);
     }
@@ -781,6 +829,74 @@ fn gcp_auth_transforms(secrets: &[ToolSecret]) -> Result<Vec<Transform>, ToolDis
         config.insert("rules".to_owned(), yaml_value(host_rules(hosts)?)?);
         transforms.push(Transform {
             name: "gcp_auth".to_owned(),
+            config: TransformConfig {
+                extra: config,
+                ..Default::default()
+            },
+            ..Default::default()
+        });
+    }
+    Ok(transforms)
+}
+
+fn aws_auth_transforms(secrets: &[ToolSecret]) -> Result<Vec<Transform>, ToolDiscoveryError> {
+    // Group by credential identity (the placeholder refs) and union the host
+    // rules + region/service scoping across tools that share the same keys, so
+    // iron-control derives one stable `aws_auth` secret per credential (keyed on
+    // the access-key placeholder) instead of colliding foreign_ids. Mirrors the
+    // dedup `gcp_auth_transforms` does by secret_ref.
+    type AwsCredKey = (String, String, Option<String>);
+    let mut by_cred =
+        BTreeMap::<AwsCredKey, (BTreeSet<String>, BTreeSet<String>, BTreeSet<String>)>::new();
+    for secret in secrets {
+        let ToolSecret::AwsAuth(secret) = secret else {
+            continue;
+        };
+        let entry = by_cred
+            .entry((
+                secret.access_key_id_ref.clone(),
+                secret.secret_access_key_ref.clone(),
+                secret.session_token_ref.clone(),
+            ))
+            .or_default();
+        entry.0.extend(secret.hosts.iter().cloned());
+        entry.1.extend(secret.allowed_regions.iter().cloned());
+        entry.2.extend(secret.allowed_services.iter().cloned());
+    }
+    let mut transforms = Vec::new();
+    for ((access_key_id_ref, secret_access_key_ref, session_token_ref), (hosts, regions, services)) in
+        by_cred
+    {
+        let mut config = BTreeMap::new();
+        config.insert(
+            "access_key_id".to_owned(),
+            yaml_map([("placeholder", yaml_string(&access_key_id_ref))])?,
+        );
+        config.insert(
+            "secret_access_key".to_owned(),
+            yaml_map([("placeholder", yaml_string(&secret_access_key_ref))])?,
+        );
+        if let Some(session_token_ref) = &session_token_ref {
+            config.insert(
+                "session_token".to_owned(),
+                yaml_map([("placeholder", yaml_string(session_token_ref))])?,
+            );
+        }
+        if !regions.is_empty() {
+            config.insert(
+                "allowed_regions".to_owned(),
+                yaml_value(regions.into_iter().collect::<Vec<_>>())?,
+            );
+        }
+        if !services.is_empty() {
+            config.insert(
+                "allowed_services".to_owned(),
+                yaml_value(services.into_iter().collect::<Vec<_>>())?,
+            );
+        }
+        config.insert("rules".to_owned(), yaml_value(host_rules(hosts)?)?);
+        transforms.push(Transform {
+            name: "aws_auth".to_owned(),
             config: TransformConfig {
                 extra: config,
                 ..Default::default()
@@ -1086,6 +1202,73 @@ secrets = [
         assert_eq!(
             discovered.fragment.transforms[1].name,
             "oauth_token".to_owned()
+        );
+
+        let _ = fs::remove_dir_all(temp);
+    }
+
+    #[test]
+    fn discovers_aws_auth_tool_as_transform() {
+        let temp = temp_dir("api-rs-tools-aws");
+        let base = temp.join("base");
+        // Mirrors tools/infra/cloudwatch/pyproject.toml.
+        write_tool(
+            &base.join("infra").join("cloudwatch"),
+            r#"
+[project]
+description = "cloudwatch"
+
+[tool.centaur]
+hosts = ["logs.*.amazonaws.com", "monitoring.*.amazonaws.com"]
+secrets = [
+  { type = "aws_auth", name = "cloudwatch", access_key_id = "AWS_ACCESS_KEY_ID", secret_access_key = "AWS_SECRET_ACCESS_KEY", hosts = ["logs.*.amazonaws.com", "monitoring.*.amazonaws.com"], allowed_services = ["logs", "monitoring"] },
+]
+"#,
+        );
+
+        let discovered = discover_tool_proxy_fragment(&[base.clone()]).unwrap();
+
+        // The tool is kept (not dropped) and contributes exactly one aws_auth
+        // transform in the shape iron-control's translator consumes.
+        assert_eq!(discovered.tool_count, 1);
+        assert_eq!(discovered.secret_count, 1);
+        let transform = discovered
+            .fragment
+            .transforms
+            .iter()
+            .find(|transform| transform.name == "aws_auth")
+            .expect("aws_auth transform present");
+        let config = &transform.config.extra;
+        assert_eq!(
+            config["access_key_id"]["placeholder"].as_str(),
+            Some("AWS_ACCESS_KEY_ID")
+        );
+        assert_eq!(
+            config["secret_access_key"]["placeholder"].as_str(),
+            Some("AWS_SECRET_ACCESS_KEY")
+        );
+        assert!(!config.contains_key("session_token"));
+        assert!(!config.contains_key("allowed_regions"));
+        assert_eq!(
+            config["allowed_services"]
+                .as_sequence()
+                .unwrap()
+                .iter()
+                .filter_map(YamlValue::as_str)
+                .collect::<Vec<_>>(),
+            vec!["logs", "monitoring"]
+        );
+        assert_eq!(config["rules"].as_sequence().unwrap().len(), 2);
+
+        // The sandbox AWS SDK gets seeded placeholder credentials to sign with.
+        let placeholders = centaur_iron_proxy::placeholder_env(&[discovered.fragment.clone()]);
+        assert_eq!(
+            placeholders.get("AWS_ACCESS_KEY_ID").map(String::as_str),
+            Some("AWS_ACCESS_KEY_ID")
+        );
+        assert_eq!(
+            placeholders.get("AWS_SECRET_ACCESS_KEY").map(String::as_str),
+            Some("AWS_SECRET_ACCESS_KEY")
         );
 
         let _ = fs::remove_dir_all(temp);
