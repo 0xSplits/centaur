@@ -775,11 +775,11 @@ async function renderExecutionStream(
   }
 
   // Append-only narration: an instant 👀 reaction on the triggering message,
-  // then the answer streamed into a message created on first answer text. The
-  // full reasoning trace (thoughts plus tool calls) accumulates silently and
-  // posts once on settle as a reasoning.txt attachment, then the 👀 flips to
-  // ✅/❌. No bot message is ever edited or deleted, so messages keep their
-  // place in the timeline even when users chime in mid-run.
+  // then the agent's reasoning blurbs posted as their own subtext (-#)
+  // messages as each thought completes, then the answer streamed into a separate message
+  // created on first answer text. On settle the 👀 flips to ✅/❌. No bot
+  // message is ever edited or deleted, so messages keep their place in the
+  // timeline even when users chime in mid-run.
   const narrator = DiscordNarrator.start(thread, message, options, { logger });
   const stopTyping = startTypingKeepalive(thread, logger);
   try {
@@ -797,9 +797,9 @@ async function renderExecutionStream(
 
 /**
  * Consumes the renderer's chunk stream, routing task updates to the narrator
- * (the reasoning-trace attachment) and answer text to a separate streamed
- * message. The answer post is created lazily on the first visible answer
- * chunk; the chat SDK's post+edit fallback then streams the rest into it.
+ * (reasoning blurbs) and answer text to a separate streamed message. The answer
+ * post is created lazily on the first visible answer chunk; the chat SDK's
+ * post+edit fallback then streams the rest into it.
  */
 async function renderSplitExecutionStreams(
   thread: Thread,

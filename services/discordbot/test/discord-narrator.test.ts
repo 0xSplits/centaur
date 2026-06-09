@@ -24,14 +24,12 @@ function task(input: {
   title: string;
   status?: "pending" | "in_progress" | "complete" | "error";
   details?: string;
-  output?: string;
 }): {
   type: "task_update";
   id: string;
   title: string;
   status: "pending" | "in_progress" | "complete" | "error";
   details?: string;
-  output?: string;
 } {
   return {
     type: "task_update",
@@ -39,7 +37,6 @@ function task(input: {
     title: input.title,
     status: input.status ?? "in_progress",
     ...(input.details ? { details: input.details } : {}),
-    ...(input.output ? { output: input.output } : {}),
   };
 }
 
@@ -65,16 +62,11 @@ function apiMessage(
   };
 }
 
-type CapturedPost = {
-  markdown: string;
-  files: Array<{ filename: string; mimeType?: string; text: string }>;
-};
-
 type Harness = {
   thread: Thread;
   message: DiscordbotApiMessage;
   botOptions: DiscordbotOptions;
-  posts: CapturedPost[];
+  posts: string[];
   reactions: Array<{ method: string; url: string }>;
 };
 
@@ -84,28 +76,17 @@ function harness(input?: {
   failPosts?: boolean;
   failReactions?: boolean;
 }): Harness {
-  const posts: CapturedPost[] = [];
+  const posts: string[] = [];
   const reactions: Array<{ method: string; url: string }> = [];
   const threadKey = input?.threadKey ?? "discord:G1:C1:T9";
   const adapter = {
     postMessage: async (_threadId: string, message: unknown) => {
       if (input?.failPosts) throw new Error("post failed");
-      const postable = message as {
-        markdown?: string;
-        files?: Array<{
-          data: Buffer;
-          filename: string;
-          mimeType?: string;
-        }>;
-      };
-      posts.push({
-        markdown: postable.markdown ?? "",
-        files: (postable.files ?? []).map((file) => ({
-          filename: file.filename,
-          mimeType: file.mimeType,
-          text: file.data.toString("utf8"),
-        })),
-      });
+      posts.push(
+        typeof message === "string"
+          ? message
+          : String((message as { raw?: string }).raw ?? ""),
+      );
       return { id: `m${posts.length}`, raw: {}, threadId: threadKey };
     },
   };
@@ -130,16 +111,15 @@ function harness(input?: {
   };
 }
 
-function startNarrator(h: Harness): DiscordNarrator {
+function startNarrator(
+  h: Harness,
+  options?: { minPostGapMs?: number; maxPosts?: number },
+): DiscordNarrator {
   return DiscordNarrator.start(h.thread, h.message, h.botOptions, {
     logger: silentLogger,
+    minPostGapMs: options?.minPostGapMs ?? 1,
+    maxPosts: options?.maxPosts,
   });
-}
-
-function traceOf(h: Harness): string {
-  expect(h.posts).toHaveLength(1);
-  expect(h.posts[0]?.files).toHaveLength(1);
-  return h.posts[0]?.files[0]?.text ?? "";
 }
 
 describe("DiscordNarrator reactions", () => {
@@ -208,33 +188,8 @@ describe("DiscordNarrator reactions", () => {
   });
 });
 
-describe("DiscordNarrator reasoning trace", () => {
-  it("posts nothing mid-run and attaches the trace as reasoning.txt on finish", async () => {
-    const h = harness();
-    const narrator = startNarrator(h);
-    narrator.update(
-      task({
-        id: "reasoning-1",
-        title: "Thinking",
-        status: "complete",
-        details: "Comparing the deploy manifests against the defaults",
-      }),
-    );
-    expect(h.posts).toEqual([]);
-    await narrator.finish("done");
-
-    expect(h.posts).toHaveLength(1);
-    expect(h.posts[0]?.markdown).toBe("Full reasoning trace:");
-    expect(h.posts[0]?.files).toEqual([
-      {
-        filename: "reasoning.txt",
-        mimeType: "text/plain",
-        text: "[thinking]\nComparing the deploy manifests against the defaults",
-      },
-    ]);
-  });
-
-  it("coalesces reasoning deltas into one thought", async () => {
+describe("DiscordNarrator blurbs", () => {
+  it("coalesces reasoning deltas and posts one subtext blurb when the thought completes", async () => {
     const h = harness();
     const narrator = startNarrator(h);
     narrator.update(
@@ -250,69 +205,9 @@ describe("DiscordNarrator reasoning trace", () => {
     );
     await narrator.finish("done");
 
-    expect(traceOf(h)).toBe(
-      "[thinking]\nComparing the deploy manifests against the defaults",
-    );
-  });
-
-  it("includes tool calls with details and output, updated in place", async () => {
-    const h = harness();
-    const narrator = startNarrator(h);
-    narrator.update(
-      task({
-        id: "reasoning-1",
-        title: "Thinking",
-        details: "Need to check the recent deploy history first",
-      }),
-    );
-    narrator.update(
-      task({ id: "cmd-1", title: "Command execution (1)", details: "git log" }),
-    );
-    narrator.update(
-      task({
-        id: "cmd-1",
-        title: "Command execution (1)",
-        status: "complete",
-        details: "git log",
-        output: "abc123 fix deploy",
-      }),
-    );
-    narrator.update(
-      task({
-        id: "reasoning-3",
-        title: "Thinking",
-        status: "complete",
-        details: "That commit looks suspicious",
-      }),
-    );
-    await narrator.finish("done");
-
-    expect(traceOf(h)).toBe(
-      [
-        "[thinking]\nNeed to check the recent deploy history first",
-        "[Command execution (1)] (complete)\ngit log\n--- output ---\nabc123 fix deploy",
-        "[thinking]\nThat commit looks suspicious",
-      ].join("\n\n"),
-    );
-  });
-
-  it("includes plan updates", async () => {
-    const h = harness();
-    const narrator = startNarrator(h);
-    narrator.update({ type: "plan_update", title: "Investigate" });
-    narrator.update(
-      task({
-        id: "thinking-1",
-        title: "Thinking",
-        status: "complete",
-        details: "Starting with the logs",
-      }),
-    );
-    await narrator.finish("done");
-
-    expect(traceOf(h)).toBe(
-      "[plan] Investigate\n\n[thinking]\nStarting with the logs",
-    );
+    expect(h.posts).toEqual([
+      "-# Comparing the deploy manifests against the defaults",
+    ]);
   });
 
   it("flushes the pending thought when the model moves on to a command", async () => {
@@ -328,38 +223,119 @@ describe("DiscordNarrator reasoning trace", () => {
     narrator.update(task({ id: "cmd-1", title: "Command execution (1)" }));
     await narrator.finish("done");
 
-    expect(traceOf(h)).toBe(
-      [
-        "[thinking]\nNeed to check the recent deploy history first",
-        "[Command execution (1)] (in_progress)",
-      ].join("\n\n"),
-    );
+    expect(h.posts).toEqual([
+      "-# Need to check the recent deploy history first",
+    ]);
   });
 
-  it("posts the partial trace on a retrying outcome", async () => {
+  it("never renders commands, tools, or plan updates", async () => {
     const h = harness();
     const narrator = startNarrator(h);
+    narrator.update({ type: "plan_update", title: "Investigate" });
     narrator.update(
-      task({
-        id: "reasoning-1",
-        title: "Thinking",
-        details: "A thought interrupted by a retry",
-      }),
+      task({ id: "cmd-1", title: "Command execution (1)", details: "ls" }),
     );
-    await narrator.finish("retrying");
-
-    expect(traceOf(h)).toBe("[thinking]\nA thought interrupted by a retry");
-  });
-
-  it("skips the trace post when nothing was traced", async () => {
-    const h = harness();
-    const narrator = startNarrator(h);
+    narrator.update(task({ id: "tool-1", title: "Web search" }));
     await narrator.finish("done");
 
     expect(h.posts).toEqual([]);
   });
 
-  it("posts the trace before settling reactions", async () => {
+  it("prefixes each line of a multi-line blurb", async () => {
+    const h = harness();
+    const narrator = startNarrator(h);
+    narrator.update(
+      task({
+        id: "thinking-1",
+        title: "Thinking",
+        status: "complete",
+        details: "First line of thought\n\nSecond line of thought",
+      }),
+    );
+    await narrator.finish("done");
+
+    expect(h.posts).toEqual([
+      "-# First line of thought\n\n-# Second line of thought",
+    ]);
+  });
+
+  it("skips fragments too short to be worth a message", async () => {
+    const h = harness();
+    const narrator = startNarrator(h);
+    narrator.update(
+      task({
+        id: "thinking-1",
+        title: "Thinking",
+        status: "complete",
+        details: "Hmm.",
+      }),
+    );
+    await narrator.finish("done");
+
+    expect(h.posts).toEqual([]);
+  });
+
+  it("merges thoughts that complete within the min post gap into one message", async () => {
+    const h = harness();
+    const narrator = startNarrator(h, { minPostGapMs: 50 });
+    narrator.update(
+      task({
+        id: "thinking-1",
+        title: "Thinking",
+        status: "complete",
+        details: "First completed thought here",
+      }),
+    );
+    narrator.update(
+      task({
+        id: "thinking-2",
+        title: "Thinking",
+        status: "complete",
+        details: "Second completed thought here",
+      }),
+    );
+    await new Promise((resolve) => setTimeout(resolve, 80));
+    await narrator.finish("done");
+
+    expect(h.posts).toEqual([
+      "-# First completed thought here\n\n-# Second completed thought here",
+    ]);
+  });
+
+  it("flushes an oversized pending thought early and truncates it", async () => {
+    const h = harness();
+    const narrator = startNarrator(h);
+    narrator.update(
+      task({ id: "reasoning-1", title: "Thinking", details: "x".repeat(700) }),
+    );
+    await narrator.finish("done");
+
+    expect(h.posts).toHaveLength(1);
+    expect(h.posts[0]?.length).toBeLessThanOrEqual(610);
+    expect(h.posts[0]).toStartWith("-# ");
+    expect(h.posts[0]).toEndWith("…");
+  });
+
+  it("stops posting past the max post cap", async () => {
+    const h = harness();
+    const narrator = startNarrator(h, { maxPosts: 2 });
+    for (let index = 0; index < 5; index++) {
+      narrator.update(
+        task({
+          id: `thinking-${index}`,
+          title: "Thinking",
+          status: "complete",
+          details: `Completed thought number ${index}`,
+        }),
+      );
+      await new Promise((resolve) => setTimeout(resolve, 5));
+    }
+    await narrator.finish("done");
+
+    expect(h.posts.length).toBeLessThanOrEqual(2);
+  });
+
+  it("posts the pending thought during finish, before settling reactions", async () => {
     const h = harness();
     const order: string[] = [];
     const originalPost = (h.thread.adapter as { postMessage: unknown })
@@ -371,7 +347,7 @@ describe("DiscordNarrator reasoning trace", () => {
       order.push("post");
       return originalPost(t, m);
     };
-    const narrator = startNarrator(h);
+    const narrator = startNarrator(h, { minPostGapMs: 10_000 });
     narrator.update(
       task({
         id: "reasoning-1",
@@ -381,8 +357,8 @@ describe("DiscordNarrator reasoning trace", () => {
     );
     await narrator.finish("done");
 
-    expect(traceOf(h)).toBe("[thinking]\nA final trailing thought");
-    // ✅ lands after the trace post (reactions chain behind posts).
+    expect(h.posts).toEqual(["-# A final trailing thought"]);
+    // ✅ lands after the trailing blurb (reactions chain behind posts).
     const checkIndex = h.reactions.findIndex((r) => r.url.includes(CHECK));
     expect(checkIndex).toBeGreaterThan(-1);
     expect(order).toEqual(["post"]);
@@ -404,7 +380,7 @@ describe("DiscordNarrator reasoning trace", () => {
     expect(h.posts).toEqual([]);
   });
 
-  it("swallows trace post failures", async () => {
+  it("swallows blurb post failures", async () => {
     const h = harness({ failPosts: true });
     const narrator = startNarrator(h);
     narrator.update(
