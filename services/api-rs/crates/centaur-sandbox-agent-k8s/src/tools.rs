@@ -218,12 +218,16 @@ pub(crate) fn tools_init_container_json(
     // without one we check out the cloned default branch.
     let checkout = match &tools.git_ref {
         Some(git_ref) => format!(
-            "git -C \"$src\" -c gc.auto=0 fetch --quiet origin \"{git_ref}\"\n\
+            "git -C \"$src\" -c gc.auto=0 fetch --quiet origin \"{git_ref}\" && \
              git -C \"$src\" checkout --quiet --detach FETCH_HEAD"
         ),
         None => "git -C \"$src\" checkout --quiet".to_owned(),
     };
 
+    // The per-sandbox proxy is created in the same reconcile as the Sandbox and
+    // may not be accepting connections when this init container first runs — and
+    // an init failure is terminal for the Sandbox (no kubelet retry), so the
+    // clone must retry through the connection-refused window rather than die.
     // repo/ref/subdir are operator config, but quote them anyway so a stray
     // space or metacharacter breaks loudly in git instead of in the shell.
     let script = format!(
@@ -232,10 +236,16 @@ pub(crate) fn tools_init_container_json(
          {askpass}\
          export GIT_TERMINAL_PROMPT=0\n\
          git config --global --add safe.directory '*'\n\
-         src=\"$(mktemp -d)\"\n\
-         git clone --quiet --filter=blob:none --no-checkout \"{repo_url}\" \"$src\"\n\
-         git -C \"$src\" sparse-checkout set \"{subdir}\"\n\
-         {checkout}\n\
+         attempt=0\n\
+         until src=\"$(mktemp -d)\" && \
+         git clone --quiet --filter=blob:none --no-checkout \"{repo_url}\" \"$src\" && \
+         git -C \"$src\" sparse-checkout set \"{subdir}\" && \
+         {checkout}; do\n\
+         attempt=$((attempt + 1))\n\
+         if [ \"$attempt\" -ge 30 ]; then echo \"tools clone failed after $attempt attempts\" >&2; exit 1; fi\n\
+         rm -rf \"$src\"\n\
+         sleep 2\n\
+         done\n\
          target=\"{TOOLS_BOOTSTRAP_DIR}\"\n\
          mkdir -p \"$target\"\n\
          cp -R \"$src/{subdir}/.\" \"$target\"/"
@@ -412,6 +422,25 @@ mod tests {
     }
 
     #[test]
+    fn tools_init_retries_clone_until_proxy_accepts() {
+        // The per-sandbox proxy may not be listening when the init container
+        // first runs, and an init failure is terminal for the Sandbox — the
+        // clone (and the ref fetch/checkout chained into the same condition)
+        // must sit in a bounded retry loop, with the copy AFTER the loop.
+        let mut tools = ToolsConfig::new("paradigmxyz/centaur", "centaur-agent:test");
+        tools.git_ref = Some("main".to_owned());
+        let script = tools_init_container_json(&tools, None)["command"][2]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        assert!(script.contains("until src=\"$(mktemp -d)\""));
+        assert!(script.contains("checkout --quiet --detach FETCH_HEAD; do"));
+        assert!(script.contains("if [ \"$attempt\" -ge 30 ]"));
+        assert!(script.contains("sleep 2"));
+        assert!(script.find("done").unwrap() < script.find("cp -R").unwrap());
+    }
+
+    #[test]
     fn tools_init_with_proxy_exports_proxy_env_and_mounts_ca() {
         let tools = ToolsConfig::new("paradigmxyz/centaur", "centaur-agent:test");
         let proxy = CloneProxy {
@@ -448,7 +477,7 @@ mod tests {
             .unwrap()
             .to_owned();
         // Default branch: plain checkout, no explicit ref fetch.
-        assert!(script.contains("git -C \"$src\" checkout --quiet\n"));
+        assert!(script.contains("git -C \"$src\" checkout --quiet; do"));
         assert!(!script.contains("fetch --quiet origin"));
     }
 
