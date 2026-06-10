@@ -235,6 +235,35 @@ spec:
                   name: {{ include "centaur.secretEnvName" . }}
                   key: {{ printf "%sIRON_CONTROL_INITIAL_API_KEY" .Values.secretManager.envPrefix }}
 {{- end }}
+{{- if .Values.toolServer.enabled }}
+{{- if not .Values.toolServer.repo }}
+{{- fail "toolServer.repo (owner/name) must be set when toolServer.enabled=true" }}
+{{- end }}
+            # Base tools are git-cloned into each sandbox at boot by a
+            # tools-bootstrap init container (the repo-cache architecture, without
+            # the shared node cache), so adding a tool is a push to the repo, not
+            # an api-rs image rebuild. api-rs still discovers its own /app/tools to
+            # grant proxy creds, so pin toolServer.ref to the tool set that image
+            # carries to avoid drift between granted creds and installed tools.
+            - name: KUBERNETES_TOOLS_REPO
+              value: {{ .Values.toolServer.repo | quote }}
+{{- if .Values.toolServer.ref }}
+            - name: KUBERNETES_TOOLS_REF
+              value: {{ .Values.toolServer.ref | quote }}
+{{- end }}
+            - name: KUBERNETES_TOOLS_SUBDIR
+              value: {{ .Values.toolServer.subdir | quote }}
+            - name: KUBERNETES_TOOLS_RUNNER_IMAGE
+              value: {{ printf "%s:%s" (default .Values.sandbox.image.repository .Values.toolServer.runnerImage.repository) (default .Values.sandbox.image.tag .Values.toolServer.runnerImage.tag) | quote }}
+            - name: KUBERNETES_TOOLS_RUNNER_IMAGE_PULL_POLICY
+              value: {{ default .Values.sandbox.image.pullPolicy .Values.toolServer.runnerImage.pullPolicy | quote }}
+{{- if .Values.toolServer.githubToken.existingSecretName }}
+            - name: KUBERNETES_TOOLS_GITHUB_TOKEN_SECRET
+              value: {{ .Values.toolServer.githubToken.existingSecretName | quote }}
+            - name: KUBERNETES_TOOLS_GITHUB_TOKEN_SECRET_KEY
+              value: {{ .Values.toolServer.githubToken.secretKey | quote }}
+{{- end }}
+{{- end }}
 {{- range $name, $value := .Values.apiRs.extraEnv }}
             - name: {{ $name }}
               value: {{ $value | quote }}

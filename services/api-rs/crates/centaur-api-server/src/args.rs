@@ -15,7 +15,8 @@ use centaur_iron_proxy::{
     ProxyFragment, SourceKind, SourcePolicy, harness_auth_fragment, infra_fragment,
 };
 use centaur_sandbox_agent_k8s::{
-    AgentSandboxBackend, AgentSandboxConfig, IronControlSettings, IronProxyConfig,
+    AgentSandboxBackend, AgentSandboxConfig, GitHubTokenRef, IronControlSettings, IronProxyConfig,
+    ToolsConfig,
 };
 use centaur_sandbox_core::{Mount, MountKind, OverlayImage, SandboxSpec};
 use centaur_sandbox_local::LocalSandboxBackend;
@@ -223,6 +224,8 @@ struct SandboxArgs {
     workflow_host_image: Option<String>,
     #[arg(long = "workflow-host-command", env = "WORKFLOW_HOST_COMMAND")]
     workflow_host_command: Option<String>,
+    #[command(flatten)]
+    tools_source: ToolsArgs,
 }
 
 impl SandboxArgs {
@@ -385,7 +388,7 @@ impl SandboxArgs {
                     .read_only(),
                 );
             }
-            if let Some(overlay) = workflow_overlay_image_from_env() {
+            if let Some(overlay) = overlay_image_from_env() {
                 spec = spec.overlay_image(overlay);
             }
         }
@@ -668,6 +671,11 @@ impl TryFrom<&SandboxArgs> for AgentSandboxConfig {
             proxy.fragments = fragments;
         }
         config.iron_control = args.iron_control.settings();
+        config.tools = args.tools_source.to_config();
+        // The same org overlay (and the same CENTAUR_OVERLAY_* env the chart
+        // already sets) serves every sandbox; workflow hosts set it spec-level
+        // via `workflow_host_spec`, which then takes precedence in the backend.
+        config.overlay = overlay_image_from_env();
         // iron-control is the only proxy mode: a per-sandbox proxy syncs its
         // secrets from the control plane, so configuring iron-proxy without
         // iron-control would produce a non-functional proxy. Fail fast.
@@ -678,6 +686,82 @@ impl TryFrom<&SandboxArgs> for AgentSandboxConfig {
             ));
         }
         Ok(config)
+    }
+}
+
+#[derive(Debug, ClapArgs)]
+struct ToolsArgs {
+    // Tools are git-cloned into each sandbox at boot by a `tools-bootstrap` init
+    // container (repo-cache-style) rather than baked into an image, so adding a
+    // tool needs no image rebuild. Explicit `id`s avoid clap arg-id collisions
+    // with sibling flattened structs.
+    #[arg(
+        id = "tools_source_repo",
+        long = "kubernetes-tools-repo",
+        env = "KUBERNETES_TOOLS_REPO"
+    )]
+    repo: Option<String>,
+    #[arg(
+        id = "tools_source_ref",
+        long = "kubernetes-tools-ref",
+        env = "KUBERNETES_TOOLS_REF"
+    )]
+    git_ref: Option<String>,
+    #[arg(
+        id = "tools_source_subdir",
+        long = "kubernetes-tools-subdir",
+        env = "KUBERNETES_TOOLS_SUBDIR",
+        default_value = "tools"
+    )]
+    source_subdir: String,
+    // Git-capable image the clone init container runs (the sandbox image carries git).
+    #[arg(
+        id = "tools_runner_image",
+        long = "kubernetes-tools-runner-image",
+        env = "KUBERNETES_TOOLS_RUNNER_IMAGE"
+    )]
+    image: Option<String>,
+    #[arg(
+        id = "tools_runner_image_pull_policy",
+        long = "kubernetes-tools-runner-image-pull-policy",
+        env = "KUBERNETES_TOOLS_RUNNER_IMAGE_PULL_POLICY"
+    )]
+    image_pull_policy: Option<String>,
+    // Secret + key holding a GitHub token for private-repo clones (optional).
+    #[arg(
+        id = "tools_github_token_secret",
+        long = "kubernetes-tools-github-token-secret",
+        env = "KUBERNETES_TOOLS_GITHUB_TOKEN_SECRET"
+    )]
+    github_token_secret: Option<String>,
+    #[arg(
+        id = "tools_github_token_secret_key",
+        long = "kubernetes-tools-github-token-secret-key",
+        env = "KUBERNETES_TOOLS_GITHUB_TOKEN_SECRET_KEY",
+        default_value = "token"
+    )]
+    github_token_secret_key: String,
+}
+
+impl ToolsArgs {
+    /// `None` when no repo or runner image is configured (tools disabled).
+    fn to_config(&self) -> Option<ToolsConfig> {
+        let repo = clean_optional_value(self.repo.as_deref())?;
+        let image = clean_optional_value(self.image.as_deref())?;
+        let mut config = ToolsConfig::new(repo, image);
+        config.image_pull_policy = self.image_pull_policy.clone();
+        config.git_ref = clean_optional_value(self.git_ref.as_deref());
+        if let Some(subdir) = clean_optional_value(Some(self.source_subdir.as_str())) {
+            config.source_subdir = subdir;
+        }
+        if let Some(secret_name) = clean_optional_value(self.github_token_secret.as_deref()) {
+            config.github_token = Some(GitHubTokenRef {
+                secret_name,
+                secret_key: clean_optional_value(Some(self.github_token_secret_key.as_str()))
+                    .unwrap_or_else(|| "token".to_owned()),
+            });
+        }
+        Some(config)
     }
 }
 
@@ -986,7 +1070,10 @@ fn default_workflow_host_path() -> String {
         .to_string()
 }
 
-fn workflow_overlay_image_from_env() -> Option<OverlayImage> {
+/// The org overlay image, from the `CENTAUR_OVERLAY_*` env the chart sets.
+/// Shared by workflow-host specs and the agent-sandbox backend default — every
+/// sandbox mounts the same overlay tree at the same path.
+fn overlay_image_from_env() -> Option<OverlayImage> {
     let image = env::var("CENTAUR_OVERLAY_IMAGE").ok()?;
     let source_path =
         env::var("CENTAUR_OVERLAY_IMAGE_SOURCE_PATH").unwrap_or_else(|_| "/overlay".to_owned());
@@ -1062,6 +1149,16 @@ fn parse_label_selector_arg(value: &str) -> Result<BTreeMap<String, String>, Str
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // Process env is global: tests that set CENTAUR_OVERLAY_* via EnvGuard must
+    // not interleave, or one test observes another's values.
+    static ENV_MUTEX: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    fn env_lock() -> std::sync::MutexGuard<'static, ()> {
+        ENV_MUTEX
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
 
     struct EnvGuard {
         name: &'static str,
@@ -1171,7 +1268,46 @@ mod tests {
     }
 
     #[test]
+    fn tools_and_overlay_config_read_from_flags() {
+        // The overlay rides the same CENTAUR_OVERLAY_* env the workflow host
+        // reads — one overlay convention for every sandbox.
+        let _env_lock = env_lock();
+        let _overlay_image = EnvGuard::set("CENTAUR_OVERLAY_IMAGE", "centaur-overlay:test");
+        let args = Args::try_parse_from([
+            "centaur-api-server",
+            "--database-url",
+            "postgres://postgres:postgres@localhost/centaur",
+            "--session-sandbox-backend",
+            "agent-k8s",
+            "--kubernetes-sandbox-iron-proxy-mode",
+            "disabled",
+            "--kubernetes-tools-repo",
+            "paradigmxyz/centaur",
+            "--kubernetes-tools-ref",
+            "main",
+            "--kubernetes-tools-runner-image",
+            "centaur-agent:test",
+            "--kubernetes-tools-github-token-secret",
+            "centaur-repo-cache-github-token",
+        ])
+        .unwrap();
+        let config = AgentSandboxConfig::try_from(&args.sandbox).unwrap();
+        let tools = config.tools.expect("tools should be Some");
+        assert_eq!(tools.repo, "paradigmxyz/centaur");
+        assert_eq!(tools.git_ref.as_deref(), Some("main"));
+        assert_eq!(tools.source_subdir, "tools");
+        assert_eq!(tools.image, "centaur-agent:test");
+        let token = tools.github_token.expect("token should be Some");
+        assert_eq!(token.secret_name, "centaur-repo-cache-github-token");
+        assert_eq!(token.secret_key, "token");
+        let overlay = config.overlay.expect("overlay should be Some");
+        assert_eq!(overlay.image, "centaur-overlay:test");
+        assert_eq!(overlay.mount_path, "/opt/centaur/overlay");
+    }
+
+    #[test]
     fn agent_k8s_workflow_host_mounts_overlay_workflows() {
+        let _env_lock = env_lock();
         let _overlay_image = EnvGuard::set("CENTAUR_OVERLAY_IMAGE", "ghcr.io/example/overlay:test");
         let _overlay_pull_policy = EnvGuard::set("CENTAUR_OVERLAY_IMAGE_PULL_POLICY", "Always");
         let _overlay_source_path = EnvGuard::set("CENTAUR_OVERLAY_IMAGE_SOURCE_PATH", "/overlay");

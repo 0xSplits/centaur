@@ -12,8 +12,8 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use async_trait::async_trait;
 use centaur_iron_control::IronControlClient;
 use centaur_sandbox_core::{
-    MountKind, ObservedSandbox, SandboxBackend, SandboxError, SandboxHandle, SandboxId, SandboxIo,
-    SandboxResult, SandboxSpec, SandboxStatus,
+    MountKind, ObservedSandbox, OverlayImage, SandboxBackend, SandboxError, SandboxHandle,
+    SandboxId, SandboxIo, SandboxResult, SandboxSpec, SandboxStatus,
 };
 use k8s_openapi::api::core::v1::{PersistentVolumeClaim, Pod};
 use kube::api::{AttachParams, DeleteParams, ListParams, Patch, PatchParams, PostParams};
@@ -25,9 +25,11 @@ use tokio::time::{Instant, sleep};
 
 pub use generated::agents_x_k8s_io as crd;
 pub use iron_proxy::IronProxyConfig;
+pub use tools::{GitHubTokenRef, ToolsConfig};
 
 pub mod generated;
 mod iron_proxy;
+mod tools;
 
 const BACKEND_NAME: &str = "agent-sandbox-k8s";
 const DEFAULT_CONTAINER_NAME: &str = "agent";
@@ -53,6 +55,15 @@ pub struct AgentSandboxConfig {
     pub state_volume: Option<StateVolumeConfig>,
     pub iron_proxy: Option<IronProxyConfig>,
     pub iron_control: Option<IronControlSettings>,
+    /// When set, every sandbox gets a `tools-bootstrap` init container that
+    /// git-clones the tools repo into the agent's `/app/tools`, and `TOOL_DIRS`
+    /// is set so the agent's shim installer finds them.
+    pub tools: Option<ToolsConfig>,
+    /// When set, the org overlay tree (tools, workflows, skills, system-prompt
+    /// overlay) is mounted into every sandbox this backend creates, via the same
+    /// spec-level [`OverlayImage`] plumbing workflow-host sandboxes use. A
+    /// spec-level overlay takes precedence over this default.
+    pub overlay: Option<OverlayImage>,
     pub ready_timeout: Duration,
 }
 
@@ -83,6 +94,8 @@ impl AgentSandboxConfig {
             state_volume: None,
             iron_proxy: None,
             iron_control: None,
+            tools: None,
+            overlay: None,
             ready_timeout: Duration::from_secs(60),
         }
     }
@@ -99,6 +112,16 @@ impl AgentSandboxConfig {
 
     pub fn iron_control(mut self, iron_control: IronControlSettings) -> Self {
         self.iron_control = Some(iron_control);
+        self
+    }
+
+    pub fn tools(mut self, tools: ToolsConfig) -> Self {
+        self.tools = Some(tools);
+        self
+    }
+
+    pub fn overlay(mut self, overlay: OverlayImage) -> Self {
+        self.overlay = Some(overlay);
         self
     }
 }
@@ -453,13 +476,31 @@ fn build_agent_sandbox(
         "args",
         (!spec.args.is_empty()).then(|| spec.args.clone()),
     );
+    // One overlay per sandbox: a spec-level overlay (workflow hosts) wins over
+    // the backend-wide default, so the two never stack into duplicate
+    // `overlay-bootstrap`/`overlay-root` names.
+    let overlay = spec.overlay.as_ref().or(config.overlay.as_ref());
+
+    // Agent container env: spec env + tools/overlay wiring (deduped). `TOOL_DIRS`
+    // is set deterministically here (not via passthrough) so it always matches
+    // the paths the bootstrap init containers actually populate in this pod.
+    let mut agent_env: Vec<(String, String)> = spec
+        .env
+        .iter()
+        .map(|env| (env.name.clone(), env.value.clone()))
+        .collect();
+    if config.tools.is_some() || overlay.is_some() {
+        for (name, value) in tools::agent_env(overlay) {
+            upsert_env(&mut agent_env, &name, value);
+        }
+    }
     insert_optional(
         &mut container,
         "env",
-        (!spec.env.is_empty()).then(|| {
-            spec.env
+        (!agent_env.is_empty()).then(|| {
+            agent_env
                 .iter()
-                .map(|env| json!({ "name": env.name, "value": env.value }))
+                .map(|(name, value)| json!({ "name": name, "value": value }))
                 .collect::<Vec<_>>()
         }),
     );
@@ -467,7 +508,7 @@ fn build_agent_sandbox(
     insert_optional(&mut container, "resources", resources_json(spec));
 
     let (mut volumes, mut volume_mounts) = mount_json(spec);
-    let init_containers = overlay_json(spec, &mut volumes, &mut volume_mounts);
+    let mut init_containers = overlay_json(overlay, &mut volumes, &mut volume_mounts);
     if let Some(state_volume) = &config.state_volume {
         volume_mounts.push(json!({
             "name": "state",
@@ -478,11 +519,40 @@ fn build_agent_sandbox(
         volume_mounts.push(iron_proxy::sandbox_ca_volume_mount_json());
         volumes.push(iron_proxy::sandbox_ca_volume_json(iron_proxy));
     }
+    // Tool sources are bootstrapped into an emptyDir by an init container and
+    // mounted read-only into the agent at the same path `TOOL_DIRS` points at.
+    if config.tools.is_some() {
+        volume_mounts.extend(tools::agent_volume_mounts_json(config.tools.is_some()));
+        volumes.extend(tools::volumes_json(config.tools.as_ref()));
+    }
     insert_optional(
         &mut container,
         "volumeMounts",
         (!volume_mounts.is_empty()).then_some(volume_mounts),
     );
+
+    // tools-bootstrap git-clones the tools repo into /app/tools (the overlay's
+    // own overlay-bootstrap init container came from `overlay_json` above).
+    if let Some(tools) = &config.tools {
+        // The sandbox NetworkPolicy only allows egress to the per-sandbox proxy
+        // (plus api-rs and DNS), so when iron-proxy is on the clone must ride it.
+        // `apply_proxy_env` ran before this builder, so the resolved proxy URL is
+        // on the spec env; absent (proxy disabled/unresolved) the clone goes direct.
+        let clone_proxy = config.iron_proxy.as_ref().and_then(|_| {
+            spec.env
+                .iter()
+                .find(|env| env.name == "HTTPS_PROXY")
+                .map(|env| tools::CloneProxy {
+                    https_proxy: env.value.clone(),
+                    ca_cert_path: iron_proxy::FIREWALL_CA_CERT_PATH.to_owned(),
+                    ca_volume_mount: iron_proxy::sandbox_ca_volume_mount_json(),
+                })
+        });
+        init_containers.push(tools::tools_init_container_json(
+            tools,
+            clone_proxy.as_ref(),
+        ));
+    }
 
     let mut pod_spec = json!({
         "containers": [container],
@@ -490,15 +560,18 @@ fn build_agent_sandbox(
         "automountServiceAccountToken": false,
         "enableServiceLinks": false,
     });
-    insert_optional(
-        &mut pod_spec,
-        "volumes",
-        (!volumes.is_empty()).then(|| std::mem::take(&mut volumes)),
-    );
+    if config.tools.is_some() || overlay.is_some() {
+        pod_spec["securityContext"] = tools::pod_security_context_json();
+    }
     insert_optional(
         &mut pod_spec,
         "initContainers",
         (!init_containers.is_empty()).then_some(init_containers),
+    );
+    insert_optional(
+        &mut pod_spec,
+        "volumes",
+        (!volumes.is_empty()).then(|| std::mem::take(&mut volumes)),
     );
     insert_optional(
         &mut pod_spec,
@@ -546,12 +619,25 @@ fn build_agent_sandbox(
     Ok(sandbox)
 }
 
+// The overlay's `SYSTEM_PROMPT.md` is staged by the init container into a tiny
+// shared volume and surfaced to the agent at `$HOME/AGENTS_OVERLAY.md`, which
+// the sandbox entrypoint appends to the base prompt.
+const OVERLAY_PROMPT_VOLUME: &str = "overlay-prompt";
+const OVERLAY_PROMPT_DIR: &str = "/overlay-prompt";
+const OVERLAY_PROMPT_FILE: &str = "AGENTS_OVERLAY.md";
+const AGENT_OVERLAY_PROMPT_PATH: &str = "/home/agent/AGENTS_OVERLAY.md";
+const OVERLAY_SYSTEM_PROMPT_REL: &str = "services/sandbox/SYSTEM_PROMPT.md";
+
+/// The shared overlay plumbing: an `overlay-bootstrap` init container copies the
+/// overlay image's tree into the `overlay-root` emptyDir mounted read-only into
+/// the main container at `mount_path`, and stages the overlay's
+/// `SYSTEM_PROMPT.md` as `$HOME/AGENTS_OVERLAY.md`.
 fn overlay_json(
-    spec: &SandboxSpec,
+    overlay: Option<&OverlayImage>,
     volumes: &mut Vec<Value>,
     volume_mounts: &mut Vec<Value>,
 ) -> Vec<Value> {
-    let Some(overlay) = &spec.overlay else {
+    let Some(overlay) = overlay else {
         return Vec::new();
     };
 
@@ -561,9 +647,19 @@ fn overlay_json(
         "name": volume_name,
         "emptyDir": {},
     }));
+    volumes.push(json!({
+        "name": OVERLAY_PROMPT_VOLUME,
+        "emptyDir": {},
+    }));
     volume_mounts.push(json!({
         "name": volume_name,
         "mountPath": overlay.mount_path,
+        "readOnly": true,
+    }));
+    volume_mounts.push(json!({
+        "name": OVERLAY_PROMPT_VOLUME,
+        "mountPath": AGENT_OVERLAY_PROMPT_PATH,
+        "subPath": OVERLAY_PROMPT_FILE,
         "readOnly": true,
     }));
 
@@ -572,14 +668,24 @@ fn overlay_json(
         "image": overlay.image,
         "command": ["/bin/sh", "-ec"],
         "args": [format!(
-            "src={}; target={}; mkdir -p \"$target\"; cp -R \"$src\"/. \"$target\"/",
+            "src={}; target={}; mkdir -p \"$target\"; cp -R \"$src\"/. \"$target\"/; \
+             if [ -f \"$target/{OVERLAY_SYSTEM_PROMPT_REL}\" ]; then \
+             cp \"$target/{OVERLAY_SYSTEM_PROMPT_REL}\" '{OVERLAY_PROMPT_DIR}/{OVERLAY_PROMPT_FILE}'; \
+             else : > '{OVERLAY_PROMPT_DIR}/{OVERLAY_PROMPT_FILE}'; fi",
             shell_quote(&overlay.source_path),
             shell_quote(init_mount_path),
         )],
-        "volumeMounts": [{
-            "name": volume_name,
-            "mountPath": init_mount_path,
-        }],
+        "volumeMounts": [
+            {
+                "name": volume_name,
+                "mountPath": init_mount_path,
+            },
+            {
+                "name": OVERLAY_PROMPT_VOLUME,
+                "mountPath": OVERLAY_PROMPT_DIR,
+            },
+        ],
+        "securityContext": tools::security_context_json(),
     });
     insert_optional(
         &mut init_container,
@@ -670,6 +776,16 @@ where
 {
     if let Some(value) = value {
         target[key] = json!(value);
+    }
+}
+
+/// Override-or-append an env entry, so the agent container never emits a
+/// duplicate env name when we layer tools/overlay wiring over `spec.env`.
+fn upsert_env(env: &mut Vec<(String, String)>, name: &str, value: String) {
+    if let Some(entry) = env.iter_mut().find(|(existing, _)| existing == name) {
+        entry.1 = value;
+    } else {
+        env.push((name.to_owned(), value));
     }
 }
 
@@ -796,6 +912,152 @@ mod tests {
             .expect("main container overlay mount");
         assert_eq!(overlay_mount.mount_path, "/opt/centaur/overlay");
         assert_eq!(overlay_mount.read_only, Some(true));
+    }
+
+    #[test]
+    fn builds_agent_sandbox_spec_with_overlay_without_tools() {
+        let spec = SandboxSpec::new("centaur-agent:latest");
+        let config = AgentSandboxConfig::new("centaur").overlay(OverlayImage::new(
+            "overlay:test",
+            "/overlay",
+            "/opt/centaur/overlay",
+        ));
+
+        let sandbox = build_agent_sandbox(&SandboxId::new("asbx-test"), &spec, &config).unwrap();
+        let pod_spec = &sandbox.spec.pod_template.spec;
+        let container = &pod_spec.containers[0];
+
+        let env = container.env.as_ref().unwrap();
+        assert!(env.iter().any(|env| {
+            env.name == "TOOL_DIRS"
+                && env.value.as_deref() == Some("/app/tools:/opt/centaur/overlay/tools")
+        }));
+        assert!(env.iter().any(|env| {
+            env.name == "CENTAUR_OVERLAY_DIR"
+                && env.value.as_deref() == Some("/opt/centaur/overlay")
+        }));
+
+        let volumes = pod_spec.volumes.as_ref().unwrap();
+        assert!(
+            volumes
+                .iter()
+                .any(|volume| { volume.name == "overlay-root" && volume.empty_dir.is_some() })
+        );
+        assert!(
+            volumes
+                .iter()
+                .any(|volume| { volume.name == "overlay-prompt" && volume.empty_dir.is_some() })
+        );
+        assert!(!volumes.iter().any(|volume| volume.name == "tools-root"));
+
+        let mounts = container.volume_mounts.as_ref().unwrap();
+        assert!(mounts.iter().any(|mount| mount.name == "overlay-root"));
+        assert!(mounts.iter().any(|mount| mount.name == "overlay-prompt"));
+
+        let init_containers = pod_spec.init_containers.as_ref().unwrap();
+        assert_eq!(init_containers.len(), 1);
+        assert_eq!(init_containers[0].name, "overlay-bootstrap");
+    }
+
+    #[test]
+    fn spec_level_overlay_wins_over_backend_default() {
+        // A workflow-host spec carries its own overlay while the backend has a
+        // default — the two must collapse into ONE overlay-bootstrap/overlay-root
+        // pair (duplicate names are an invalid pod), with the spec's winning.
+        let spec = SandboxSpec::new("centaur-agent:latest").overlay_image(OverlayImage::new(
+            "overlay:spec",
+            "/overlay",
+            "/opt/centaur/overlay",
+        ));
+        let config = AgentSandboxConfig::new("centaur").overlay(OverlayImage::new(
+            "overlay:config",
+            "/overlay",
+            "/opt/centaur/overlay",
+        ));
+
+        let sandbox = build_agent_sandbox(&SandboxId::new("asbx-test"), &spec, &config).unwrap();
+        let pod_spec = &sandbox.spec.pod_template.spec;
+
+        let init_containers = pod_spec.init_containers.as_ref().unwrap();
+        assert_eq!(init_containers.len(), 1);
+        assert_eq!(init_containers[0].name, "overlay-bootstrap");
+        assert_eq!(init_containers[0].image.as_deref(), Some("overlay:spec"));
+
+        let overlay_volumes = pod_spec
+            .volumes
+            .as_ref()
+            .unwrap()
+            .iter()
+            .filter(|volume| volume.name == "overlay-root")
+            .count();
+        assert_eq!(overlay_volumes, 1);
+    }
+
+    #[test]
+    fn tools_clone_rides_iron_proxy_when_enabled() {
+        // apply_proxy_env runs before build_agent_sandbox in create(), so the
+        // resolved per-sandbox proxy URL arrives on the spec env.
+        let spec = SandboxSpec::new("centaur-agent:latest")
+            .env("HTTPS_PROXY", "http://asbx-test-iron-proxy:8080");
+        let config = AgentSandboxConfig::new("centaur")
+            .tools(ToolsConfig::new("paradigmxyz/centaur", "api:test"))
+            .iron_proxy(IronProxyConfig::new("proxy:test", "ca-cert", "ca-key"));
+
+        let sandbox = build_agent_sandbox(&SandboxId::new("asbx-test"), &spec, &config).unwrap();
+        let pod_spec = &sandbox.spec.pod_template.spec;
+        let bootstrap = &pod_spec.init_containers.as_ref().unwrap()[0];
+        assert_eq!(bootstrap.name, "tools-bootstrap");
+        let script = &bootstrap.command.as_ref().unwrap()[2];
+        assert!(script.contains("export HTTPS_PROXY=\"http://asbx-test-iron-proxy:8080\""));
+        assert!(script.contains("export GIT_SSL_CAINFO=\"/firewall-certs/ca-cert.pem\""));
+        assert!(
+            bootstrap
+                .volume_mounts
+                .as_ref()
+                .unwrap()
+                .iter()
+                .any(|mount| mount.name == "firewall-ca")
+        );
+
+        // Without iron-proxy the clone goes direct: no proxy exports, no CA mount.
+        let spec = SandboxSpec::new("centaur-agent:latest");
+        let config = AgentSandboxConfig::new("centaur")
+            .tools(ToolsConfig::new("paradigmxyz/centaur", "api:test"));
+        let sandbox = build_agent_sandbox(&SandboxId::new("asbx-test"), &spec, &config).unwrap();
+        let bootstrap = &sandbox
+            .spec
+            .pod_template
+            .spec
+            .init_containers
+            .as_ref()
+            .unwrap()[0];
+        let script = &bootstrap.command.as_ref().unwrap()[2];
+        assert!(!script.contains("HTTPS_PROXY"));
+        assert!(
+            !bootstrap
+                .volume_mounts
+                .as_ref()
+                .unwrap()
+                .iter()
+                .any(|mount| mount.name == "firewall-ca")
+        );
+    }
+
+    #[test]
+    fn bootstrap_empty_dirs_are_writable_by_agent_uid() {
+        let spec = SandboxSpec::new("centaur-agent:latest");
+        let config = AgentSandboxConfig::new("centaur")
+            .tools(ToolsConfig::new("paradigmxyz/centaur", "api:test"));
+
+        let sandbox = build_agent_sandbox(&SandboxId::new("asbx-test"), &spec, &config).unwrap();
+        let pod_spec = &sandbox.spec.pod_template.spec;
+
+        let security_context = pod_spec.security_context.as_ref().unwrap();
+        assert_eq!(security_context.fs_group, Some(1001));
+        assert_eq!(
+            security_context.fs_group_change_policy.as_deref(),
+            Some("OnRootMismatch")
+        );
     }
 
     #[test]
