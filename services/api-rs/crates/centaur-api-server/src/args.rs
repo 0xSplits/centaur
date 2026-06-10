@@ -16,7 +16,7 @@ use centaur_iron_proxy::{
 };
 use centaur_sandbox_agent_k8s::{
     AgentSandboxBackend, AgentSandboxConfig, GitHubTokenRef, IronControlSettings, IronProxyConfig,
-    OverlayConfig, ToolsConfig,
+    ToolsConfig,
 };
 use centaur_sandbox_core::{Mount, MountKind, OverlayImage, SandboxSpec};
 use centaur_sandbox_local::LocalSandboxBackend;
@@ -226,8 +226,6 @@ struct SandboxArgs {
     workflow_host_command: Option<String>,
     #[command(flatten)]
     tools_source: ToolsArgs,
-    #[command(flatten)]
-    overlay: OverlayArgs,
 }
 
 impl SandboxArgs {
@@ -390,7 +388,7 @@ impl SandboxArgs {
                     .read_only(),
                 );
             }
-            if let Some(overlay) = workflow_overlay_image_from_env() {
+            if let Some(overlay) = overlay_image_from_env() {
                 spec = spec.overlay_image(overlay);
             }
         }
@@ -674,7 +672,10 @@ impl TryFrom<&SandboxArgs> for AgentSandboxConfig {
         }
         config.iron_control = args.iron_control.settings();
         config.tools = args.tools_source.to_config();
-        config.overlay = args.overlay.to_config();
+        // The same org overlay (and the same CENTAUR_OVERLAY_* env the chart
+        // already sets) serves every sandbox; workflow hosts set it spec-level
+        // via `workflow_host_spec`, which then takes precedence in the backend.
+        config.overlay = overlay_image_from_env();
         // iron-control is the only proxy mode: a per-sandbox proxy syncs its
         // secrets from the control plane, so configuring iron-proxy without
         // iron-control would produce a non-functional proxy. Fail fast.
@@ -759,55 +760,6 @@ impl ToolsArgs {
                 secret_key: clean_optional_value(Some(self.github_token_secret_key.as_str()))
                     .unwrap_or_else(|| "token".to_owned()),
             });
-        }
-        Some(config)
-    }
-}
-
-#[derive(Debug, ClapArgs)]
-struct OverlayArgs {
-    #[arg(
-        id = "overlay_image",
-        long = "centaur-overlay-image",
-        env = "CENTAUR_OVERLAY_IMAGE"
-    )]
-    image: Option<String>,
-    #[arg(
-        id = "overlay_image_pull_policy",
-        long = "centaur-overlay-image-pull-policy",
-        env = "CENTAUR_OVERLAY_IMAGE_PULL_POLICY"
-    )]
-    image_pull_policy: Option<String>,
-    #[arg(
-        id = "overlay_image_source_path",
-        long = "centaur-overlay-image-source-path",
-        env = "CENTAUR_OVERLAY_IMAGE_SOURCE_PATH",
-        default_value = "/overlay"
-    )]
-    source_path: String,
-    // The overlay tree mounts at the same path the api-rs pod uses
-    // (`overlay.mountPath`), so the agent's `<mount>/tools` matches the path
-    // api-rs discovered tools at.
-    #[arg(
-        id = "overlay_mount_path",
-        long = "centaur-overlay-mount-path",
-        env = "CENTAUR_OVERLAY_MOUNT_PATH",
-        default_value = "/app/overlay/org"
-    )]
-    mount_path: String,
-}
-
-impl OverlayArgs {
-    /// `None` when no overlay image is configured (overlay disabled).
-    fn to_config(&self) -> Option<OverlayConfig> {
-        let image = clean_optional_value(self.image.as_deref())?;
-        let mut config = OverlayConfig::new(image);
-        config.image_pull_policy = self.image_pull_policy.clone();
-        if let Some(path) = clean_optional_value(Some(self.source_path.as_str())) {
-            config.source_path = path;
-        }
-        if let Some(path) = clean_optional_value(Some(self.mount_path.as_str())) {
-            config.mount_path = path;
         }
         Some(config)
     }
@@ -1118,7 +1070,10 @@ fn default_workflow_host_path() -> String {
         .to_string()
 }
 
-fn workflow_overlay_image_from_env() -> Option<OverlayImage> {
+/// The org overlay image, from the `CENTAUR_OVERLAY_*` env the chart sets.
+/// Shared by workflow-host specs and the agent-sandbox backend default — every
+/// sandbox mounts the same overlay tree at the same path.
+fn overlay_image_from_env() -> Option<OverlayImage> {
     let image = env::var("CENTAUR_OVERLAY_IMAGE").ok()?;
     let source_path =
         env::var("CENTAUR_OVERLAY_IMAGE_SOURCE_PATH").unwrap_or_else(|_| "/overlay".to_owned());
@@ -1194,6 +1149,16 @@ fn parse_label_selector_arg(value: &str) -> Result<BTreeMap<String, String>, Str
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // Process env is global: tests that set CENTAUR_OVERLAY_* via EnvGuard must
+    // not interleave, or one test observes another's values.
+    static ENV_MUTEX: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    fn env_lock() -> std::sync::MutexGuard<'static, ()> {
+        ENV_MUTEX
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
 
     struct EnvGuard {
         name: &'static str,
@@ -1304,6 +1269,10 @@ mod tests {
 
     #[test]
     fn tools_and_overlay_config_read_from_flags() {
+        // The overlay rides the same CENTAUR_OVERLAY_* env the workflow host
+        // reads — one overlay convention for every sandbox.
+        let _env_lock = env_lock();
+        let _overlay_image = EnvGuard::set("CENTAUR_OVERLAY_IMAGE", "centaur-overlay:test");
         let args = Args::try_parse_from([
             "centaur-api-server",
             "--database-url",
@@ -1320,8 +1289,6 @@ mod tests {
             "centaur-agent:test",
             "--kubernetes-tools-github-token-secret",
             "centaur-repo-cache-github-token",
-            "--centaur-overlay-image",
-            "centaur-overlay:test",
         ])
         .unwrap();
         let config = AgentSandboxConfig::try_from(&args.sandbox).unwrap();
@@ -1335,11 +1302,12 @@ mod tests {
         assert_eq!(token.secret_key, "token");
         let overlay = config.overlay.expect("overlay should be Some");
         assert_eq!(overlay.image, "centaur-overlay:test");
-        assert_eq!(overlay.mount_path, "/app/overlay/org");
+        assert_eq!(overlay.mount_path, "/opt/centaur/overlay");
     }
 
     #[test]
     fn agent_k8s_workflow_host_mounts_overlay_workflows() {
+        let _env_lock = env_lock();
         let _overlay_image = EnvGuard::set("CENTAUR_OVERLAY_IMAGE", "ghcr.io/example/overlay:test");
         let _overlay_pull_policy = EnvGuard::set("CENTAUR_OVERLAY_IMAGE_PULL_POLICY", "Always");
         let _overlay_source_path = EnvGuard::set("CENTAUR_OVERLAY_IMAGE_SOURCE_PATH", "/overlay");

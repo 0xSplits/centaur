@@ -8,24 +8,26 @@
 //! proxied env (tool placeholder creds + `*_DSN` from `apply_proxy_env`,
 //! granted per-sandbox by iron-control) — none of that lives here.
 //!
-//! What this module provides is the *sources* the shims install from, mounted
-//! INTO the agent container at the SAME paths the api-rs pod's own `TOOL_DIRS`
-//! points at (so api-rs's `tool_discovery` and the agent agree on tool paths):
+//! What this module provides is the *sources* the shims install from — the same
+//! trees api-rs's own `tool_discovery` scans, so the creds api-rs grants match
+//! the tools the agent installs:
 //!
 //! * a `tools-bootstrap` init container git-clones the tools repo at a pinned
 //!   ref and copies its `source_subdir` into an emptyDir mounted at `/app/tools`
 //!   — the same repo-cache architecture (clone a repo into a pre-provisioned
 //!   directory, no Dockerfile rebuild to add a tool) without sharing the
 //!   repo-cache DaemonSet's node-level cache;
-//! * an `overlay-bootstrap` init container copies the org overlay image's tree
-//!   into the overlay-root emptyDir, mounted at the overlay `mount_path` (and
-//!   stages the overlay's `SYSTEM_PROMPT.md` as `$HOME/AGENTS_OVERLAY.md`, which
-//!   the sandbox entrypoint appends to the base prompt).
+//! * the org overlay rides the shared spec-level [`OverlayImage`] plumbing
+//!   (`overlay_json` in `lib.rs`, the same mechanism and `/opt/centaur/overlay`
+//!   mount workflow-host sandboxes use), which also stages the overlay's
+//!   `SYSTEM_PROMPT.md` as `$HOME/AGENTS_OVERLAY.md` for the sandbox entrypoint
+//!   to append to the base prompt.
 //!
 //! `TOOL_DIRS` is set explicitly on the agent env to `/app/tools` (or
-//! `/app/tools:<mount_path>/tools` when the overlay is configured), matching the
-//! value the api-rs Deployment computes for itself.
+//! `/app/tools:<mount_path>/tools` when the overlay is configured), pointing at
+//! the paths the init containers populate in this pod.
 
+use centaur_sandbox_core::OverlayImage;
 use serde_json::{Value, json};
 
 const AGENT_UID: i64 = 1001;
@@ -41,18 +43,6 @@ const TOOLS_BOOTSTRAP_DIR: &str = "/tools-bootstrap";
 const GITHUB_TOKEN_VOLUME: &str = "tools-github-token";
 const GITHUB_TOKEN_DIR: &str = "/tools-github-token";
 const GITHUB_TOKEN_FILE: &str = "token";
-
-/// Shared overlay-tree volume (populated by `overlay-bootstrap`).
-const OVERLAY_VOLUME: &str = "overlay-root";
-
-// The overlay's `SYSTEM_PROMPT.md` is staged by the init container into a tiny
-// shared volume and surfaced to the agent at `$HOME/AGENTS_OVERLAY.md`, which the
-// sandbox entrypoint appends to the base prompt.
-const OVERLAY_PROMPT_VOLUME: &str = "overlay-prompt";
-const OVERLAY_PROMPT_DIR: &str = "/overlay-prompt";
-const OVERLAY_PROMPT_FILE: &str = "AGENTS_OVERLAY.md";
-const AGENT_OVERLAY_PROMPT_PATH: &str = "/home/agent/AGENTS_OVERLAY.md";
-const OVERLAY_SYSTEM_PROMPT_REL: &str = "services/sandbox/SYSTEM_PROMPT.md";
 
 /// Git source for the base tools tree. When set, every sandbox gets a
 /// `tools-bootstrap` init container that clones `repo` at `git_ref` and copies
@@ -93,40 +83,7 @@ impl ToolsConfig {
     }
 }
 
-/// Org overlay image + where its tree lands in the sandbox. `mount_path` matches
-/// the api-rs pod's `overlay.mountPath` so the agent's `<mount_path>/tools` is
-/// the same path api-rs discovered tools at.
-#[derive(Clone, Debug)]
-pub struct OverlayConfig {
-    pub image: String,
-    pub image_pull_policy: Option<String>,
-    /// Path the overlay tree is copied from inside the overlay image.
-    pub source_path: String,
-    /// Path the overlay tree is mounted at in the sandbox (e.g. `/app/overlay/org`).
-    pub mount_path: String,
-}
-
-impl OverlayConfig {
-    pub fn new(image: impl Into<String>) -> Self {
-        Self {
-            image: image.into(),
-            image_pull_policy: None,
-            source_path: "/overlay".to_owned(),
-            mount_path: "/app/overlay/org".to_owned(),
-        }
-    }
-
-    /// Parent dir the overlay-root emptyDir is mounted at (so the copy lands at
-    /// `mount_path`). Falls back to `mount_path` itself if it has no parent.
-    fn overlay_root(&self) -> &str {
-        match self.mount_path.rfind('/') {
-            Some(0) | None => &self.mount_path,
-            Some(idx) => &self.mount_path[..idx],
-        }
-    }
-}
-
-fn security_context_json() -> Value {
+pub(crate) fn security_context_json() -> Value {
     json!({
         "allowPrivilegeEscalation": false,
         "capabilities": {"drop": ["ALL"]},
@@ -146,7 +103,7 @@ pub(crate) fn pod_security_context_json() -> Value {
 
 /// `TOOL_DIRS` for the agent: base tools plus the overlay's tools when present.
 /// Matches the value the api-rs Deployment computes for its own `TOOL_DIRS`.
-pub(crate) fn agent_tool_dirs(overlay: Option<&OverlayConfig>) -> String {
+pub(crate) fn agent_tool_dirs(overlay: Option<&OverlayImage>) -> String {
     match overlay {
         Some(overlay) => format!("{BASE_TOOL_DIR}:{}/tools", overlay.mount_path),
         None => BASE_TOOL_DIR.to_owned(),
@@ -155,7 +112,7 @@ pub(crate) fn agent_tool_dirs(overlay: Option<&OverlayConfig>) -> String {
 
 /// Agent env added for tools/overlay wiring: `TOOL_DIRS` (always) and
 /// `CENTAUR_OVERLAY_DIR` (when the overlay is configured).
-pub(crate) fn agent_env(overlay: Option<&OverlayConfig>) -> Vec<(String, String)> {
+pub(crate) fn agent_env(overlay: Option<&OverlayImage>) -> Vec<(String, String)> {
     let mut env = vec![("TOOL_DIRS".to_owned(), agent_tool_dirs(overlay))];
     if let Some(overlay) = overlay {
         env.push(("CENTAUR_OVERLAY_DIR".to_owned(), overlay.mount_path.clone()));
@@ -276,45 +233,8 @@ pub(crate) fn tools_init_container_json(
     container
 }
 
-/// The `overlay-bootstrap` init container: copies the overlay image's tree into
-/// the shared `overlay-root` emptyDir, and stages the overlay's
-/// `SYSTEM_PROMPT.md` as `AGENTS_OVERLAY.md` in a small shared volume.
-pub(crate) fn overlay_init_container_json(overlay: &OverlayConfig) -> Value {
-    let script = format!(
-        "src=\"{src}\"\n\
-         target=\"{target}\"\n\
-         mkdir -p \"$target\"\n\
-         cp -R \"$src\"/. \"$target\"/\n\
-         if [ -f \"$target/{prompt_rel}\" ]; then\n\
-         \x20 cp \"$target/{prompt_rel}\" \"{prompt_dir}/{prompt_file}\"\n\
-         else\n\
-         \x20 : > \"{prompt_dir}/{prompt_file}\"\n\
-         fi",
-        src = overlay.source_path,
-        target = overlay.mount_path,
-        prompt_rel = OVERLAY_SYSTEM_PROMPT_REL,
-        prompt_dir = OVERLAY_PROMPT_DIR,
-        prompt_file = OVERLAY_PROMPT_FILE,
-    );
-    let mut container = json!({
-        "name": "overlay-bootstrap",
-        "image": overlay.image,
-        "command": ["/bin/sh", "-ec", script],
-        "volumeMounts": [
-            {"name": OVERLAY_VOLUME, "mountPath": overlay.overlay_root()},
-            {"name": OVERLAY_PROMPT_VOLUME, "mountPath": OVERLAY_PROMPT_DIR},
-        ],
-        "securityContext": security_context_json(),
-    });
-    if let Some(policy) = &overlay.image_pull_policy {
-        container["imagePullPolicy"] = json!(policy);
-    }
-    container
-}
-
-/// Volumes added to the pod for tool sources (and, when enabled, the overlay
-/// tree + prompt-handoff volume).
-pub(crate) fn volumes_json(tools: Option<&ToolsConfig>, overlay: bool) -> Vec<Value> {
+/// Volumes added to the pod for tool sources.
+pub(crate) fn volumes_json(tools: Option<&ToolsConfig>) -> Vec<Value> {
     let mut volumes = Vec::new();
     if let Some(tools) = tools {
         volumes.push(json!({"name": TOOLS_VOLUME, "emptyDir": {}}));
@@ -329,35 +249,17 @@ pub(crate) fn volumes_json(tools: Option<&ToolsConfig>, overlay: bool) -> Vec<Va
             }));
         }
     }
-    if overlay {
-        volumes.push(json!({"name": OVERLAY_VOLUME, "emptyDir": {}}));
-        volumes.push(json!({"name": OVERLAY_PROMPT_VOLUME, "emptyDir": {}}));
-    }
     volumes
 }
 
 /// Volume mounts added to the AGENT container: the base tools tree at
-/// `/app/tools` and, when the overlay is enabled, the overlay tree plus the
-/// staged overlay prompt at `$HOME/AGENTS_OVERLAY.md`.
-pub(crate) fn agent_volume_mounts_json(tools: bool, overlay: Option<&OverlayConfig>) -> Vec<Value> {
-    let mut mounts = Vec::new();
+/// `/app/tools`. (Overlay mounts ride the shared spec-level overlay plumbing.)
+pub(crate) fn agent_volume_mounts_json(tools: bool) -> Vec<Value> {
     if tools {
-        mounts.push(json!({"name": TOOLS_VOLUME, "mountPath": BASE_TOOL_DIR, "readOnly": true}));
+        vec![json!({"name": TOOLS_VOLUME, "mountPath": BASE_TOOL_DIR, "readOnly": true})]
+    } else {
+        Vec::new()
     }
-    if let Some(overlay) = overlay {
-        mounts.push(json!({
-            "name": OVERLAY_VOLUME,
-            "mountPath": overlay.overlay_root(),
-            "readOnly": true,
-        }));
-        mounts.push(json!({
-            "name": OVERLAY_PROMPT_VOLUME,
-            "mountPath": AGENT_OVERLAY_PROMPT_PATH,
-            "subPath": OVERLAY_PROMPT_FILE,
-            "readOnly": true,
-        }));
-    }
-    mounts
 }
 
 #[cfg(test)]
@@ -365,12 +267,12 @@ mod tests {
     use super::*;
 
     #[test]
-    fn tool_dirs_match_api_rs_pod_value() {
+    fn tool_dirs_include_overlay_tools_at_its_mount_path() {
         assert_eq!(agent_tool_dirs(None), "/app/tools");
-        let overlay = OverlayConfig::new("centaur-overlay:test");
+        let overlay = OverlayImage::new("centaur-overlay:test", "/overlay", "/opt/centaur/overlay");
         assert_eq!(
             agent_tool_dirs(Some(&overlay)),
-            "/app/tools:/app/overlay/org/tools"
+            "/app/tools:/opt/centaur/overlay/tools"
         );
     }
 
@@ -379,26 +281,16 @@ mod tests {
         let env = agent_env(None);
         assert_eq!(env, vec![("TOOL_DIRS".to_owned(), "/app/tools".to_owned())]);
 
-        let overlay = OverlayConfig::new("centaur-overlay:test");
+        let overlay = OverlayImage::new("centaur-overlay:test", "/overlay", "/opt/centaur/overlay");
         let env = agent_env(Some(&overlay));
         assert!(env.contains(&(
             "TOOL_DIRS".to_owned(),
-            "/app/tools:/app/overlay/org/tools".to_owned()
+            "/app/tools:/opt/centaur/overlay/tools".to_owned()
         )));
         assert!(env.contains(&(
             "CENTAUR_OVERLAY_DIR".to_owned(),
-            "/app/overlay/org".to_owned()
+            "/opt/centaur/overlay".to_owned()
         )));
-    }
-
-    #[test]
-    fn overlay_root_is_mount_path_parent() {
-        let overlay = OverlayConfig::new("img");
-        assert_eq!(overlay.overlay_root(), "/app/overlay");
-
-        let mut shallow = OverlayConfig::new("img");
-        shallow.mount_path = "/overlay".to_owned();
-        assert_eq!(shallow.overlay_root(), "/overlay");
     }
 
     #[test]
@@ -494,10 +386,14 @@ mod tests {
         assert!(script.contains("/tools-github-token/token"));
         let mounts = c["volumeMounts"].as_array().unwrap();
         assert_eq!(mounts.len(), 2);
-        assert!(mounts.iter().any(|m| m["mountPath"] == "/tools-github-token"));
+        assert!(
+            mounts
+                .iter()
+                .any(|m| m["mountPath"] == "/tools-github-token")
+        );
 
         // The pod gets a secret-backed volume projecting the token to `token`.
-        let volumes = volumes_json(Some(&tools), false);
+        let volumes = volumes_json(Some(&tools));
         let token_vol = volumes
             .iter()
             .find(|v| v["name"] == GITHUB_TOKEN_VOLUME)
@@ -512,40 +408,19 @@ mod tests {
     #[test]
     fn volumes_without_token_are_just_emptydirs() {
         let tools = ToolsConfig::new("paradigmxyz/centaur", "centaur-agent:test");
-        let volumes = volumes_json(Some(&tools), false);
+        let volumes = volumes_json(Some(&tools));
         assert_eq!(volumes.len(), 1);
         assert_eq!(volumes[0]["name"], TOOLS_VOLUME);
         assert!(volumes[0]["emptyDir"].is_object());
     }
 
     #[test]
-    fn overlay_init_stages_prompt_and_mounts_root() {
-        let overlay = OverlayConfig::new("centaur-overlay:test");
-        let c = overlay_init_container_json(&overlay);
-        assert_eq!(c["name"], "overlay-bootstrap");
-        let script = c["command"][2].as_str().unwrap();
-        assert!(script.contains("target=\"/app/overlay/org\""));
-        assert!(script.contains("services/sandbox/SYSTEM_PROMPT.md"));
-        assert!(script.contains("AGENTS_OVERLAY.md"));
-        let root_mount = &c["volumeMounts"][0];
-        assert_eq!(root_mount["mountPath"], "/app/overlay");
-    }
-
-    #[test]
-    fn agent_mounts_tools_and_overlay_prompt() {
-        let overlay = OverlayConfig::new("centaur-overlay:test");
-        let mounts = agent_volume_mounts_json(true, Some(&overlay));
-        // base tools, overlay tree, overlay prompt
-        assert_eq!(mounts.len(), 3);
-        assert!(mounts.iter().any(|m| m["mountPath"] == "/app/tools"));
-        assert!(mounts.iter().any(|m| m["mountPath"] == "/app/overlay"));
-        let prompt = mounts
-            .iter()
-            .find(|m| m["mountPath"] == AGENT_OVERLAY_PROMPT_PATH)
-            .unwrap();
-        assert_eq!(prompt["subPath"], "AGENTS_OVERLAY.md");
-
-        let mounts = agent_volume_mounts_json(true, None);
+    fn agent_mounts_tools_read_only() {
+        let mounts = agent_volume_mounts_json(true);
         assert_eq!(mounts.len(), 1);
+        assert_eq!(mounts[0]["mountPath"], "/app/tools");
+        assert_eq!(mounts[0]["readOnly"], true);
+
+        assert!(agent_volume_mounts_json(false).is_empty());
     }
 }
