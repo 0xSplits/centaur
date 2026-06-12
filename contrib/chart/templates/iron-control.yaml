@@ -215,6 +215,15 @@ spec:
         - podSelector:
             matchLabels:
               centaur.ai/iron-proxy: "true"
+{{- if .Values.ironControl.ingress.enabled }}
+        # Ingress controller pods (Tailscale operator, Cloudflare, ...)
+        # forwarding external traffic to iron-control.
+{{- range default .Values.networkPolicy.ingressControllerNamespaces .Values.networkPolicy.ingressSourceNamespaces }}
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: {{ . | quote }}
+{{- end }}
+{{- end }}
       ports:
         - protocol: TCP
           port: {{ .Values.ironControl.service.httpPort }}
