@@ -1,7 +1,6 @@
 packages:
   - packages/*
   - services/linearbot
-  - services/slackbot
   - services/slackbotv2
 
 patchedDependencies:
