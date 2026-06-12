@@ -31,7 +31,7 @@ build:
       just _build-all-sequential
     else
       pids=()
-      for recipe in _build-api _build-api-rs _build-iron-proxy _build-slackbot _build-slackbotv2 _build-agent; do
+      for recipe in _build-api _build-api-rs _build-iron-proxy _build-slackbot _build-slackbotv2 _build-discordbot _build-agent; do
         just "$recipe" &
         pids+=("$!")
       done
@@ -48,6 +48,7 @@ _build-all-sequential:
     just _build-iron-proxy
     just _build-slackbot
     just _build-slackbotv2
+    just _build-discordbot
     just _build-agent
 
 build-one service:
@@ -59,6 +60,7 @@ build-one service:
       iron-proxy) just _build-iron-proxy ;;
       slackbot) just _build-slackbot ;;
       slackbotv2) just _build-slackbotv2 ;;
+      discordbot) just _build-discordbot ;;
       agent|sandbox) just _build-agent ;;
       agent-thin|sandbox-thin) just _build-agent-thin ;;
       *) echo "unknown service: {{service}}" >&2; exit 2 ;;
@@ -79,6 +81,9 @@ _build-slackbot:
 _build-slackbotv2:
     docker build -t centaur-slackbotv2:latest -f services/slackbotv2/Dockerfile .
 
+_build-discordbot:
+    docker build -t centaur-discordbot:latest -f services/discordbot/Dockerfile .
+
 _build-agent:
     docker build --target "{{agent_build_target}}" -t "{{agent_image}}" -f "{{agent_dockerfile}}" .
 
@@ -91,7 +96,7 @@ _build-agent-thin:
 _push-registry:
     #!/usr/bin/env bash
     set -euo pipefail
-    for img in centaur-api centaur-api-rs centaur-iron-proxy centaur-slackbot centaur-slackbotv2 centaur-agent; do
+    for img in centaur-api centaur-api-rs centaur-iron-proxy centaur-slackbot centaur-slackbotv2 centaur-discordbot centaur-agent; do
       target="{{registry}}/library/${img}:latest"
       echo "pushing ${img}:latest -> ${target}..."
       docker tag "${img}:latest" "${target}"
@@ -104,7 +109,7 @@ _push-registry:
 _import-k3s:
     #!/usr/bin/env bash
     set -euo pipefail
-    for img in centaur-api centaur-api-rs centaur-iron-proxy centaur-slackbot centaur-slackbotv2 centaur-agent; do
+    for img in centaur-api centaur-api-rs centaur-iron-proxy centaur-slackbot centaur-slackbotv2 centaur-discordbot centaur-agent; do
       echo "importing ${img}:latest into k3s containerd..."
       docker save "${img}:latest" | {{k3s_ctr}} images import -
     done
@@ -126,6 +131,7 @@ deploy:
           --set ironProxy.image.repository=ghcr.io/paradigmxyz/centaur/centaur-iron-proxy
           --set slackbot.image.repository=ghcr.io/paradigmxyz/centaur/centaur-slackbot
           --set slackbotv2.image.repository=ghcr.io/paradigmxyz/centaur/centaur-slackbotv2
+          --set discordbot.image.repository=ghcr.io/paradigmxyz/centaur/centaur-discordbot
           --set sandbox.image.repository=ghcr.io/paradigmxyz/centaur/centaur-agent
         )
         ;;
