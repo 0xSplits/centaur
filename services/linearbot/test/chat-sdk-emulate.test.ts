@@ -295,6 +295,67 @@ describe("linearbot chat-sdk pipeline", () => {
     expect(codexApi.creates).toHaveLength(0);
   });
 
+  // Upstream slackbotv2 #522: the recovery sweep raced live renders — the
+  // obligation is indexed before the live render starts, and a sweep pass
+  // landing mid-render claimed it and posted the same answer twice. Live
+  // renders now hold the per-thread recovery lease, so the sweep lease-skips.
+  it("does not duplicate the live render when a recovery sweep scans mid-stream", async () => {
+    const sharedState = createMemoryState();
+    await sharedState.connect();
+    bot = createTestBot({ state: sharedState });
+
+    const sessionId = "sess-sweep-race";
+    const threadKey = `linear:${ISSUE_ID}:s:${sessionId}`;
+    const rootCommentId = linearApi.addUserComment({
+      body: "@centaur race the sweep",
+    });
+    linearApi.addAgentSession({ id: sessionId, rootCommentId });
+
+    const response = await postWebhook(
+      agentSessionCreatedPayload({
+        sessionId,
+        commentId: rootCommentId,
+        commentBody: "@centaur race the sweep",
+        promptContext: "ENG-7: Sweep race",
+      }),
+    );
+    expect(response.status).toBe(200);
+    await waitFor(() => codexApi.executes.length >= 1);
+
+    // Hold the live render in-flight: everything except the terminal line.
+    const outputLines = sampleCodexOutputLines(
+      "Single answer despite the sweep.",
+    );
+    codexApi.emitOutputLines(threadKey, outputLines.slice(0, -1));
+    // The events request implies commitExecutionStarted ran: the obligation
+    // is indexed and the live render holds the lease.
+    await waitFor(() => codexApi.eventRequests.length === 1);
+
+    // A second instance's startup sweep scans the live obligation; it must
+    // lease-skip instead of opening a second renderer.
+    createTestBot({
+      recoverRenderObligationsOnStart: true,
+      state: sharedState,
+    });
+    await Bun.sleep(300);
+
+    codexApi.emitOutputLines(threadKey, outputLines.slice(-1));
+    await waitFor(() =>
+      linearApi.activities.some((a) => a.content.type === "response"),
+    );
+    await Bun.sleep(100);
+
+    expect(
+      codexApi.eventRequests.filter(
+        (request) => request.threadKey === threadKey,
+      ),
+    ).toHaveLength(1);
+    const responses = linearApi.activities.filter(
+      (a) => a.content.type === "response",
+    );
+    expect(responses).toHaveLength(1);
+  });
+
   // A comment-less, creator-less created event is what a bare delegation (or
   // a description mention / triage automation) produces. Upstream dropped the
   // event entirely (missing comment) or attributed it to the bot itself
@@ -1013,6 +1074,11 @@ type MockSessionApi = {
     data: unknown,
     executionId?: string,
   ): void;
+  eventRequests: Array<{
+    afterEventId: number;
+    executionId?: string;
+    threadKey: string;
+  }>;
   executes: MockSessionRequest<LinearbotExecuteSessionRequest>[];
   reset(): void;
   url: string;
@@ -1022,6 +1088,11 @@ function startMockCodexApi(): MockSessionApi {
   const appends: MockSessionRequest<LinearbotAppendMessagesRequest>[] = [];
   const creates: MockSessionRequest<LinearbotCreateSessionRequest>[] = [];
   const executes: MockSessionRequest<LinearbotExecuteSessionRequest>[] = [];
+  const eventRequests: Array<{
+    afterEventId: number;
+    executionId?: string;
+    threadKey: string;
+  }> = [];
   const idempotentExecutions = new Map<string, string>();
   type StreamHandle = {
     controller: ReadableStreamDefaultController<Uint8Array>;
@@ -1107,6 +1178,11 @@ function startMockCodexApi(): MockSessionApi {
       }
       if (request.method === "GET" && suffix === "events") {
         const executionId = url.searchParams.get("execution_id") ?? undefined;
+        eventRequests.push({
+          afterEventId: Number(url.searchParams.get("after_event_id") ?? 0),
+          ...(executionId ? { executionId } : {}),
+          threadKey,
+        });
         const stream = new ReadableStream<Uint8Array>({
           start(controller) {
             const handle: StreamHandle = { controller, executionId };
@@ -1135,6 +1211,7 @@ function startMockCodexApi(): MockSessionApi {
   return {
     appends,
     creates,
+    eventRequests,
     executes,
     url: `http://127.0.0.1:${server.port}`,
     emitOutputLines(threadKey, lines, executionId) {
@@ -1151,6 +1228,7 @@ function startMockCodexApi(): MockSessionApi {
     reset() {
       appends.length = 0;
       creates.length = 0;
+      eventRequests.length = 0;
       executes.length = 0;
       idempotentExecutions.clear();
       pendingEvents.clear();

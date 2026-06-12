@@ -106,6 +106,7 @@ const RENDER_OBLIGATION_INDEX_MAX_LENGTH = 2000;
 const SESSION_INDEX_MAX_LENGTH = 100;
 const RENDER_INDEX_TTL_MS = 30 * 24 * 60 * 60 * 1000;
 const RENDER_RECOVERY_LEASE_TTL_MS = 2 * 60 * 1000;
+const RENDER_LEASE_REFRESH_INTERVAL_MS = 60 * 1000;
 const RENDER_RECOVERY_THREAD_TIMEOUT_MS = 2 * 60 * 1000;
 const RENDER_RECOVERY_MAX_THREAD_FAILURES = 5;
 const RENDER_RETRY_INITIAL_DELAY_MS = 250;
@@ -424,6 +425,9 @@ async function syncThreadMessageToSession(
   }
 
   let lastEventId = state.lastEventId ?? 0;
+  const renderLease: { release: (() => Promise<void>) | null } = {
+    release: null,
+  };
   const candidateMessages = context ?? [serializedMessage];
   const messagesToAppend = candidateMessages.filter(
     (item) => !messageIds.has(item.id),
@@ -470,6 +474,16 @@ async function syncThreadMessageToSession(
     const latest = (await thread.state) ?? {};
     const latestExecutedMessageIds = new Set(latest.executedMessageIds ?? []);
     latestExecutedMessageIds.add(serializedMessage.id);
+    // Take the render lease before the obligation becomes visible so a
+    // concurrent recovery sweep never claims it while this process is about
+    // to render it live (upstream slackbotv2 #522).
+    try {
+      renderLease.release = await acquireRenderLease(input.state, thread.id);
+    } catch (error) {
+      traceLog(input.options, "linearbot_render_lease_acquire_failed", trace, {
+        error: errorMessage(error),
+      });
+    }
     await thread.setState({
       activeExecution: true,
       // Refresh the staleness timestamp where the flag is legitimately
@@ -538,6 +552,7 @@ async function syncThreadMessageToSession(
       input.options,
       forwardInput,
       () => lastEventId,
+      renderLease,
       trace,
       commitExecutionStarted,
     );
@@ -545,6 +560,9 @@ async function syncThreadMessageToSession(
       last_event_id: lastEventId,
     });
   } catch (error) {
+    // The live render is not happening; let the recovery sweep claim the
+    // obligation (if one was committed) as soon as it scans.
+    await renderLease.release?.();
     const latest = (await thread.state) ?? {};
     await thread.setState({
       activeExecution: false,
@@ -853,54 +871,61 @@ function scheduleExecutionRender(
   options: LinearbotOptions,
   input: ForwardSessionInput,
   getLastEventId: () => number,
+  renderLease: { release: (() => Promise<void>) | null },
   trace?: LinearbotTrace,
   onExecutionStarted?: (
     execution: LinearbotExecuteSessionResponse,
   ) => Promise<void>,
 ): void {
   const promise = (async () => {
-    let attempt = 0;
-    while (true) {
-      const result = await renderExecutionAttempt(
-        thread,
-        message,
-        options,
-        input,
-        getLastEventId,
-        trace,
-        onExecutionStarted,
-      );
-      if (result === "complete") return;
-      if (attempt >= RENDER_RETRY_MAX_ATTEMPTS) {
-        traceLog(options, "linearbot_render_retries_exhausted", trace, {
-          retry_attempts: attempt,
-        });
-        const latest = (await thread.state) ?? {};
-        await thread.setState({
-          activeExecution: false,
-          activeExecutionStartedAt: null,
-          lastEventId: Math.max(latest.lastEventId ?? 0, getLastEventId()),
-        });
-        await renderExecutionStream(
+    try {
+      let attempt = 0;
+      while (true) {
+        const result = await renderExecutionAttempt(
           thread,
-          streamError(
-            new Error(
-              "Streaming retries exhausted; giving up on rendering this run.",
-            ),
-          ),
           message,
           options,
+          input,
+          getLastEventId,
           trace,
-        ).catch(() => undefined);
-        return;
+          onExecutionStarted,
+        );
+        if (result === "complete") return;
+        if (attempt >= RENDER_RETRY_MAX_ATTEMPTS) {
+          traceLog(options, "linearbot_render_retries_exhausted", trace, {
+            retry_attempts: attempt,
+          });
+          const latest = (await thread.state) ?? {};
+          await thread.setState({
+            activeExecution: false,
+            activeExecutionStartedAt: null,
+            lastEventId: Math.max(latest.lastEventId ?? 0, getLastEventId()),
+          });
+          await renderExecutionStream(
+            thread,
+            streamError(
+              new Error(
+                "Streaming retries exhausted; giving up on rendering this run.",
+              ),
+            ),
+            message,
+            options,
+            trace,
+          ).catch(() => undefined);
+          return;
+        }
+        const delayMs = renderRetryDelayMs(attempt);
+        attempt += 1;
+        traceLog(options, "linearbot_render_retry_scheduled", trace, {
+          retry_delay_ms: delayMs,
+          retry_attempt: attempt,
+        });
+        await sleep(delayMs);
       }
-      const delayMs = renderRetryDelayMs(attempt);
-      attempt += 1;
-      traceLog(options, "linearbot_render_retry_scheduled", trace, {
-        retry_delay_ms: delayMs,
-        retry_attempt: attempt,
-      });
-      await sleep(delayMs);
+    } finally {
+      // The render settled (or gave up): hand the obligation back to the
+      // recovery sweep's jurisdiction (upstream slackbotv2 #522).
+      await renderLease.release?.();
     }
   })();
   backgroundWaitUntil(promise);
@@ -1124,11 +1149,17 @@ async function recoverRenderObligations(
       if (outcome.timedOut) {
         void recovery.catch(() => undefined);
         deferredCount += 1;
+        // Count timeouts toward the abandonment budget (upstream slackbotv2
+        // #522): an obligation whose recovery hangs on every claim (for
+        // example an event stream that never yields) would otherwise keep the
+        // sweep loop spinning forever, racing every live render.
+        failureCounts.set(threadId, (failureCounts.get(threadId) ?? 0) + 1);
         traceLog(
           options,
           "linearbot_render_recovery_thread_timeout",
           undefined,
           {
+            failure_count: failureCounts.get(threadId),
             thread_id: threadId,
             timeout_ms: timeoutMs,
           },
@@ -1278,6 +1309,42 @@ async function* streamOpenedSession(
 
 function renderRecoveryLeaseKey(threadId: string): string {
   return `linearbot:render:lease:${threadId}`;
+}
+
+/**
+ * Holds the per-thread render lease for the duration of a live render so the
+ * recovery sweep cannot claim the just-indexed obligation and post a
+ * duplicate answer (it lease-skips instead). The TTL keeps this crash-safe:
+ * if the pod dies mid-render the lease expires and recovery takes over. The
+ * lease is refreshed while the render runs because agent turns routinely
+ * outlive a single TTL window. (Ported from slackbotv2 #522.)
+ */
+async function acquireRenderLease(
+  state: StateAdapter,
+  threadId: string,
+): Promise<() => Promise<void>> {
+  const key = renderRecoveryLeaseKey(threadId);
+  const token = randomUUID();
+  await state.set(key, token, RENDER_RECOVERY_LEASE_TTL_MS);
+  const refresh = setInterval(() => {
+    void state
+      .get<string>(key)
+      .then((current) =>
+        current === token
+          ? state.set(key, token, RENDER_RECOVERY_LEASE_TTL_MS)
+          : undefined,
+      )
+      .catch(() => undefined);
+  }, RENDER_LEASE_REFRESH_INTERVAL_MS);
+  return async () => {
+    clearInterval(refresh);
+    try {
+      const current = await state.get<string>(key);
+      if (current === token) await state.delete(key);
+    } catch {
+      // Best effort: TTL expiry is the backstop.
+    }
+  };
 }
 
 /**
