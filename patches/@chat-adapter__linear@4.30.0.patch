@@ -1,0 +1,27 @@
+diff --git a/dist/index.js b/dist/index.js
+index 3a13b7a581b46e5bd46120a30d423663e9adb988..a4b158e31410e26028a55aeeb11cfe4f48e89de1 100644
+--- a/dist/index.js
++++ b/dist/index.js
+@@ -1673,10 +1673,19 @@ var LinearAdapter = class {
+       id: raw.comment.id,
+       isMention: raw.kind === "agent_session_comment",
+       // Agent session comments are treated as mentions as they directly target the bot
+-      threadId: this.encodeThreadId({
++      // Patched (centaur): agent-session messages must all share ONE stable
++      // thread id — linear:{issueId}:s:{agentSessionId} — regardless of which
++      // comment triggered them. Upstream keys the thread by the triggering
++      // comment's own id, so a session's `created` event (root comment) and
++      // every `prompted` follow-up (new source comment) each landed on a
++      // DIFFERENT thread, splitting one Linear agent session across fresh
++      // bot sessions on every reply.
++      threadId: raw.kind === "agent_session_comment" ? this.encodeThreadId({
+         issueId: raw.comment.issueId,
+-        commentId: raw.comment.id,
+-        agentSessionId: raw.kind === "agent_session_comment" ? raw.agentSessionId : void 0
++        agentSessionId: raw.agentSessionId
++      }) : this.encodeThreadId({
++        issueId: raw.comment.issueId,
++        commentId: raw.comment.id
+       }),
+       text,
+       formatted,

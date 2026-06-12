@@ -330,6 +330,24 @@ slackbotv2:
   extraEnv: {}
   resources: {}
 
+# Chat SDK Linear bot — Linear agent (actor=app) ingress. Receives
+# AgentSessionEvent webhooks on /api/webhooks/linear, forwards sessions to the
+# api-rs control plane (:8080), and renders runs as Linear agent activities.
+# Disabled by default: requires the LINEAR_ACCESS_TOKEN / LINEAR_WEBHOOK_SECRET
+# secrets from the Linear OAuth app install (see contrib/scripts/bootstrap-k8s-secrets.sh).
+linearbot:
+  enabled: false
+  replicaCount: 1
+  image:
+    repository: centaur-linearbot
+    tag: latest
+    pullPolicy: Always
+  userName: centaur
+  # "agent-sessions" (default) or "comments" (degraded, personal API key).
+  mode: ""
+  extraEnv: {}
+  resources: {}
+
 postgres:
   enabled: true
   image:
