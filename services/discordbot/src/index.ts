@@ -89,6 +89,7 @@ const RENDER_OBLIGATION_INDEX_KEY = "discordbot:render:index";
 const RENDER_OBLIGATION_INDEX_MAX_LENGTH = 2000;
 const RENDER_INDEX_TTL_MS = 30 * 24 * 60 * 60 * 1000;
 const RENDER_RECOVERY_LEASE_TTL_MS = 2 * 60 * 1000;
+const RENDER_LEASE_REFRESH_INTERVAL_MS = 60 * 1000;
 const RENDER_RETRY_INITIAL_DELAY_MS = 250;
 const RENDER_RETRY_MAX_DELAY_MS = 5_000;
 // Discord caps message content at 2000 chars; leave headroom so the honest
@@ -456,6 +457,9 @@ async function syncThreadMessageToSession(
   }
 
   let lastEventId = state.lastEventId ?? 0;
+  const renderLease: { release: (() => Promise<void>) | null } = {
+    release: null,
+  };
   const candidateMessages = context ?? [serializedMessage];
   const messagesToAppend = candidateMessages.filter(
     (item) => !messageIds.has(item.id),
@@ -499,6 +503,16 @@ async function syncThreadMessageToSession(
     const latest = (await thread.state) ?? {};
     const latestExecutedMessageIds = new Set(latest.executedMessageIds ?? []);
     latestExecutedMessageIds.add(serializedMessage.id);
+    // Take the render lease before the obligation becomes visible so a
+    // concurrent recovery sweep never claims it while this process is about
+    // to render it live (upstream slackbotv2 #522).
+    try {
+      renderLease.release = await acquireRenderLease(input.state, thread.id);
+    } catch (error) {
+      traceLog(input.options, "discordbot_render_lease_acquire_failed", trace, {
+        error: errorMessage(error),
+      });
+    }
     await thread.setState({
       activeExecution: true,
       // Discord delta: refresh the staleness timestamp where the flag is
@@ -570,6 +584,7 @@ async function syncThreadMessageToSession(
       forwardInput,
       () => lastEventId,
       shouldIncludeContext,
+      renderLease,
       trace,
       commitExecutionStarted,
       releaseExecutionSlot ?? undefined,
@@ -578,6 +593,9 @@ async function syncThreadMessageToSession(
       last_event_id: lastEventId,
     });
   } catch (error) {
+    // The live render is not happening; let the recovery sweep claim the
+    // obligation (if one was committed) as soon as it scans.
+    await renderLease.release?.();
     // Discord delta: release the per-guild slot — the render that would have
     // released it was never scheduled.
     releaseExecutionSlot?.();
@@ -611,6 +629,7 @@ function scheduleExecutionRender(
   input: ForwardSessionInput,
   getLastEventId: () => number,
   isInitialExecution: boolean,
+  renderLease: { release: (() => Promise<void>) | null },
   trace?: DiscordbotTrace,
   onExecutionStarted?: (
     execution: DiscordbotExecuteSessionResponse,
@@ -669,6 +688,9 @@ function scheduleExecutionRender(
         await sleep(delayMs);
       }
     } finally {
+      // The render settled (or gave up): hand the obligation back to the
+      // recovery sweep's jurisdiction (upstream slackbotv2 #522).
+      await renderLease.release?.();
       // Discord delta: reliably release the per-guild execution slot.
       onSettled?.();
     }
@@ -1044,6 +1066,42 @@ async function* streamOpenedSession(
 
 function renderRecoveryLeaseKey(threadId: string): string {
   return `discordbot:render:lease:${threadId}`;
+}
+
+/**
+ * Holds the per-thread render lease for the duration of a live render so the
+ * recovery sweep cannot claim the just-indexed obligation and post a
+ * duplicate answer (it lease-skips instead). The TTL keeps this crash-safe:
+ * if the pod dies mid-render the lease expires and recovery takes over. The
+ * lease is refreshed while the render runs because agent turns routinely
+ * outlive a single TTL window. (Ported from slackbotv2 #522.)
+ */
+async function acquireRenderLease(
+  state: StateAdapter,
+  threadId: string,
+): Promise<() => Promise<void>> {
+  const key = renderRecoveryLeaseKey(threadId);
+  const token = randomUUID();
+  await state.set(key, token, RENDER_RECOVERY_LEASE_TTL_MS);
+  const refresh = setInterval(() => {
+    void state
+      .get<string>(key)
+      .then((current) =>
+        current === token
+          ? state.set(key, token, RENDER_RECOVERY_LEASE_TTL_MS)
+          : undefined,
+      )
+      .catch(() => undefined);
+  }, RENDER_LEASE_REFRESH_INTERVAL_MS);
+  return async () => {
+    clearInterval(refresh);
+    try {
+      const current = await state.get<string>(key);
+      if (current === token) await state.delete(key);
+    } catch {
+      // Best effort: TTL expiry is the backstop.
+    }
+  };
 }
 
 async function renderExecutionStream(

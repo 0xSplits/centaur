@@ -1044,6 +1044,61 @@ describe("discordbot", () => {
     expect(Number(recoveredThreadState?.lastEventId)).toBeGreaterThan(0);
   });
 
+  // Upstream slackbotv2 #522: the recovery sweep raced live renders — the
+  // obligation is indexed before the live render starts, and a sweep pass
+  // landing mid-render claimed it and posted the same answer twice. Live
+  // renders now hold the per-thread recovery lease, so the sweep lease-skips.
+  it("does not duplicate the live render when a recovery sweep scans mid-stream", async () => {
+    const sharedState = createMemoryState();
+    await sharedState.connect();
+    codexApi.autoRespond = false;
+    bot = createTestBot({ state: sharedState });
+
+    const threadId = discordApi.nextId();
+    discordApi.seedThreadChannel(threadId, CHANNEL_ID);
+    const key = threadKey(threadId);
+
+    const mentionId = await dispatchMessage({
+      channelId: threadId,
+      content: `<@${APP_ID}> race the sweep`,
+      mention: true,
+      thread: { id: threadId, parentId: CHANNEL_ID },
+    });
+    await waitFor(() => codexApi.executes.length === 1, 3000);
+    // Hold the live render in-flight: everything except the terminal line.
+    const outputLines = sampleCodexOutputLines(
+      "Single answer despite the sweep.",
+    );
+    codexApi.emitOutputLines(key, outputLines.slice(0, -1));
+    // The events request implies commitExecutionStarted ran: the obligation
+    // is indexed and the live render holds the lease.
+    await waitFor(() => codexApi.eventRequests.length === 1, 3000);
+
+    // A second instance's startup sweep scans the live obligation; it must
+    // lease-skip instead of opening a second renderer.
+    createTestBot({
+      recoverRenderObligationsOnStart: true,
+      state: sharedState,
+    });
+    await sleep(300);
+
+    codexApi.emitOutputLines(key, outputLines.slice(-1));
+    await waitForSettle(threadId, mentionId);
+
+    expect(
+      codexApi.eventRequests.filter((request) => request.threadKey === key),
+    ).toHaveLength(1);
+    expect(
+      answerPostsIn(threadId).filter((text) =>
+        text.includes("Single answer despite the sweep."),
+      ),
+    ).toHaveLength(1);
+    const settledThreadState = await sharedState.get<Record<string, unknown>>(
+      `thread-state:${key}`,
+    );
+    expect(settledThreadState?.renderObligation).toBeNull();
+  });
+
   // Regression (c) — upstream d6953481: per-thread isolation in recovery.
   it("recovers healthy render obligations even when another one is poisoned", async () => {
     const sharedState = createMemoryState();
