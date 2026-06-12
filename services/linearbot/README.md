@@ -12,9 +12,25 @@ manually (there is no shared package); the Rust `api-rs` control plane is unchan
 
 - **Delegating an issue / `@`-mentioning the agent** → Linear creates an **agent session**; the
   webhook's `created` event starts a centaur session keyed `linear:{issueId}:s:{agentSessionId}`.
+  Sessions without a trigger comment (description mentions, bare delegations) and sessions
+  created by automation (e.g. a triage rule delegating the issue — no `creator`) work too; both
+  required adapter patches, see below.
+- **Empty prompts get a synthesized instruction**: a bare delegation has no user-written prompt,
+  so the execute message becomes an explicit "work this issue to the best of your ability"
+  instruction (plus the delegated-ownership contract: status via the sandbox `linear` tool, the
+  `Linear-Status:` marker as backstop, recurring-task continuity hint, no self-delegation).
+- **Delegated issues track progress via workflow status** (mentions never move status — the
+  agent only owns issues *delegated* to it): kicking off work moves Todo/Backlog/Triage → the
+  team's first started state; at the end the agent either moves the issue itself with the
+  `linear` tool or ends its answer with `Linear-Status: done|in_progress|todo`, which is
+  stripped from the posted response and applied by the bot. Best-effort, like narration.
 - **Replies in the session thread** arrive as `prompted` events and execute as follow-up turns on
   the **same** session (the adapter is patched to keep one stable thread key per agent session —
   upstream split every follow-up into a fresh thread).
+- **Plain issue comments** (outside the session's comment thread) are forwarded into the issue's
+  agent sessions as append-only context — no execution — so a delegated agent sees "actually,
+  hold off" posted on the issue. Requires the **Comments** webhook subscription. Bot/agent
+  comments and the session's own thread (which arrives as `prompted`) are skipped.
 - **Issue context first**: the initial turn prepends a synthetic context message built from
   Linear's `promptContext` blob (curated issue details + comments, shipped on every
   AgentSessionEvent webhook), falling back to a subject fetch (identifier, title, state,
@@ -43,7 +59,8 @@ Agent-sessions mode requires an **OAuth `actor=app` install** of a Linear OAuth 
 the `app:assignable` + `app:mentionable` scopes; set the resulting token as
 `LINEAR_ACCESS_TOKEN`. A personal `LINEAR_API_KEY` only supports the degraded
 `LINEARBOT_MODE=comments` (plain issue-comment threads, no agent sessions). Webhook
-subscriptions needed: **Agent session events** (and optionally Comments for comments mode).
+subscriptions needed: **Agent session events** and **Comments** (comments power the
+issue-comment-to-session forwarding; they are also what comments mode consumes).
 
 ## Environment
 
@@ -64,9 +81,18 @@ subscriptions needed: **Agent session events** (and optionally Comments for comm
 
 ## Patched adapter
 
-`patches/@chat-adapter__linear@4.30.0.patch` (registered in `pnpm-workspace.yaml`): agent-session
-messages encode their thread id as `linear:{issueId}:s:{agentSessionId}` regardless of which
-comment triggered them, so one Linear agent session maps to exactly one centaur session.
+`patches/@chat-adapter__linear@4.30.0.patch` (registered in `pnpm-workspace.yaml`), three fixes:
+
+1. Agent-session messages encode their thread id as `linear:{issueId}:s:{agentSessionId}`
+   regardless of which comment triggered them, so one Linear agent session maps to exactly one
+   centaur session.
+2. A `created` event without a root comment (description mention, bare delegation) synthesizes
+   an empty trigger comment instead of dropping the event (which left the session unacknowledged
+   forever).
+3. A `created` event without a creator (automation/triage-rule delegation, or another agent) is
+   attributed to a distinct `linear-automation` identity instead of the bot itself — upstream's
+   self-attribution made the chat SDK skip the message as the bot's own, silently ignoring every
+   automation-created session.
 
 ## Tests
 

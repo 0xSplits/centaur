@@ -140,6 +140,12 @@ export type LinearbotThreadState = {
   historyForwarded?: boolean;
   lastEventId?: number;
   renderObligation?: LinearbotRenderObligation | null;
+  /**
+   * Linear delta: root comment id of the agent session's comment thread.
+   * Comment webhooks matching it (or replying under it) already arrive as
+   * `prompted` events and are skipped by the issue-comment forwarder.
+   */
+  sessionRootCommentId?: string;
 };
 
 export type LinearbotRenderObligation = {
@@ -196,6 +202,22 @@ export type LinearActivityClient = {
 };
 
 export type LinearSessionCapableAdapter = {
-  linearClient?: LinearActivityClient;
+  /** App user id of the bot; the getter throws before initialize. */
+  botUserId?: string;
+  linearClient?: LinearActivityClient & LinearRawRequestClient;
   startTyping?(threadId: string, status?: string): Promise<void>;
+};
+
+/**
+ * Raw GraphQL escape hatch on the Linear SDK client, used by the issue-status
+ * plumbing (linear-status.ts) — the typed SDK surface differs across versions
+ * for agent-era fields like `delegate`.
+ */
+export type LinearRawRequestClient = {
+  client?: {
+    rawRequest<Data>(
+      query: string,
+      variables?: Record<string, unknown>,
+    ): Promise<{ data?: Data | null }>;
+  };
 };

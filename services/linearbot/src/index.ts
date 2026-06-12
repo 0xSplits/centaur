@@ -17,8 +17,29 @@ import {
 } from "chat";
 import { Hono, type Context } from "hono";
 import pg from "pg";
-import { buildLinearContextMessage } from "./linear-context";
+import {
+  issueSessionsKey,
+  isSessionThreadComment,
+  parseIssueCommentWebhook,
+  type IssueCommentEvent,
+} from "./issue-comments";
+import {
+  buildLinearContextMessage,
+  EMPTY_PROMPT_INSTRUCTION,
+} from "./linear-context";
 import { ackWorking, LinearNarrator } from "./linear-narrator";
+import {
+  extractStatusMarker,
+  fetchIssueStatus,
+  kickoffTargetState,
+  markerTargetState,
+  statusTraceFields,
+  updateIssueState,
+  type LinearIssueStatus,
+  type LinearStatusMarker,
+  type LinearWorkflowState,
+} from "./linear-status";
+import { parseLinearThreadKey } from "./linear-threading";
 import { extractMessageOverrides } from "./overrides";
 import {
   collectInitialContext,
@@ -41,8 +62,17 @@ import type {
   LinearbotRendererSource,
   LinearbotThreadState,
   LinearbotTrace,
+  LinearSessionCapableAdapter,
 } from "./types";
-import { elapsedMs, errorMessage, noopLogger, nowMs, traceLog } from "./utils";
+import {
+  elapsedMs,
+  errorMessage,
+  isJsonObject,
+  noopLogger,
+  nowMs,
+  stringValue,
+  traceLog,
+} from "./utils";
 
 export type {
   Linearbot,
@@ -71,6 +101,9 @@ type LinearbotRequestContext = {
 const requestContext = new AsyncLocalStorage<LinearbotRequestContext>();
 const RENDER_OBLIGATION_INDEX_KEY = "linearbot:render:index";
 const RENDER_OBLIGATION_INDEX_MAX_LENGTH = 2000;
+// Linear delta: agent-session threads per issue, for routing plain issue
+// comments into the session as context. Issues rarely host many sessions.
+const SESSION_INDEX_MAX_LENGTH = 100;
 const RENDER_INDEX_TTL_MS = 30 * 24 * 60 * 60 * 1000;
 const RENDER_RECOVERY_LEASE_TTL_MS = 2 * 60 * 1000;
 const RENDER_RECOVERY_THREAD_TIMEOUT_MS = 2 * 60 * 1000;
@@ -123,10 +156,21 @@ export function createLinearbot(options: LinearbotOptions): Linearbot {
   });
 
   chat.onNewMention(async (thread, message) => {
+    // Defense-in-depth (the chat SDK already drops isMe at intake): the
+    // agent can create comments and delegate issues itself via the sandbox
+    // linear tool, and its own activity must never start an execution.
+    if (message.author.isMe) {
+      traceLog(options, "linearbot_self_message_skipped", undefined, {
+        message_id: message.id,
+        thread_id: thread.id,
+      });
+      return;
+    }
     // Linear requires a thought within 10s of the session starting; fire the
     // ephemeral working ack before any session-api work.
     ackWorking(thread, logger);
     await thread.subscribe();
+    await recordSessionThread(state, thread, message, options);
     await syncThreadMessageToSession(thread, message, {
       mode: "execute",
       options,
@@ -135,8 +179,16 @@ export function createLinearbot(options: LinearbotOptions): Linearbot {
   });
 
   chat.onSubscribedMessage(async (thread, message) => {
+    if (message.author.isMe) {
+      traceLog(options, "linearbot_self_message_skipped", undefined, {
+        message_id: message.id,
+        thread_id: thread.id,
+      });
+      return;
+    }
     const mode = message.isMention === true ? "execute" : "append";
     if (mode === "execute") ackWorking(thread, logger);
+    await recordSessionThread(state, thread, message, options);
     await syncThreadMessageToSession(thread, message, {
       mode,
       options,
@@ -166,6 +218,16 @@ export function createLinearbot(options: LinearbotOptions): Linearbot {
       });
     });
     if (awaitHandoff && response.ok) {
+      // Linear delta: plain issue comments (outside any session thread) are
+      // invisible to agent sessions — the adapter ignores Comment webhooks in
+      // agent-sessions mode. Route them into the issue's known session
+      // threads as append-only context. Runs inside the request context so a
+      // retryable session-api failure 503s for redelivery, and only after the
+      // adapter accepted the delivery (signature verified).
+      const commentForward = requestContext.run(context, () =>
+        forwardIssueCommentToSessions(rawBody, { chat, options, state }),
+      );
+      if (commentForward) handoffTasks.push(commentForward);
       try {
         await Promise.all(handoffTasks);
       } catch (error) {
@@ -308,6 +370,17 @@ async function syncThreadMessageToSession(
   const serializedMessage = await serializeMessage(message);
   const overrides = extractMessageOverrides(serializedMessage.text);
   serializedMessage.text = overrides.cleanedText;
+  // Linear delta: a pure delegation (or description mention) has no prompt
+  // text at all; synthesize the work-this-issue instruction instead of
+  // executing an empty message (see EMPTY_PROMPT_INSTRUCTION).
+  if (
+    input.mode === "execute" &&
+    !serializedMessage.text.trim() &&
+    serializedMessage.attachments.length === 0
+  ) {
+    serializedMessage.text = EMPTY_PROMPT_INSTRUCTION;
+    traceLog(input.options, "linearbot_empty_prompt_instruction", trace);
+  }
   if (overrides.harnessType || overrides.model) {
     traceLog(input.options, "linearbot_forward_overrides_parsed", trace, {
       harness_type: overrides.harnessType,
@@ -442,6 +515,13 @@ async function syncThreadMessageToSession(
       activeExecutionStartedAt: Date.now(),
     });
     traceLog(input.options, "linearbot_forward_active_execution_marked", trace);
+    // Linear delta: kicking off work on an issue DELEGATED to the agent moves
+    // it to the team's first started state ("In Progress"). Fire-and-forget —
+    // mention-only sessions are filtered inside (the agent only owns issues
+    // delegated to it), and failures never affect the run.
+    backgroundWaitUntil(
+      updateDelegatedIssueStatusOnKickoff(thread, input.options, trace),
+    );
     // Create + append the session messages only (fast). The execute call
     // blocks on cold sandbox spin-up, so it runs inside the render stream
     // below — after the working ack landed — instead of before the webhook
@@ -549,6 +629,222 @@ export function hasLiveActiveExecution(
   if (state.activeExecution !== true) return false;
   if (typeof state.activeExecutionStartedAt !== "number") return false;
   return nowEpochMs - state.activeExecutionStartedAt <= ttlMs;
+}
+
+/**
+ * Records an agent-session thread on its issue's session index (used to route
+ * plain issue comments into the session) and pins the session's root comment
+ * id for prompted-event dedupe. Best-effort: indexing must not fail the turn.
+ */
+async function recordSessionThread(
+  state: StateAdapter,
+  thread: Thread<LinearbotThreadState>,
+  message: ChatMessage,
+  options: LinearbotOptions,
+): Promise<void> {
+  try {
+    const { issueId, agentSessionId } = parseLinearThreadKey(thread.id);
+    if (!issueId || !agentSessionId) return;
+    const threadState = (await thread.state) ?? {};
+    const rootCommentId = sessionRootCommentIdFromMessage(message);
+    if (threadState.sessionRootCommentId === rootCommentId) return;
+    if (!threadState.sessionRootCommentId) {
+      await state.appendToList(issueSessionsKey(issueId), thread.id, {
+        maxLength: SESSION_INDEX_MAX_LENGTH,
+        ttlMs: RENDER_INDEX_TTL_MS,
+      });
+      await thread.setState({ sessionRootCommentId: rootCommentId });
+      return;
+    }
+    // A comment-less created event (description mention / bare delegation)
+    // pinned a synthetic root; upgrade it once a prompted message reveals the
+    // real comment thread Linear created for the session.
+    if (threadState.sessionRootCommentId.startsWith("agent-session-")) {
+      await thread.setState({ sessionRootCommentId: rootCommentId });
+    }
+  } catch (error) {
+    traceLog(options, "linearbot_session_index_failed", undefined, {
+      error: errorMessage(error),
+      thread_id: thread.id,
+    });
+  }
+}
+
+/**
+ * Root comment id of the session's comment thread: the triggering comment's
+ * parent when the message is a reply (prompted events), else the comment
+ * itself (the created event's root comment).
+ */
+function sessionRootCommentIdFromMessage(message: ChatMessage): string {
+  const raw = message.raw;
+  if (isJsonObject(raw) && raw.kind === "agent_session_comment") {
+    const comment = raw.comment;
+    if (isJsonObject(comment)) {
+      const rootId = stringValue(comment.parentId) ?? stringValue(comment.id);
+      if (rootId) return rootId;
+    }
+  }
+  return message.id;
+}
+
+/**
+ * Routes a plain issue comment (outside any agent-session comment thread)
+ * into every known session thread on the issue as append-only context — no
+ * execution, exactly like a non-mention subscribed message. Returns null when
+ * the webhook is not a forwardable comment event. Retryable session-api
+ * failures propagate so the webhook answers 503 and Linear redelivers;
+ * forwardedMessageIds dedupes the replay.
+ */
+function forwardIssueCommentToSessions(
+  rawBody: string,
+  input: {
+    chat: Chat<Record<string, Adapter>, LinearbotThreadState>;
+    options: LinearbotOptions;
+    state: StateAdapter;
+  },
+): Promise<void> | null {
+  const event = parseIssueCommentWebhook(rawBody);
+  if (!event) return null;
+  return (async () => {
+    const indexedThreadIds = await input.state.getList<string>(
+      issueSessionsKey(event.issueId),
+    );
+    const threadIds = Array.from(new Set(indexedThreadIds));
+    for (const threadId of threadIds) {
+      const thread = input.chat.thread(threadId);
+      const threadState = (await thread.state) ?? {};
+      if (isSessionThreadComment(event, threadState.sessionRootCommentId)) {
+        continue;
+      }
+      traceLog(input.options, "linearbot_issue_comment_forwarded", undefined, {
+        comment_id: event.commentId,
+        thread_id: threadId,
+      });
+      await syncThreadMessageToSession(
+        thread,
+        issueCommentMessage(event, threadId),
+        { mode: "append", options: input.options, state: input.state },
+      );
+    }
+  })();
+}
+
+/**
+ * Minimal ChatMessage-shaped value for an issue comment; serializeMessage
+ * only reads these fields, so the chat SDK Message class is not needed.
+ */
+function issueCommentMessage(
+  event: IssueCommentEvent,
+  threadId: string,
+): ChatMessage {
+  return {
+    attachments: [],
+    author: {
+      fullName: event.authorName,
+      isBot: false,
+      isMe: false,
+      userId: event.authorId,
+      userName: event.authorName,
+    },
+    id: event.commentId,
+    isMention: false,
+    metadata: {
+      dateSent: event.createdAt ? new Date(event.createdAt) : new Date(),
+    },
+    raw: { linearbotIssueComment: true, url: event.url },
+    text: event.body,
+    threadId,
+  } as unknown as ChatMessage;
+}
+
+/**
+ * Linear delta: when the agent kicks off work on an issue DELEGATED to it,
+ * move the issue out of Todo/Backlog/Triage into the team's first started
+ * state. Never throws — status mutation is cosmetic, like narration.
+ */
+async function updateDelegatedIssueStatusOnKickoff(
+  thread: Thread<LinearbotThreadState>,
+  options: LinearbotOptions,
+  trace?: LinearbotTrace,
+): Promise<void> {
+  try {
+    const target = await delegatedStatusTarget(thread, kickoffTargetState);
+    if (!target) return;
+    await updateIssueState(target.client, target.issueId, target.state.id);
+    traceLog(
+      options,
+      "linearbot_issue_kickoff_state_updated",
+      trace,
+      statusTraceFields(target.issueId, target.state),
+    );
+  } catch (error) {
+    traceLog(options, "linearbot_issue_kickoff_state_failed", trace, {
+      error: errorMessage(error),
+    });
+  }
+}
+
+/**
+ * Applies the agent's terminal `Linear-Status: …` marker to the delegated
+ * issue (backstop for when the agent could not move it via the sandbox
+ * linear tool). Never throws.
+ */
+async function applyTerminalStatusMarker(
+  thread: Thread,
+  marker: LinearStatusMarker,
+  options: LinearbotOptions,
+  trace?: LinearbotTrace,
+): Promise<void> {
+  try {
+    const target = await delegatedStatusTarget(thread, (status) =>
+      markerTargetState(status, marker),
+    );
+    if (!target) return;
+    await updateIssueState(target.client, target.issueId, target.state.id);
+    traceLog(options, "linearbot_issue_marker_state_updated", trace, {
+      status_marker: marker,
+      ...statusTraceFields(target.issueId, target.state),
+    });
+  } catch (error) {
+    traceLog(options, "linearbot_issue_marker_state_failed", trace, {
+      error: errorMessage(error),
+      status_marker: marker,
+    });
+  }
+}
+
+/**
+ * Resolves the issue-status move for this thread, or null when no move should
+ * happen: not an agent-session thread, no usable Linear client, the issue is
+ * NOT delegated to the bot (mentions never move status), or the picker
+ * declines (already in the right state).
+ */
+async function delegatedStatusTarget(
+  thread: Thread,
+  pick: (status: LinearIssueStatus) => LinearWorkflowState | undefined,
+): Promise<{
+  client: NonNullable<LinearSessionCapableAdapter["linearClient"]>;
+  issueId: string;
+  state: LinearWorkflowState;
+} | null> {
+  const { issueId, agentSessionId } = parseLinearThreadKey(thread.id);
+  if (!issueId || !agentSessionId) return null;
+  const adapter = thread.adapter as unknown as LinearSessionCapableAdapter;
+  const client = adapter.linearClient;
+  if (!client?.client?.rawRequest) return null;
+  let botUserId: string | undefined;
+  try {
+    botUserId = adapter.botUserId;
+  } catch {
+    // The getter throws before the adapter is initialized.
+    return null;
+  }
+  if (!botUserId) return null;
+  const status = await fetchIssueStatus(client, issueId);
+  if (!status || status.delegateId !== botUserId) return null;
+  const state = pick(status);
+  if (!state) return null;
+  return { client, issueId, state };
 }
 
 function scheduleExecutionRender(
@@ -1009,17 +1305,29 @@ async function renderExecutionStream(
   });
   try {
     const finalText = await collectActivityStream(stream, options, narrator);
+    let marker: LinearStatusMarker | undefined;
     if (narrator.failed) {
       await narrator.finish("failed", finalText);
     } else {
+      // Linear delta: the agent can signal the delegated issue's terminal
+      // status with a `Linear-Status: …` line; strip it from the posted
+      // answer and apply it as a backstop after the response lands.
+      const extracted = extractStatusMarker(finalText);
+      marker = extracted.marker;
       // Flush remaining thoughts before the response so the timeline reads
       // in order; the response activity is what settles the session.
       await narrator.finish("done");
-      await thread.post(finalText);
+      await thread.post(extracted.text.trim() ? extracted.text : finalText);
+      if (marker) {
+        backgroundWaitUntil(
+          applyTerminalStatusMarker(thread, marker, options, trace),
+        );
+      }
     }
     traceLog(options, "linearbot_render_final", trace, {
       chars: finalText.length,
       failed: narrator.failed,
+      ...(marker ? { status_marker: marker } : {}),
     });
   } catch (error) {
     await narrator.finish(

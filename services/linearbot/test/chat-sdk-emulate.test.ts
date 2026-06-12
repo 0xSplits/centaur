@@ -196,6 +196,10 @@ describe("linearbot chat-sdk pipeline", () => {
         linearApi.activities.filter((a) => a.content.type === "response")
           .length >= 2,
     );
+
+    // Mention sessions never move issue status: the issue is not delegated
+    // to the agent, so it has no ownership of it.
+    expect(linearApi.issueStateUpdates).toHaveLength(0);
   });
 
   it("renders a failed execution as a terminal error activity, not a response", async () => {
@@ -275,6 +279,143 @@ describe("linearbot chat-sdk pipeline", () => {
     await Bun.sleep(50);
     expect(codexApi.creates).toHaveLength(0);
   });
+
+  it("ignores agent sessions created by the bot itself (loop guard)", async () => {
+    const response = await postWebhook(
+      agentSessionCreatedPayload({
+        sessionId: "sess-self",
+        commentId: "comment-self",
+        commentBody: "do the thing",
+        promptContext: "x",
+        creatorId: BOT_USER_ID,
+      }),
+    );
+    expect(response.status).toBe(200);
+    await Bun.sleep(50);
+    expect(codexApi.creates).toHaveLength(0);
+  });
+
+  // A comment-less, creator-less created event is what a bare delegation (or
+  // a description mention / triage automation) produces. Upstream dropped the
+  // event entirely (missing comment) or attributed it to the bot itself
+  // (missing creator → skipped as a self-message) — both adapter patches
+  // under test here. The empty prompt synthesizes the work instruction, the
+  // delegated issue moves to In Progress on kickoff, and the agent's terminal
+  // `Linear-Status:` marker is stripped from the answer and applied.
+  it("runs a bare delegation end-to-end: instruction, kickoff status, terminal marker", async () => {
+    const sessionId = "sess-delegated";
+    const threadKey = `linear:${ISSUE_ID}:s:${sessionId}`;
+    linearApi.addAgentSession({ id: sessionId });
+    linearApi.setIssueDelegate(BOT_USER_ID);
+
+    const response = await postWebhook(
+      agentSessionCreatedPayload({
+        sessionId,
+        creatorId: null,
+        promptContext: "ENG-9: Weekly report\n\nCompile the weekly report.",
+      }),
+    );
+    expect(response.status).toBe(200);
+
+    await waitFor(() => codexApi.executes.length >= 1);
+    const inputLine = JSON.parse(
+      codexApi.executes[0]!.body.input_lines[0]!,
+    ) as { message: { content: Array<{ text?: string }> } };
+    expect(inputLine.message.content[0]?.text).toContain(
+      "work the task to the best of your ability",
+    );
+    expect(inputLine.message.content[0]?.text).toContain("Linear-Status:");
+    const contextTexts = appendedTexts();
+    expect(contextTexts[0]).toContain("[Linear issue context]");
+    expect(contextTexts[0]).toContain("Compile the weekly report.");
+
+    // The working ack still lands without a root comment.
+    await waitFor(() => linearApi.activities.length >= 1);
+    expect(linearApi.activities[0]?.content.type).toBe("thought");
+
+    // Kickoff moves the delegated issue Todo -> In Progress.
+    await waitFor(() => linearApi.issueStateUpdates.length >= 1);
+    expect(linearApi.issueStateUpdates[0]).toEqual({
+      issueId: ISSUE_ID,
+      stateId: "st-progress",
+    });
+
+    // Terminal marker is stripped from the response and applied as Done.
+    codexApi.emitOutputLines(
+      threadKey,
+      sampleCodexOutputLines("Report compiled.\n\nLinear-Status: done"),
+    );
+    await waitFor(() =>
+      linearApi.activities.some((a) => a.content.type === "response"),
+    );
+    const responseActivity = linearApi.activities.find(
+      (a) => a.content.type === "response",
+    );
+    expect(
+      responseActivity?.content.type === "response"
+        ? responseActivity.content.body
+        : "",
+    ).toBe("Report compiled.");
+    await waitFor(() => linearApi.issueStateUpdates.length >= 2);
+    expect(linearApi.issueStateUpdates[1]).toEqual({
+      issueId: ISSUE_ID,
+      stateId: "st-done",
+    });
+  });
+
+  it("forwards plain issue comments into the session as context, skipping session-thread replies", async () => {
+    const sessionId = "sess-comments";
+    const rootCommentId = linearApi.addUserComment({
+      body: "@centaur investigate",
+    });
+    linearApi.addAgentSession({ id: sessionId, rootCommentId });
+
+    const created = await postWebhook(
+      agentSessionCreatedPayload({
+        sessionId,
+        commentId: rootCommentId,
+        commentBody: "@centaur investigate",
+        promptContext: "ENG-5: Investigate",
+      }),
+    );
+    expect(created.status).toBe(200);
+    await waitFor(() => codexApi.executes.length >= 1);
+    const executesBefore = codexApi.executes.length;
+
+    // A plain comment elsewhere on the issue lands in the session as
+    // append-only context (no execution).
+    const outOfBand = await postWebhook(
+      commentCreatedPayload({ id: "comment-oob", body: "actually, hold off" }),
+    );
+    expect(outOfBand.status).toBe(200);
+    await waitFor(() => appendedTexts().includes("actually, hold off"));
+    expect(codexApi.executes.length).toBe(executesBefore);
+
+    // Replies inside the session's own comment thread arrive as prompted
+    // events; the comment path must not forward them again.
+    const inThread = await postWebhook(
+      commentCreatedPayload({
+        id: "comment-inthread",
+        body: "in-thread reply",
+        parentId: rootCommentId,
+      }),
+    );
+    expect(inThread.status).toBe(200);
+    await Bun.sleep(100);
+    expect(appendedTexts()).not.toContain("in-thread reply");
+
+    // Bot/agent comments (no user) are never forwarded.
+    const botComment = await postWebhook(
+      commentCreatedPayload({
+        id: "comment-bot",
+        body: "agent response echo",
+        user: null,
+      }),
+    );
+    expect(botComment.status).toBe(200);
+    await Bun.sleep(100);
+    expect(appendedTexts()).not.toContain("agent response echo");
+  });
 });
 
 // ---------------------------------------------------------------------------
@@ -283,8 +424,10 @@ describe("linearbot chat-sdk pipeline", () => {
 
 function agentSessionCreatedPayload(input: {
   appUserId?: string;
-  commentBody: string;
-  commentId: string;
+  commentBody?: string;
+  commentId?: string;
+  /** Creator user id; null omits the creator (automation-created session). */
+  creatorId?: string | null;
   promptContext: string;
   sessionId: string;
 }) {
@@ -301,14 +444,56 @@ function agentSessionCreatedPayload(input: {
       appUserId: input.appUserId ?? BOT_USER_ID,
       issueId: ISSUE_ID,
       url: `https://linear.app/acme/agent-session/${input.sessionId}`,
-      comment: { id: input.commentId, body: input.commentBody },
-      creator: {
-        id: USER_ID,
-        name: "Ada Lovelace",
-        email: "ada@example.com",
-        url: "https://linear.app/acme/profiles/ada",
-        avatarUrl: null,
-      },
+      ...(input.commentId
+        ? { comment: { id: input.commentId, body: input.commentBody ?? "" } }
+        : {}),
+      ...(input.creatorId === null
+        ? {}
+        : {
+            creator: {
+              id: input.creatorId ?? USER_ID,
+              name: "Ada Lovelace",
+              email: "ada@example.com",
+              url: "https://linear.app/acme/profiles/ada",
+              avatarUrl: null,
+            },
+          }),
+    },
+  };
+}
+
+function commentCreatedPayload(input: {
+  body: string;
+  id: string;
+  parentId?: string;
+  user?: null;
+}) {
+  return {
+    action: "create",
+    type: "Comment",
+    createdAt: new Date().toISOString(),
+    organizationId: ORG_ID,
+    webhookTimestamp: Date.now(),
+    webhookId: "wh-3",
+    url: `https://linear.app/acme/comment/${input.id}`,
+    data: {
+      id: input.id,
+      body: input.body,
+      issueId: ISSUE_ID,
+      parentId: input.parentId,
+      createdAt: new Date().toISOString(),
+      updatedAt: new Date().toISOString(),
+      ...(input.user === null
+        ? {}
+        : {
+            user: {
+              id: USER_ID,
+              name: "Ada Lovelace",
+              email: "ada@example.com",
+              url: "https://linear.app/acme/profiles/ada",
+              avatarUrl: null,
+            },
+          }),
     },
   };
 }
@@ -532,19 +717,31 @@ type FakeComment = {
 
 type FakeLinearApi = {
   activities: RecordedActivity[];
-  addAgentSession(input: { id: string; rootCommentId: string }): void;
+  addAgentSession(input: { id: string; rootCommentId?: string }): void;
   addUserComment(input: { body: string; parentId?: string }): string;
   close(): void;
+  issueStateUpdates: Array<{ issueId: string; stateId: string }>;
   reset(): void;
+  setIssueDelegate(userId: string | null): void;
   unhandledOperations: string[];
   url: string;
 };
 
+const WORKFLOW_STATES = [
+  { id: "st-triage", name: "Triage", position: 0, type: "triage" },
+  { id: "st-todo", name: "Todo", position: 1, type: "unstarted" },
+  { id: "st-progress", name: "In Progress", position: 2, type: "started" },
+  { id: "st-done", name: "Done", position: 3, type: "completed" },
+];
+
 function startFakeLinearApi(): FakeLinearApi {
   const activities: RecordedActivity[] = [];
   const comments = new Map<string, FakeComment>();
-  const sessions = new Map<string, { id: string; rootCommentId: string }>();
+  const sessions = new Map<string, { id: string; rootCommentId?: string }>();
   const unhandledOperations: string[] = [];
+  const issueStateUpdates: Array<{ issueId: string; stateId: string }> = [];
+  let issueDelegateId: string | null = null;
+  let issueStateId = "st-todo";
   let idCounter = 0;
   const nextId = (prefix: string) => `${prefix}-${++idCounter}`;
 
@@ -583,6 +780,28 @@ function startFakeLinearApi(): FakeLinearApi {
   });
 
   const handle = (query: string, variables: Record<string, unknown>) => {
+    if (query.includes("LinearbotIssueStatus")) {
+      const currentState = WORKFLOW_STATES.find(
+        (state) => state.id === issueStateId,
+      );
+      return {
+        issue: {
+          id: String(variables.issueId ?? ISSUE_ID),
+          delegate: issueDelegateId ? { id: issueDelegateId } : null,
+          state: currentState
+            ? { id: currentState.id, type: currentState.type }
+            : null,
+          team: { states: { nodes: WORKFLOW_STATES } },
+        },
+      };
+    }
+    if (query.includes("LinearbotIssueStateUpdate")) {
+      const issueId = String(variables.issueId ?? "");
+      const stateId = String(variables.stateId ?? "");
+      issueStateUpdates.push({ issueId, stateId });
+      issueStateId = stateId;
+      return { issueUpdate: { success: true } };
+    }
     if (query.includes("LinearAdapterViewerOrganization")) {
       return {
         viewer: {
@@ -680,7 +899,7 @@ function startFakeLinearApi(): FakeLinearApi {
           context: null,
           status: "active",
           appUser: { id: BOT_USER_ID },
-          comment: { id: session.rootCommentId },
+          comment: session.rootCommentId ? { id: session.rootCommentId } : null,
           creator: { id: USER_ID },
           issue: { id: ISSUE_ID },
         },
@@ -738,8 +957,12 @@ function startFakeLinearApi(): FakeLinearApi {
 
   return {
     activities,
+    issueStateUpdates,
     unhandledOperations,
     url: `http://127.0.0.1:${server.port}/graphql`,
+    setIssueDelegate(userId) {
+      issueDelegateId = userId;
+    },
     addUserComment(input) {
       const id = nextId("comment");
       comments.set(id, {
@@ -761,6 +984,9 @@ function startFakeLinearApi(): FakeLinearApi {
       comments.clear();
       sessions.clear();
       unhandledOperations.length = 0;
+      issueStateUpdates.length = 0;
+      issueDelegateId = null;
+      issueStateId = "st-todo";
       idCounter = 0;
     },
   };

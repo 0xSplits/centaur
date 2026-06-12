@@ -6,7 +6,7 @@ settings:
 
 patchedDependencies:
   '@chat-adapter/linear@4.30.0':
-    hash: 1f6c698c1254d14a8dea29e342b95ed5330a7b8fd7e24c144194c7d9cb20468b
+    hash: fce7a692b030cfe3d325b020a4472b9424b8976aa2f7faded6ad4c83421e9132
     path: patches/@chat-adapter__linear@4.30.0.patch
   '@chat-adapter/slack@4.30.0':
     hash: 3969edeaa8632fe39c4f2a10d6c3505e86aa4eb1cb970fb86eacca4f5deea5ca
@@ -73,7 +73,7 @@ importers:
         version: link:../../packages/rendering
       '@chat-adapter/linear':
         specifier: ^4.30.0
-        version: 4.30.0(patch_hash=1f6c698c1254d14a8dea29e342b95ed5330a7b8fd7e24c144194c7d9cb20468b)(graphql@16.14.2)(zod@4.4.3)
+        version: 4.30.0(patch_hash=fce7a692b030cfe3d325b020a4472b9424b8976aa2f7faded6ad4c83421e9132)(graphql@16.14.2)(zod@4.4.3)
       '@chat-adapter/state-pg':
         specifier: ^4.30.0
         version: 4.30.0(zod@4.4.3)
@@ -1617,7 +1617,7 @@ packages:
 
 snapshots:
 
-  '@chat-adapter/linear@4.30.0(patch_hash=1f6c698c1254d14a8dea29e342b95ed5330a7b8fd7e24c144194c7d9cb20468b)(graphql@16.14.2)(zod@4.4.3)':
+  '@chat-adapter/linear@4.30.0(patch_hash=fce7a692b030cfe3d325b020a4472b9424b8976aa2f7faded6ad4c83421e9132)(graphql@16.14.2)(zod@4.4.3)':
     dependencies:
       '@chat-adapter/shared': 4.30.0(zod@4.4.3)
       '@linear/sdk': 76.0.0(graphql@16.14.2)

@@ -15,6 +15,26 @@ import { errorMessage, isJsonObject, stringValue } from "./utils";
 
 const CONTEXT_MAX_CHARS = 100_000;
 
+// Linear delta: a pure delegation (or a description mention) starts a session
+// with NO user-written prompt — the trigger comment body is empty. Without
+// this, the empty execute message degrades to "" in the stored session and
+// the literal "continue" on the codex input path. Synthesize an explicit
+// instruction instead: the prepended issue context plus the overlay's system
+// prompt are assumed sufficient to execute in some capacity. The instruction
+// also makes the delegated-ownership contract explicit (status via the
+// sandbox `linear` tool, with the `Linear-Status:` marker as the backstop the
+// bot applies — see linear-status.ts).
+export const EMPTY_PROMPT_INSTRUCTION = [
+  "You have been delegated this Linear issue without additional instructions.",
+  "Review the issue context above and work the task to the best of your ability.",
+  "",
+  "You own this issue while it is delegated to you:",
+  '- The issue is moved to "In Progress" automatically when you start. When you finish, use the `linear` CLI tool (if available) to move it to "Done" if the work is complete, or back to "Todo" if you could not make progress.',
+  "- If you cannot update the issue with the tool, end your final answer with the line `Linear-Status: done`, `Linear-Status: todo`, or `Linear-Status: in_progress` and it will be applied for you.",
+  "- If this looks like a recurring task, previous instances likely exist as other Linear issues; look them up with the `linear` tool for context and continuity.",
+  "- Never delegate issues to yourself or mention yourself in comments.",
+].join("\n");
+
 /**
  * Builds the synthetic "issue context" message prepended to the initial
  * session context. Returns null when no context could be derived; never
