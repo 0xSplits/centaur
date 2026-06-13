@@ -52,6 +52,13 @@ spec:
         - podSelector:
             matchLabels:
 {{ include "centaur.componentSelectorLabels" (dict "root" . "component" "api-rs") | nindent 14 }}
+        # Python workflow-host sandboxes connect to Postgres directly via
+        # DATABASE_URL (the host process, not its tool calls, which go through
+        # the per-sandbox iron-proxy). api-rs labels them
+        # centaur.ai/component=workflow-run.
+        - podSelector:
+            matchLabels:
+              centaur.ai/component: workflow-run
 {{- end }}
 {{- if .Values.slackbotv2.enabled }}
         - podSelector:
@@ -81,6 +88,40 @@ spec:
 ---
 {{- end }}
 {{- if .Values.apiRs.enabled }}
+# Python workflow-host sandboxes (centaur.ai/component=workflow-run) are spawned
+# by api-rs, so the per-sandbox egress policy api-rs renders already covers their
+# proxy, the control plane, and DNS. The host process additionally talks to
+# Postgres directly (DATABASE_URL) and may make direct outbound HTTPS calls
+# (mirroring api-rs), neither of which the per-sandbox policy grants -- without
+# this the host fails to start with ECONNREFUSED to Postgres under any enforcing
+# CNI (the default-deny denies all egress).
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ include "centaur.fullname" . }}-workflow-run
+  labels:
+{{ include "centaur.labels" . | nindent 4 }}
+spec:
+  podSelector:
+    matchLabels:
+      centaur.ai/component: workflow-run
+  policyTypes:
+    - Egress
+  egress:
+{{- if .Values.postgres.enabled }}
+    - to:
+        - podSelector:
+            matchLabels:
+{{ include "centaur.componentSelectorLabels" (dict "root" . "component" "postgres") | nindent 14 }}
+      ports:
+        - protocol: TCP
+          port: 5432
+{{- end }}
+    # Trusted workflow code may make direct outbound HTTPS calls (mirrors api-rs).
+    - ports:
+        - protocol: TCP
+          port: 443
+---
 apiVersion: networking.k8s.io/v1
 kind: NetworkPolicy
 metadata:
