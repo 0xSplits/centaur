@@ -789,7 +789,10 @@ impl SandboxArgs {
         // does (see ToolGitSource::from_config). Without this only the base
         // repo's workflows load, and lanes shipped via an overlay extra_source
         // (e.g. an org's webhook/schedule workflows) silently 404.
-        let mut dirs = vec![format!("{SANDBOX_REPOS_MOUNT_PATH}/{}/workflows", config.repo)];
+        let mut dirs = vec![format!(
+            "{SANDBOX_REPOS_MOUNT_PATH}/{}/workflows",
+            config.repo
+        )];
         dirs.extend(
             config
                 .extra_sources
@@ -1944,7 +1947,10 @@ mod tests {
         ])
         .unwrap();
 
-        assert_eq!(args.sandbox.agent_k8s_workflow_dirs(), "/opt/centaur/workflows");
+        assert_eq!(
+            args.sandbox.agent_k8s_workflow_dirs(),
+            "/opt/centaur/workflows"
+        );
     }
 
     #[test]
