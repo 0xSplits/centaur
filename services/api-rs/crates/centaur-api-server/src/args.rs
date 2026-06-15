@@ -779,10 +779,24 @@ impl SandboxArgs {
     }
 
     fn agent_k8s_workflow_dirs(&self) -> String {
-        if let Some(repo) = clean_optional_value(self.tools_source.repo.as_deref()) {
-            return format!("{SANDBOX_REPOS_MOUNT_PATH}/{repo}/workflows");
-        }
-        "/opt/centaur/workflows".to_owned()
+        let Some(config) = self.tools_source.to_config() else {
+            return "/opt/centaur/workflows".to_owned();
+        };
+        // The base tools repo and every `extra_sources` entry each ship a
+        // `workflows/` tree at the repo root (sibling of the tools subdir). The
+        // workflow host must discover all of them, so emit a colon-separated
+        // path that fans out across extra sources exactly like tool discovery
+        // does (see ToolGitSource::from_config). Without this only the base
+        // repo's workflows load, and lanes shipped via an overlay extra_source
+        // (e.g. an org's webhook/schedule workflows) silently 404.
+        let mut dirs = vec![format!("{SANDBOX_REPOS_MOUNT_PATH}/{}/workflows", config.repo)];
+        dirs.extend(
+            config
+                .extra_sources
+                .iter()
+                .map(|source| format!("{SANDBOX_REPOS_MOUNT_PATH}/{}/workflows", source.repo)),
+        );
+        dirs.join(":")
     }
 
     fn default_workflow_host_path(&self) -> String {
@@ -1886,6 +1900,51 @@ mod tests {
         let token = tools.github_token.expect("token should be Some");
         assert_eq!(token.secret_name, "centaur-repo-cache-github-token");
         assert_eq!(token.secret_key, "token");
+    }
+
+    #[test]
+    fn agent_k8s_workflow_dirs_fan_out_across_extra_sources() {
+        let args = Args::try_parse_from([
+            "centaur-api-server",
+            "--database-url",
+            "postgres://postgres:postgres@localhost/centaur",
+            "--session-sandbox-backend",
+            "agent-k8s",
+            "--kubernetes-sandbox-iron-proxy-mode",
+            "disabled",
+            "--kubernetes-tools-repo",
+            "paradigmxyz/centaur",
+            "--kubernetes-tools-runner-image",
+            "centaur-agent:test",
+            "--kubernetes-tools-extra-sources",
+            r#"[{"repo":"acme/overlay"},{"repo":"acme/other","subdir":"packages/tools"}]"#,
+        ])
+        .unwrap();
+
+        // Every source contributes its repo-root `workflows/` tree, base first,
+        // colon-joined. The tools `subdir` does not affect the workflows path.
+        assert_eq!(
+            args.sandbox.agent_k8s_workflow_dirs(),
+            "/home/agent/github/paradigmxyz/centaur/workflows:\
+             /home/agent/github/acme/overlay/workflows:\
+             /home/agent/github/acme/other/workflows",
+        );
+    }
+
+    #[test]
+    fn agent_k8s_workflow_dirs_falls_back_when_tools_disabled() {
+        let args = Args::try_parse_from([
+            "centaur-api-server",
+            "--database-url",
+            "postgres://postgres:postgres@localhost/centaur",
+            "--session-sandbox-backend",
+            "agent-k8s",
+            "--kubernetes-sandbox-iron-proxy-mode",
+            "disabled",
+        ])
+        .unwrap();
+
+        assert_eq!(args.sandbox.agent_k8s_workflow_dirs(), "/opt/centaur/workflows");
     }
 
     #[test]
