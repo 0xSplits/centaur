@@ -47,7 +47,7 @@ manually (there is no shared package); the Rust `api-rs` control plane is unchan
 ## Ingress model
 
 Linear delivers **HTTP webhooks** (like Slack, unlike Discord's Gateway): signature-verified
-(`LINEAR_WEBHOOK_SECRET`, HMAC-SHA256) deliveries to `POST /api/webhooks/linear`. The
+(`LINEARBOT_WEBHOOK_SECRET`, HMAC-SHA256) deliveries to `POST /api/webhooks/linear`. The
 create/append handoff is awaited before the webhook is acknowledged; a retryable session-api
 failure answers **503** so Linear redelivers (the chat-SDK dedupe key is cleared first). The
 execute call runs inside the background render — after the working ack — because cold sandbox
@@ -66,7 +66,7 @@ issue-comment-to-session forwarding; they are also what comments mode consumes).
 
 | Var | Required | Notes |
 |-----|----------|-------|
-| `LINEAR_WEBHOOK_SECRET` | ✅ | Signing secret from the webhook settings page. |
+| `LINEARBOT_WEBHOOK_SECRET` | ✅ | Signing secret from the linearbot webhook's settings page. Distinct from the api-rs `linear_webhook` workflow's `LINEAR_WEBHOOK_SECRET` (separate Linear webhook → separate secret). |
 | `LINEAR_ACCESS_TOKEN` | ✅* | actor=app OAuth token (*or `LINEAR_API_KEY` for comments mode). |
 | `LINEARBOT_DATABASE_URL` | ✅ | Postgres for chat-SDK state (falls back to `DATABASE_URL`). |
 | `CENTAUR_API_URL` | — | api-rs control plane, default `http://127.0.0.1:8080`. |

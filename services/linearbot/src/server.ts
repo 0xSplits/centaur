@@ -2,7 +2,10 @@ import { createLinearbot, type LinearbotOptions } from "./index";
 
 const port = numberEnv("PORT", 3001);
 const apiUrl = stringEnv("CENTAUR_API_URL", "http://127.0.0.1:8080");
-const linearWebhookSecret = requiredEnv("LINEAR_WEBHOOK_SECRET");
+// Distinct from the api-rs `linear_webhook` workflow's LINEAR_WEBHOOK_SECRET:
+// linearbot is a separate Linear webhook (different URL → different signing
+// secret), so it gets its own key to avoid clobbering the workflow's.
+const linearWebhookSecret = requiredEnv("LINEARBOT_WEBHOOK_SECRET");
 // actor=app OAuth token for agent sessions; a personal API key only supports
 // the degraded comments mode.
 const linearAccessToken = optionalEnv("LINEAR_ACCESS_TOKEN");

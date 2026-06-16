@@ -43,11 +43,14 @@ spec:
                 secretKeyRef:
                   name: {{ include "centaur.secretEnvName" . }}
                   key: {{ printf "%sLINEAR_ACCESS_TOKEN" .Values.secretManager.envPrefix }}
-            - name: LINEAR_WEBHOOK_SECRET
+            # linearbot's own webhook signing secret — distinct from the api-rs
+            # linear_webhook workflow's LINEAR_WEBHOOK_SECRET (separate Linear
+            # webhook, separate signing secret).
+            - name: LINEARBOT_WEBHOOK_SECRET
               valueFrom:
                 secretKeyRef:
                   name: {{ include "centaur.secretEnvName" . }}
-                  key: {{ printf "%sLINEAR_WEBHOOK_SECRET" .Values.secretManager.envPrefix }}
+                  key: {{ printf "%sLINEARBOT_WEBHOOK_SECRET" .Values.secretManager.envPrefix }}
             - name: LINEARBOT_API_KEY
               valueFrom:
                 secretKeyRef:

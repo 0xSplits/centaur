@@ -33,7 +33,10 @@ Optional Linear bot bootstrap (consumed when linearbot.enabled=true):
   LINEAR_ACCESS_TOKEN          actor=app OAuth token from the Linear agent
                                install; required together with the webhook
                                secret (partial config fails fast)
-  LINEAR_WEBHOOK_SECRET        signing secret from the Linear webhook settings
+  LINEARBOT_WEBHOOK_SECRET     signing secret from the linearbot webhook's
+                               settings page (distinct from the linear_webhook
+                               workflow's LINEAR_WEBHOOK_SECRET — separate
+                               Linear webhook, separate secret)
   LINEARBOT_API_KEY            bearer the bot sends to api-rs; auto-generated
                                when absent
 
@@ -122,9 +125,9 @@ require_env SLACKBOT_API_KEY
 # Linear config is optional but must be complete: a token without the webhook
 # secret (or vice versa) deploys a linearbot that boots and then rejects every
 # delivery, which reads as silence.
-if [[ -n "${LINEAR_ACCESS_TOKEN:-}" || -n "${LINEAR_WEBHOOK_SECRET:-}" ]]; then
+if [[ -n "${LINEAR_ACCESS_TOKEN:-}" || -n "${LINEARBOT_WEBHOOK_SECRET:-}" ]]; then
   require_env LINEAR_ACCESS_TOKEN
-  require_env LINEAR_WEBHOOK_SECRET
+  require_env LINEARBOT_WEBHOOK_SECRET
 fi
 
 # Discord keys are optional as a group, but partial configuration would silently
@@ -220,7 +223,7 @@ if secret_exists centaur-infra-env; then
   # rotated; the api-rs bearer is generated once and kept stable.
   if [[ -n "${LINEAR_ACCESS_TOKEN:-}" ]]; then
     patch_data+=("\"LINEAR_ACCESS_TOKEN\":\"$(printf '%s' "$LINEAR_ACCESS_TOKEN" | base64 | tr -d '\n')\"")
-    patch_data+=("\"LINEAR_WEBHOOK_SECRET\":\"$(printf '%s' "$LINEAR_WEBHOOK_SECRET" | base64 | tr -d '\n')\"")
+    patch_data+=("\"LINEARBOT_WEBHOOK_SECRET\":\"$(printf '%s' "$LINEARBOT_WEBHOOK_SECRET" | base64 | tr -d '\n')\"")
     if [[ -n "${LINEARBOT_API_KEY:-}" ]]; then
       patch_data+=("\"LINEARBOT_API_KEY\":\"$(printf '%s' "$LINEARBOT_API_KEY" | base64 | tr -d '\n')\"")
     elif ! secret_key_present LINEARBOT_API_KEY; then
@@ -282,7 +285,7 @@ else
   fi
   if [[ -n "${LINEAR_ACCESS_TOKEN:-}" ]]; then
     secret_args+=(--from-literal=LINEAR_ACCESS_TOKEN="$LINEAR_ACCESS_TOKEN")
-    secret_args+=(--from-literal=LINEAR_WEBHOOK_SECRET="$LINEAR_WEBHOOK_SECRET")
+    secret_args+=(--from-literal=LINEARBOT_WEBHOOK_SECRET="$LINEARBOT_WEBHOOK_SECRET")
     secret_args+=(--from-literal=LINEARBOT_API_KEY="${LINEARBOT_API_KEY:-$(rand_hex)}")
   fi
   kubectl "${secret_args[@]}" >/dev/null
