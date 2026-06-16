@@ -55,6 +55,7 @@ const options: LinearbotOptions = {
   activeExecutionTtlMs: optionalNumberEnv("LINEARBOT_ACTIVE_EXECUTION_TTL_MS"),
   apiUrl,
   apiKey: optionalEnv("LINEARBOT_API_KEY") ?? optionalEnv("CENTAUR_API_KEY"),
+  defaultHarnessType: optionalEnv("LINEARBOT_DEFAULT_HARNESS"),
   idleTimeoutMs: optionalNumberEnv("SESSION_IDLE_TIMEOUT_MS"),
   linearAccessToken,
   linearApiKey,

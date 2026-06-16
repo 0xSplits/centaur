@@ -62,6 +62,8 @@ export type LinearbotAppendMessagesRequest = {
 export type LinearbotCreateSessionRequest = {
   harness_type: string;
   metadata: JsonObject;
+  /** 'restart': switch the thread to harness_type if it's pinned to another harness. */
+  on_harness_conflict?: "reject" | "restart";
 };
 
 export type LinearbotExecuteSessionRequest = {
@@ -94,6 +96,11 @@ export type LinearbotOptions = {
   activeExecutionTtlMs?: number;
   apiKey?: string;
   apiUrl: string;
+  /**
+   * Harness for new threads when no --claude/--amp/--codex flag is given
+   * (HarnessType wire value: codex | amp | claudecode). Defaults to codex.
+   */
+  defaultHarnessType?: string;
   fetch?: LinearbotFetch;
   idleTimeoutMs?: number;
   /** OAuth access token from an actor=app install (agent-sessions mode). */
@@ -169,6 +176,12 @@ export type LinearbotTrace = {
 
 export type ForwardSessionInput = {
   afterEventId: number;
+  /**
+   * Prepended to the execute message content as a text part. Set when a harness
+   * restart discards the previous harness's conversation state so the new
+   * harness still sees the issue + comment history.
+   */
+  contextPreamble?: string;
   executionId?: string;
   executeMessage?: LinearbotApiMessage;
   /** Harness override parsed from message flags (--claude/--amp/--codex). */

@@ -63,6 +63,13 @@ type ForwardSessionApiCallbacks = {
     execution: LinearbotExecuteSessionResponse,
   ): Promise<void>;
   onMessagesAppended?(): Promise<void>;
+  /**
+   * Fires when session creation restarted the thread onto a new harness
+   * (explicit --claude/--amp/--codex on a thread pinned to another harness).
+   * Runs before append/execute, so the callback may set `input.contextPreamble`
+   * to re-feed the issue + comment history to the fresh harness.
+   */
+  onSessionRestarted?(): Promise<void>;
 };
 
 export async function collectInitialContext(
@@ -147,10 +154,18 @@ export async function forwardToSessionApi(
   callbacks: ForwardSessionApiCallbacks = {},
 ): Promise<AsyncIterable<LinearbotRendererSource> | null> {
   const createStartedAtMs = nowMs();
-  await createSession(options, input.threadId, input.harnessType);
+  const created = await createSession(
+    options,
+    input.threadId,
+    input.harnessType,
+  );
   traceLog(options, "linearbot_session_create_complete", input.trace, {
+    harness_switched: created.harnessSwitched,
     phase_ms: elapsedMs(createStartedAtMs),
   });
+  if (created.harnessSwitched) {
+    await callbacks.onSessionRestarted?.();
+  }
   if (input.messages.length > 0) {
     const appendStartedAtMs = nowMs();
     await appendSessionMessages(options, input.threadId, input.messages);
@@ -172,6 +187,7 @@ export async function forwardToSessionApi(
     input.threadId,
     input.executeMessage,
     input.model,
+    input.contextPreamble,
   );
   traceLog(options, "linearbot_session_execute_complete", input.trace, {
     execution_id: execution.execution_id,
@@ -201,6 +217,7 @@ export async function executeSessionTurn(
     input.threadId,
     input.executeMessage,
     input.model,
+    input.contextPreamble,
   );
   traceLog(options, "linearbot_session_execute_complete", input.trace, {
     execution_id: execution.execution_id,
@@ -251,6 +268,41 @@ export function startingStreamNotification(threadId: string): JsonObject {
       },
     },
   };
+}
+
+const RESTART_CONTEXT_MAX_CHARS = 24_000;
+
+/**
+ * Transcript of the Linear issue thread, fed to a freshly restarted harness as
+ * a context preamble (the old harness's conversation state dies with its
+ * sandbox). The current message is excluded — it rides in the same input line
+ * as the actual user turn. The synthetic issue-context message (author
+ * "Linear") is part of the history, so the new harness still sees the issue.
+ */
+export function harnessRestartPreamble(
+  history: LinearbotApiMessage[],
+  currentMessageId: string,
+): string | undefined {
+  const lines: string[] = [];
+  for (const item of history) {
+    if (item.id === currentMessageId) continue;
+    const text = item.text.trim();
+    if (!text) continue;
+    const author = item.author.isMe
+      ? "assistant"
+      : item.author.userName || item.author.fullName || "user";
+    lines.push(`[${author}]: ${text}`);
+  }
+  if (lines.length === 0) return undefined;
+  let transcript = lines.join("\n");
+  if (transcript.length > RESTART_CONTEXT_MAX_CHARS) {
+    transcript = `…(earlier messages truncated)\n${transcript.slice(-RESTART_CONTEXT_MAX_CHARS)}`;
+  }
+  return (
+    "This Linear issue thread was just restarted on a different agent harness, " +
+    "so the previous agent's working state is gone. Transcript of the thread so " +
+    `far, for context:\n${transcript}`
+  );
 }
 
 export function sessionStreamError(error: unknown): RustSessionStreamEvent {
@@ -319,14 +371,29 @@ async function bytesToBase64(data: Buffer | Blob): Promise<string> {
 
 const DEFAULT_HARNESS_TYPE = "codex";
 
+type CreateSessionOutcome = {
+  /** The API restarted the thread onto the requested harness. */
+  harnessSwitched: boolean;
+};
+
 async function createSession(
   options: LinearbotOptions,
   threadId: string,
   harnessType?: string,
-): Promise<void> {
-  const requested = harnessType ?? DEFAULT_HARNESS_TYPE;
-  const response = await postCreateSession(options, threadId, requested);
-  if (response.ok) return;
+): Promise<CreateSessionOutcome> {
+  const requested =
+    harnessType ?? options.defaultHarnessType ?? DEFAULT_HARNESS_TYPE;
+  // An explicit --claude/--amp/--codex restarts a thread pinned to another
+  // harness; the implicit default never forces a switch.
+  const response = await postCreateSession(
+    options,
+    threadId,
+    requested,
+    harnessType ? "restart" : undefined,
+  );
+  if (response.ok) {
+    return { harnessSwitched: await harnessSwitchedFromResponse(response) };
+  }
 
   let body = "";
   try {
@@ -335,15 +402,15 @@ async function createSession(
     body = "";
   }
   // A thread is pinned to the harness it was created with; the API rejects a
-  // differing harness_type with 409. A mid-thread --claude/--amp/--codex (or a
-  // plain message on a thread created with a non-default harness) lands here:
-  // keep the thread alive on its existing harness instead of failing the message.
+  // differing harness_type with 409. A plain message on a thread created with a
+  // non-default harness lands here: keep the thread alive on its existing
+  // harness instead of failing the message.
   const existing =
     response.status === 409 ? existingHarnessFromConflict(body) : undefined;
   if (existing && existing !== requested) {
     const retry = await postCreateSession(options, threadId, existing);
     await ensureApiOk(retry, "create session", options);
-    return;
+    return { harnessSwitched: false };
   }
   logApiErrorBody(options, "create session", response, body);
   throw new SessionApiError({
@@ -359,6 +426,7 @@ async function postCreateSession(
   options: LinearbotOptions,
   threadId: string,
   harnessType: string,
+  onHarnessConflict?: "reject" | "restart",
 ): Promise<Response> {
   const fetchFn = options.fetch ?? fetch;
   const body: LinearbotCreateSessionRequest = {
@@ -368,12 +436,24 @@ async function postCreateSession(
       platform: "linear",
       thread_id: threadId,
     },
+    ...(onHarnessConflict ? { on_harness_conflict: onHarnessConflict } : {}),
   };
   return fetchFn(apiSessionUrl(options.apiUrl, threadId), {
     method: "POST",
     headers: apiHeaders(options),
     body: JSON.stringify(body),
   });
+}
+
+async function harnessSwitchedFromResponse(
+  response: Response,
+): Promise<boolean> {
+  try {
+    const payload = await response.json();
+    return isJsonObject(payload) && payload.harness_switched === true;
+  } catch {
+    return false;
+  }
 }
 
 function existingHarnessFromConflict(body: string): string | undefined {
@@ -414,12 +494,13 @@ async function executeSession(
   threadId: string,
   message: LinearbotApiMessage,
   model?: string,
+  contextPreamble?: string,
 ): Promise<LinearbotExecuteSessionResponse> {
   const fetchFn = options.fetch ?? fetch;
   const body: LinearbotExecuteSessionRequest = {
     idempotency_key: message.id,
     metadata: sessionMetadata(message, { action: "execute" }),
-    input_lines: toCodexInputLines(message, threadId, model),
+    input_lines: toCodexInputLines(message, threadId, model, contextPreamble),
     ...(options.idleTimeoutMs === undefined
       ? {}
       : { idle_timeout_ms: options.idleTimeoutMs }),
@@ -586,6 +667,7 @@ function toCodexInputLines(
   message: LinearbotApiMessage,
   threadId: string,
   model?: string,
+  contextPreamble?: string,
 ): string[] {
   const staged = new Map<LinearbotApiAttachment, string>();
   const lines: string[] = [];
@@ -596,6 +678,7 @@ function toCodexInputLines(
       threadId,
       staged,
       model,
+      contextPreamble,
     );
     if (
       inlineLine.length <= MAX_CODEX_INPUT_LINE_CHARS &&
@@ -607,7 +690,15 @@ function toCodexInputLines(
     staged.set(attachment, stagedAttachmentId);
     lines.push(...stagedAttachmentInputLines(attachment, stagedAttachmentId));
   }
-  lines.push(toCodexInputLineWithStaged(message, threadId, staged, model));
+  lines.push(
+    toCodexInputLineWithStaged(
+      message,
+      threadId,
+      staged,
+      model,
+      contextPreamble,
+    ),
+  );
   return lines;
 }
 
@@ -616,6 +707,7 @@ function toCodexInputLineWithStaged(
   threadId: string,
   staged: Map<LinearbotApiAttachment, string>,
   model?: string,
+  contextPreamble?: string,
 ): string {
   return JSON.stringify({
     type: "user",
@@ -624,7 +716,7 @@ function toCodexInputLineWithStaged(
     ...(model ? { model } : {}),
     message: {
       role: "user",
-      content: codexInputContent(message, staged),
+      content: codexInputContent(message, staged, contextPreamble),
     },
   });
 }
@@ -663,8 +755,16 @@ function stagedAttachmentInputLines(
 function codexInputContent(
   message: LinearbotApiMessage,
   staged: Map<LinearbotApiAttachment, string> = new Map(),
+  contextPreamble?: string,
 ): JsonValue[] {
   const content: JsonValue[] = [];
+  // On a harness restart the fresh sandbox has no conversation state, so the
+  // thread transcript rides in front of this turn's text (see
+  // harnessRestartPreamble); on the normal path the issue context arrives as
+  // its own prepended session message instead.
+  if (contextPreamble?.trim()) {
+    content.push({ type: "text", text: contextPreamble });
+  }
   if (message.text.trim()) {
     content.push({ type: "text", text: message.text });
   }

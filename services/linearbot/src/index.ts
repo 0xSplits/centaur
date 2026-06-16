@@ -45,6 +45,7 @@ import {
   collectInitialContext,
   executeSessionTurn,
   forwardToSessionApi,
+  harnessRestartPreamble,
   isRetryableSessionApiError,
   openSessionEventStream,
   serializeMessage,
@@ -436,7 +437,9 @@ async function syncThreadMessageToSession(
   const forwardInput: ForwardSessionInput = {
     afterEventId: lastEventId,
     executeMessage: shouldStartExecution ? serializedMessage : undefined,
-    harnessType: overrides.harnessType,
+    // A harness override only applies when this message starts an execution;
+    // restarting the thread out from under an active execution would kill it.
+    harnessType: shouldStartExecution ? overrides.harnessType : undefined,
     messages: messagesToAppend,
     model: overrides.model,
     onEventId: (eventId) => {
@@ -445,6 +448,22 @@ async function syncThreadMessageToSession(
     openStream: false,
     threadId: thread.id,
     trace,
+  };
+
+  // The previous harness's conversation state dies with its sandbox on a
+  // restart, so re-feed the issue + comment history with this turn. The
+  // preamble lands on forwardInput, which executeSessionTurn reads when the
+  // render stream runs the execute below.
+  const handleSessionRestarted = async (): Promise<void> => {
+    const history = context ?? (await collectInitialContext(thread, message));
+    forwardInput.contextPreamble = harnessRestartPreamble(
+      history,
+      serializedMessage.id,
+    );
+    traceLog(input.options, "linearbot_forward_restart_context_built", trace, {
+      history_message_count: history.length,
+      preamble_chars: forwardInput.contextPreamble?.length ?? 0,
+    });
   };
 
   const commitMessagesAppended = async (): Promise<void> => {
@@ -544,7 +563,10 @@ async function syncThreadMessageToSession(
     await forwardToSessionApi(
       input.options,
       { ...forwardInput, executeMessage: undefined, openStream: false },
-      { onMessagesAppended: commitMessagesAppended },
+      {
+        onMessagesAppended: commitMessagesAppended,
+        onSessionRestarted: handleSessionRestarted,
+      },
     );
     scheduleExecutionRender(
       thread,

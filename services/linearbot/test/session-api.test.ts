@@ -1,5 +1,8 @@
 import { describe, expect, test } from "bun:test";
-import { forwardToSessionApi } from "../src/session-api";
+import {
+  forwardToSessionApi,
+  harnessRestartPreamble,
+} from "../src/session-api";
 import type {
   ForwardSessionInput,
   LinearbotApiMessage,
@@ -226,5 +229,131 @@ describe("forwardToSessionApi overrides", () => {
     expect(thrown?.message).toContain("create session failed: 500");
     // The body is logged server-side only; the user-facing message stays generic.
     expect(thrown?.message).not.toContain("internal hostname leaked");
+  });
+});
+
+describe("forwardToSessionApi harness restart", () => {
+  test("requests a restart when an explicit harness override is given", async () => {
+    const { fetchFn, requests } = fakeApi();
+    await forwardToSessionApi(
+      options(fetchFn),
+      forwardInput(apiMessage("go"), { harnessType: "claudecode" }),
+    );
+    const create = requests.find(isCreateRequest);
+    expect(
+      (create?.body as { on_harness_conflict?: string }).on_harness_conflict,
+    ).toBe("restart");
+  });
+
+  test("does not request a restart for the implicit default harness", async () => {
+    const { fetchFn, requests } = fakeApi();
+    await forwardToSessionApi(options(fetchFn), forwardInput(apiMessage("hi")));
+    const create = requests.find(isCreateRequest);
+    expect("on_harness_conflict" in (create?.body as object)).toBe(false);
+  });
+
+  test("uses the configured default harness when no override is set", async () => {
+    const { fetchFn, requests } = fakeApi();
+    await forwardToSessionApi(
+      { ...options(fetchFn), defaultHarnessType: "claudecode" },
+      forwardInput(apiMessage("hi")),
+    );
+    const create = requests.find(isCreateRequest);
+    expect((create?.body as { harness_type?: string }).harness_type).toBe(
+      "claudecode",
+    );
+    // The default never forces a switch on a thread pinned to another harness.
+    expect("on_harness_conflict" in (create?.body as object)).toBe(false);
+  });
+
+  test("fires onSessionRestarted and prepends the restart preamble", async () => {
+    const { fetchFn, requests } = fakeApi({
+      createSession: [
+        { body: { harness_switched: true, ok: true }, status: 200 },
+      ],
+    });
+    const input = forwardInput(apiMessage("go"), { harnessType: "claudecode" });
+    let restarted = false;
+    await forwardToSessionApi(options(fetchFn), input, {
+      onSessionRestarted: async () => {
+        restarted = true;
+        input.contextPreamble = "Restarted: prior transcript";
+      },
+    });
+    expect(restarted).toBe(true);
+    const execute = requests.find((request) =>
+      request.url.endsWith("/execute"),
+    );
+    const line = JSON.parse(
+      (execute?.body as { input_lines: string[] }).input_lines[0]!,
+    );
+    expect(line.message.content).toEqual([
+      { type: "text", text: "Restarted: prior transcript" },
+      { type: "text", text: "go" },
+    ]);
+  });
+
+  test("does not fire onSessionRestarted when no switch occurred", async () => {
+    const { fetchFn } = fakeApi();
+    let restarted = false;
+    await forwardToSessionApi(
+      options(fetchFn),
+      forwardInput(apiMessage("go"), { harnessType: "claudecode" }),
+      {
+        onSessionRestarted: async () => {
+          restarted = true;
+        },
+      },
+    );
+    expect(restarted).toBe(false);
+  });
+});
+
+describe("harnessRestartPreamble", () => {
+  function historyMessage(
+    id: string,
+    text: string,
+    isMe = false,
+  ): LinearbotApiMessage {
+    return {
+      attachments: [],
+      author: {
+        fullName: "Ada",
+        isBot: false,
+        isMe,
+        userId: "U1",
+        userName: "ada",
+      },
+      id,
+      isMention: false,
+      raw: {},
+      text,
+      threadId: THREAD_ID,
+      timestamp: "2026-06-10T00:00:00.000Z",
+    };
+  }
+
+  test("renders a transcript and excludes the current message", () => {
+    const preamble = harnessRestartPreamble(
+      [
+        historyMessage("ctx", "Issue context blob"),
+        historyMessage("m1", "the assistant reply", true),
+        historyMessage("cur", "this turn's prompt"),
+      ],
+      "cur",
+    );
+    expect(preamble).toContain("restarted on a different agent harness");
+    expect(preamble).toContain("[ada]: Issue context blob");
+    expect(preamble).toContain("[assistant]: the assistant reply");
+    expect(preamble).not.toContain("this turn's prompt");
+  });
+
+  test("returns undefined when nothing but the current message remains", () => {
+    expect(
+      harnessRestartPreamble([historyMessage("cur", "only this")], "cur"),
+    ).toBeUndefined();
+    expect(
+      harnessRestartPreamble([historyMessage("blank", "   ")], "other"),
+    ).toBeUndefined();
   });
 });
