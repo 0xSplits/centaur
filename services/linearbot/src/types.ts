@@ -177,6 +177,12 @@ export type LinearbotTrace = {
 export type ForwardSessionInput = {
   afterEventId: number;
   /**
+   * Human-readable issue name (identifier/title) carried in the create-session
+   * metadata as `linear_conversation_name`; api-rs uses it as the session
+   * principal's display name.
+   */
+  conversationName?: string;
+  /**
    * Prepended to the execute message content as a text part. Set when a harness
    * restart discards the previous harness's conversation state so the new
    * harness still sees the issue + comment history.

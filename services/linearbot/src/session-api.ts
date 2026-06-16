@@ -158,6 +158,7 @@ export async function forwardToSessionApi(
     options,
     input.threadId,
     input.harnessType,
+    input.conversationName,
   );
   traceLog(options, "linearbot_session_create_complete", input.trace, {
     harness_switched: created.harnessSwitched,
@@ -380,6 +381,7 @@ async function createSession(
   options: LinearbotOptions,
   threadId: string,
   harnessType?: string,
+  conversationName?: string,
 ): Promise<CreateSessionOutcome> {
   const requested =
     harnessType ?? options.defaultHarnessType ?? DEFAULT_HARNESS_TYPE;
@@ -390,6 +392,7 @@ async function createSession(
     threadId,
     requested,
     harnessType ? "restart" : undefined,
+    conversationName,
   );
   if (response.ok) {
     return { harnessSwitched: await harnessSwitchedFromResponse(response) };
@@ -408,7 +411,13 @@ async function createSession(
   const existing =
     response.status === 409 ? existingHarnessFromConflict(body) : undefined;
   if (existing && existing !== requested) {
-    const retry = await postCreateSession(options, threadId, existing);
+    const retry = await postCreateSession(
+      options,
+      threadId,
+      existing,
+      undefined,
+      conversationName,
+    );
     await ensureApiOk(retry, "create session", options);
     return { harnessSwitched: false };
   }
@@ -427,14 +436,18 @@ async function postCreateSession(
   threadId: string,
   harnessType: string,
   onHarnessConflict?: "reject" | "restart",
+  conversationName?: string,
 ): Promise<Response> {
   const fetchFn = options.fetch ?? fetch;
+  const name = conversationName?.trim();
   const body: LinearbotCreateSessionRequest = {
     harness_type: harnessType,
     metadata: {
       source: "linearbot",
       platform: "linear",
       thread_id: threadId,
+      // api-rs reads this as the session principal's display name.
+      ...(name ? { linear_conversation_name: name } : {}),
     },
     ...(onHarnessConflict ? { on_harness_conflict: onHarnessConflict } : {}),
   };

@@ -128,6 +128,59 @@ const POSTGRES_CONNECT_MAX_DELAY_MS = 10_000;
 // a handful of times), so the flag is ignored once older than this TTL.
 const ACTIVE_EXECUTION_TTL_MS = 30 * 60 * 1000;
 
+// The resolved issue name becomes the session principal's display name in
+// iron-control (see api-rs derive_principal). api-rs re-upserts the principal on
+// every create, so the name must ride every create to stay stable — cache the
+// per-issue lookup (mirrors slackbotv2's channel-name cache). Misses expire
+// sooner so a transient subject-fetch failure self-heals.
+const CONVERSATION_NAME_CACHE_SUCCESS_TTL_MS = 6 * 60 * 60 * 1000;
+const CONVERSATION_NAME_CACHE_MISS_TTL_MS = 10 * 60 * 1000;
+type ConversationNameCacheEntry = {
+  expiresAtMs: number;
+  name: string | undefined;
+};
+const conversationNameCache = new Map<string, ConversationNameCacheEntry>();
+
+export function clearConversationNameCacheForTests(): void {
+  conversationNameCache.clear();
+}
+
+/**
+ * Resolve a human-readable name for a Linear issue thread (the issue identifier,
+ * e.g. "ENG-123", falling back to the title) to name the session principal.
+ * Cached per issue and never throws — the name is cosmetic, so a fetch failure
+ * just falls back to the synthetic id-based principal name in api-rs.
+ */
+export async function resolveLinearConversationName(
+  message: ChatMessage,
+  logger: Logger,
+): Promise<string | undefined> {
+  const { issueId } = parseLinearThreadKey(message.threadId);
+  const cacheKey = issueId ?? message.threadId;
+  const cached = conversationNameCache.get(cacheKey);
+  if (cached && cached.expiresAtMs > Date.now()) return cached.name;
+
+  let name: string | undefined;
+  try {
+    const subject = await message.subject;
+    name = subject?.id ?? subject?.title ?? undefined;
+  } catch (error) {
+    logger.warn("linearbot_conversation_name_failed", {
+      error: errorMessage(error),
+    });
+    name = undefined;
+  }
+  conversationNameCache.set(cacheKey, {
+    expiresAtMs:
+      Date.now() +
+      (name
+        ? CONVERSATION_NAME_CACHE_SUCCESS_TTL_MS
+        : CONVERSATION_NAME_CACHE_MISS_TTL_MS),
+    name,
+  });
+  return name;
+}
+
 export function createLinearbot(options: LinearbotOptions): Linearbot {
   const userName = options.userName ?? "centaur";
   const logger = options.logger ?? noopLogger;
@@ -433,9 +486,13 @@ async function syncThreadMessageToSession(
   const messagesToAppend = candidateMessages.filter(
     (item) => !messageIds.has(item.id),
   );
+  // Names the session principal in iron-control; resolved (and cached) here so
+  // it rides every create. Cosmetic, so a failed lookup just yields undefined.
+  const conversationName = await resolveLinearConversationName(message, logger);
 
   const forwardInput: ForwardSessionInput = {
     afterEventId: lastEventId,
+    conversationName,
     executeMessage: shouldStartExecution ? serializedMessage : undefined,
     // A harness override only applies when this message starts an execution;
     // restarting the thread out from under an active execution would kill it.

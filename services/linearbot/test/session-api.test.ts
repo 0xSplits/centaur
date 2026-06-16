@@ -309,6 +309,61 @@ describe("forwardToSessionApi harness restart", () => {
   });
 });
 
+describe("forwardToSessionApi principal naming", () => {
+  test("carries the conversation name as create-session metadata", async () => {
+    const { fetchFn, requests } = fakeApi();
+    await forwardToSessionApi(
+      options(fetchFn),
+      forwardInput(apiMessage("go"), { conversationName: "ENG-123" }),
+    );
+    const create = requests.find(isCreateRequest);
+    expect(
+      (create?.body as { metadata: { linear_conversation_name?: string } })
+        .metadata.linear_conversation_name,
+    ).toBe("ENG-123");
+  });
+
+  test("omits the conversation name when unset or blank", async () => {
+    const { fetchFn, requests } = fakeApi();
+    await forwardToSessionApi(
+      options(fetchFn),
+      forwardInput(apiMessage("go"), { conversationName: "  " }),
+    );
+    const create = requests.find(isCreateRequest);
+    expect(
+      "linear_conversation_name" in
+        (create?.body as { metadata: object }).metadata,
+    ).toBe(false);
+  });
+
+  test("still names the principal after a 409 harness-conflict retry", async () => {
+    const { fetchFn, requests } = fakeApi({
+      createSession: [
+        {
+          body: { existing_harness: "codex", ok: false },
+          status: 409,
+        },
+        { status: 200 },
+      ],
+    });
+    await forwardToSessionApi(
+      options(fetchFn),
+      forwardInput(apiMessage("go"), {
+        harnessType: "claudecode",
+        conversationName: "ENG-123",
+      }),
+    );
+    const creates = requests.filter(isCreateRequest);
+    expect(creates).toHaveLength(2);
+    for (const create of creates) {
+      expect(
+        (create.body as { metadata: { linear_conversation_name?: string } })
+          .metadata.linear_conversation_name,
+      ).toBe("ENG-123");
+    }
+  });
+});
+
 describe("harnessRestartPreamble", () => {
   function historyMessage(
     id: string,
