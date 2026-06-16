@@ -166,6 +166,17 @@ describe("linearbot chat-sdk pipeline", () => {
       false,
     );
 
+    // Linear delta: the answer is also mirrored into the comment thread as a
+    // real reply nested under the session's root comment. The response
+    // activity alone only surfaces in the detached agent-session widget; this
+    // is the copy humans read and reply to.
+    await waitFor(() => linearApi.botComments.length >= 1);
+    expect(linearApi.botComments[0]).toEqual({
+      issueId: ISSUE_ID,
+      body: "All tests now pass.",
+      parentId: rootCommentId,
+    });
+
     // ---- prompted follow-up reuses the SAME session/thread key (patched
     // adapter regression: upstream keyed each prompt to its own comment).
     const prompted = agentSessionPromptedPayload({
@@ -196,6 +207,14 @@ describe("linearbot chat-sdk pipeline", () => {
         linearApi.activities.filter((a) => a.content.type === "response")
           .length >= 2,
     );
+
+    // The follow-up answer is mirrored into the same comment thread too.
+    await waitFor(() => linearApi.botComments.length >= 2);
+    expect(linearApi.botComments[1]).toEqual({
+      issueId: ISSUE_ID,
+      body: "Regression test added.",
+      parentId: rootCommentId,
+    });
 
     // Mention sessions never move issue status: the issue is not delegated
     // to the agent, so it has no ownership of it.
@@ -417,6 +436,14 @@ describe("linearbot chat-sdk pipeline", () => {
         ? responseActivity.content.body
         : "",
     ).toBe("Report compiled.");
+
+    // No comment thread exists (bare delegation, synthetic root): the answer
+    // posts top-level on the issue, un-nested.
+    await waitFor(() => linearApi.botComments.length >= 1);
+    expect(linearApi.botComments[0]?.issueId).toBe(ISSUE_ID);
+    expect(linearApi.botComments[0]?.body).toBe("Report compiled.");
+    expect(linearApi.botComments[0]?.parentId).toBeUndefined();
+
     await waitFor(() => linearApi.issueStateUpdates.length >= 2);
     expect(linearApi.issueStateUpdates[1]).toEqual({
       issueId: ISSUE_ID,
@@ -476,6 +503,99 @@ describe("linearbot chat-sdk pipeline", () => {
     expect(botComment.status).toBe(200);
     await Bun.sleep(100);
     expect(appendedTexts()).not.toContain("agent response echo");
+  });
+
+  // These assertions filter by this comment's own thread key / parent id: a
+  // prior test's detached render can still post into the shared mock servers
+  // after the per-test reset (see the activity-log caveat above).
+  it("comment-bot: answers a comment @-mention as one visible comment (answer + collapsed CoT), no session", async () => {
+    bot = createTestBot({ commentBot: true });
+    const commentThreadKey = `linear:${ISSUE_ID}:c:comment-q`;
+    const repliesToComment = () =>
+      linearApi.botComments.filter((c) => c.parentId === "comment-q");
+
+    const response = await postWebhook(
+      commentCreatedPayload({
+        id: "comment-q",
+        body: "@centaur how long will this take?",
+      }),
+    );
+    expect(response.status).toBe(200);
+
+    // No agent session: the run executes on the comment-thread key.
+    await waitFor(() =>
+      codexApi.executes.some((e) => e.threadKey === commentThreadKey),
+    );
+    // A Comment webhook has no promptContext blob, so issue context is fetched
+    // and seeded on the first turn of this comment thread.
+    const seeded = codexApi.appends
+      .filter((a) => a.threadKey === commentThreadKey)
+      .flatMap((a) => sessionMessageTexts(a.body.messages));
+    expect(seeded.some((text) => text.includes("[Linear issue context]"))).toBe(
+      true,
+    );
+
+    codexApi.emitOutputLines(
+      commentThreadKey,
+      sampleCodexOutputLines("About a day."),
+    );
+
+    await waitFor(() => repliesToComment().length >= 1);
+    const reply = repliesToComment()[0]!;
+    expect(reply.issueId).toBe(ISSUE_ID);
+    expect(reply.body).toContain("About a day.");
+    // Chain-of-thought folded into a collapsed section.
+    expect(reply.body).toContain(">>> Chain of thought");
+    expect(reply.body).toContain("pnpm test");
+
+    // A redelivery of the same comment never double-replies.
+    await Bun.sleep(50);
+    const redelivered = await postWebhook(
+      commentCreatedPayload({
+        id: "comment-q",
+        body: "@centaur how long will this take?",
+      }),
+    );
+    expect(redelivered.status).toBe(200);
+    await Bun.sleep(100);
+    expect(repliesToComment()).toHaveLength(1);
+  });
+
+  it("comment-bot: a comment that does not mention the bot is not answered", async () => {
+    bot = createTestBot({ commentBot: true });
+    const response = await postWebhook(
+      commentCreatedPayload({
+        id: "comment-plain",
+        body: "just a note for the team",
+      }),
+    );
+    expect(response.status).toBe(200);
+    await Bun.sleep(100);
+    expect(
+      codexApi.executes.some(
+        (e) => e.threadKey === `linear:${ISSUE_ID}:c:comment-plain`,
+      ),
+    ).toBe(false);
+    expect(
+      linearApi.botComments.some((c) => c.parentId === "comment-plain"),
+    ).toBe(false);
+  });
+
+  it("comment-bot stays dormant unless the flag is set (mention falls through to forwarding)", async () => {
+    // Default bot has commentBot off; a mention comment must not be answered.
+    const response = await postWebhook(
+      commentCreatedPayload({ id: "comment-off", body: "@centaur hello" }),
+    );
+    expect(response.status).toBe(200);
+    await Bun.sleep(100);
+    expect(
+      codexApi.executes.some(
+        (e) => e.threadKey === `linear:${ISSUE_ID}:c:comment-off`,
+      ),
+    ).toBe(false);
+    expect(
+      linearApi.botComments.some((c) => c.parentId === "comment-off"),
+    ).toBe(false);
   });
 });
 
@@ -776,10 +896,13 @@ type FakeComment = {
   userId?: string;
 };
 
+type RecordedBotComment = { issueId: string; body: string; parentId?: string };
+
 type FakeLinearApi = {
   activities: RecordedActivity[];
   addAgentSession(input: { id: string; rootCommentId?: string }): void;
   addUserComment(input: { body: string; parentId?: string }): string;
+  botComments: RecordedBotComment[];
   close(): void;
   issueStateUpdates: Array<{ issueId: string; stateId: string }>;
   reset(): void;
@@ -797,6 +920,7 @@ const WORKFLOW_STATES = [
 
 function startFakeLinearApi(): FakeLinearApi {
   const activities: RecordedActivity[] = [];
+  const botComments: RecordedBotComment[] = [];
   const comments = new Map<string, FakeComment>();
   const sessions = new Map<string, { id: string; rootCommentId?: string }>();
   const unhandledOperations: string[] = [];
@@ -853,6 +977,17 @@ function startFakeLinearApi(): FakeLinearApi {
             ? { id: currentState.id, type: currentState.type }
             : null,
           team: { states: { nodes: WORKFLOW_STATES } },
+        },
+      };
+    }
+    if (query.includes("LinearbotIssueContext")) {
+      return {
+        issue: {
+          identifier: "ENG-1",
+          title: "Something broke",
+          description: "The deploy fails on boot.",
+          url: "https://linear.app/acme/issue/ENG-1",
+          state: { name: "Todo" },
         },
       };
     }
@@ -916,6 +1051,25 @@ function startFakeLinearApi(): FakeLinearApi {
     }
     if (query.includes("agentSessionUpdate(")) {
       return { agentSessionUpdate: { success: true, lastSyncId: idCounter } };
+    }
+    if (query.includes("LinearbotCommentCreate")) {
+      const id = nextId("bot-reply");
+      const parentId = variables.parentId
+        ? String(variables.parentId)
+        : undefined;
+      const body = String(variables.body ?? "");
+      comments.set(id, {
+        id,
+        body,
+        parentId,
+        botActor: { id: BOT_USER_ID, name: "centaur" },
+      });
+      botComments.push({
+        issueId: String(variables.issueId ?? ""),
+        body,
+        parentId,
+      });
+      return { commentCreate: { success: true } };
     }
     if (
       /query\s+agentActivity\b/i.test(query) ||
@@ -1018,6 +1172,7 @@ function startFakeLinearApi(): FakeLinearApi {
 
   return {
     activities,
+    botComments,
     issueStateUpdates,
     unhandledOperations,
     url: `http://127.0.0.1:${server.port}/graphql`,
@@ -1042,6 +1197,7 @@ function startFakeLinearApi(): FakeLinearApi {
     },
     reset() {
       activities.length = 0;
+      botComments.length = 0;
       comments.clear();
       sessions.clear();
       unhandledOperations.length = 0;

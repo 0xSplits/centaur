@@ -24,10 +24,17 @@ import {
   type IssueCommentEvent,
 } from "./issue-comments";
 import {
+  buildCommentReplyBody,
+  commentMentionsBot,
+  CommentReplyCollector,
+} from "./comment-bot";
+import {
   buildLinearContextMessage,
   EMPTY_PROMPT_INSTRUCTION,
+  fetchIssueContextText,
 } from "./linear-context";
 import { ackWorking, LinearNarrator } from "./linear-narrator";
+import { postIssueReply } from "./linear-reply";
 import {
   extractStatusMarker,
   fetchIssueStatus,
@@ -279,10 +286,22 @@ export function createLinearbot(options: LinearbotOptions): Linearbot {
       // threads as append-only context. Runs inside the request context so a
       // retryable session-api failure 503s for redelivery, and only after the
       // adapter accepted the delivery (signature verified).
-      const commentForward = requestContext.run(context, () =>
-        forwardIssueCommentToSessions(rawBody, { chat, options, state }),
-      );
-      if (commentForward) handoffTasks.push(commentForward);
+      // Linear delta: when the comment-bot is enabled, a comment that
+      // @-mentions the bot is answered as a visible comment (no session); any
+      // other comment still forwards into existing sessions as context.
+      const commentBot = options.commentBot
+        ? requestContext.run(context, () =>
+            handleCommentBotMention(rawBody, { chat, options, state }),
+          )
+        : null;
+      if (commentBot) {
+        handoffTasks.push(commentBot);
+      } else {
+        const commentForward = requestContext.run(context, () =>
+          forwardIssueCommentToSessions(rawBody, { chat, options, state }),
+        );
+        if (commentForward) handoffTasks.push(commentForward);
+      }
       try {
         await Promise.all(handoffTasks);
       } catch (error) {
@@ -746,6 +765,17 @@ async function recordSessionThread(
     const rootCommentId = sessionRootCommentIdFromMessage(message);
     if (threadState.sessionRootCommentId === rootCommentId) return;
     if (!threadState.sessionRootCommentId) {
+      // Diagnostic: was this session comment-anchored at creation? A synthetic
+      // root (Linear sent no `agentSession.comment`) means an issue/delegation
+      // session, whose answer cannot nest in a comment thread. `message_kind`
+      // distinguishes the trigger so we can see which invocations anchor.
+      const raw = isJsonObject(message.raw) ? message.raw : undefined;
+      traceLog(options, "linearbot_session_anchor", undefined, {
+        anchored: !rootCommentId.startsWith("agent-session-"),
+        message_kind: stringValue(raw?.kind),
+        root_comment_id: rootCommentId,
+        thread_id: thread.id,
+      });
       await state.appendToList(issueSessionsKey(issueId), thread.id, {
         maxLength: SESSION_INDEX_MAX_LENGTH,
         ttlMs: RENDER_INDEX_TTL_MS,
@@ -852,6 +882,236 @@ function issueCommentMessage(
     text: event.body,
     threadId,
   } as unknown as ChatMessage;
+}
+
+const COMMENTBOT_MAX_RETRIES = 3;
+
+/** The bot's @-mention names for the comment-bot: userName plus any aliases. */
+function commentMentionNames(options: LinearbotOptions): string[] {
+  return [
+    options.userName ?? "centaur",
+    ...(options.commentMentionAliases ?? []),
+  ]
+    .map((name) => name.trim())
+    .filter((name) => name.length > 0);
+}
+
+/**
+ * Comment-bot path: a comment that @-mentions the bot is answered as one
+ * visible reply (answer + collapsed chain-of-thought), with no agent session.
+ * Returns null when the webhook is not a bot-mention comment, so the caller
+ * falls through to forwarding the comment into existing sessions. Mirrors the
+ * agent-session handoff split: create+append is awaited (a retryable failure
+ * 503s for Linear redelivery); execute+render+post runs in the background.
+ */
+function handleCommentBotMention(
+  rawBody: string,
+  input: {
+    chat: Chat<Record<string, Adapter>, LinearbotThreadState>;
+    options: LinearbotOptions;
+    state: StateAdapter;
+  },
+): Promise<void> | null {
+  const event = parseIssueCommentWebhook(rawBody);
+  if (!event) return null;
+  if (!commentMentionsBot(event.body, commentMentionNames(input.options))) {
+    return null;
+  }
+  const { chat, options } = input;
+  const rootCommentId = event.parentId ?? event.commentId;
+  const threadKey = `linear:${event.issueId}:c:${rootCommentId}`;
+  const message = issueCommentMessage(event, threadKey);
+  const trace: LinearbotTrace = {
+    includeContext: false,
+    messageId: event.commentId,
+    mode: "execute",
+    openStream: true,
+    startedAtMs: nowMs(),
+    threadId: threadKey,
+  };
+  return (async () => {
+    const thread = chat.thread(threadKey);
+    const threadState = (await thread.state) ?? {};
+    if ((threadState.repliedCommentIds ?? []).includes(event.commentId)) {
+      traceLog(options, "linearbot_commentbot_duplicate_skipped", trace, {
+        comment_id: event.commentId,
+      });
+      return;
+    }
+    const client = (thread.adapter as unknown as LinearSessionCapableAdapter)
+      .linearClient;
+    const serialized = await serializeMessage(message);
+    const contextMessages: LinearbotApiMessage[] = [];
+    if (!threadState.historyForwarded && client) {
+      const contextText = await fetchIssueContextText(
+        client,
+        event.issueId,
+        options.logger ?? noopLogger,
+      );
+      if (contextText) {
+        contextMessages.push(
+          commentContextMessage(
+            contextText,
+            event.commentId,
+            threadKey,
+            serialized.timestamp,
+          ),
+        );
+      }
+    }
+    let lastEventId = threadState.lastEventId ?? 0;
+    const forwardInput: ForwardSessionInput = {
+      afterEventId: lastEventId,
+      executeMessage: serialized,
+      messages: contextMessages,
+      onEventId: (eventId) => {
+        lastEventId = Math.max(lastEventId, eventId);
+      },
+      openStream: false,
+      threadId: threadKey,
+      trace,
+    };
+    traceLog(options, "linearbot_commentbot_started", trace, {
+      context_included: contextMessages.length > 0,
+    });
+    // Create + append the issue context only (fast); the execute call blocks on
+    // cold sandbox spin-up, so it runs in the background render below.
+    try {
+      await forwardToSessionApi(
+        options,
+        { ...forwardInput, executeMessage: undefined, openStream: false },
+        {},
+      );
+    } catch (error) {
+      markRetryableForWebhookRedelivery(error, message, input, trace);
+      throw error;
+    }
+    // Claim the comment so a racing redelivery never double-replies, and record
+    // that context is seeded. Done after create+append (a retryable failure
+    // above still 503s for redelivery) and before the background render — a
+    // crash mid-render forfeits this one reply rather than risking a duplicate.
+    const claimed = (await thread.state) ?? {};
+    await thread.setState({
+      historyForwarded: true,
+      repliedCommentIds: [
+        ...(claimed.repliedCommentIds ?? []),
+        event.commentId,
+      ].slice(-200),
+    });
+    backgroundWaitUntil(
+      runCommentBotExecution({
+        client,
+        event,
+        forwardInput,
+        options,
+        rootCommentId,
+        trace,
+      }),
+    );
+  })();
+}
+
+/** Synthetic issue-context message seeding a comment-bot run's first turn. */
+function commentContextMessage(
+  text: string,
+  commentId: string,
+  threadKey: string,
+  timestamp: string,
+): LinearbotApiMessage {
+  return {
+    attachments: [],
+    author: {
+      fullName: "Linear",
+      isBot: true,
+      isMe: false,
+      userId: "linear",
+      userName: "linear",
+    },
+    // Stable per comment thread so api-rs dedupes a redelivered append.
+    id: `linear-context-${commentId}`,
+    isMention: false,
+    raw: { linearbotSyntheticContext: true },
+    text,
+    threadId: threadKey,
+    timestamp,
+  };
+}
+
+/**
+ * Background half of the comment-bot: executes the turn, collects the answer +
+ * chain-of-thought from the render stream, and posts a single comment reply.
+ * Best-effort with a bounded retry on transient (cold-start) failures — unlike
+ * the agent-session path there is no recovery sweep, so a hard failure posts an
+ * error comment rather than silently dropping the reply.
+ */
+async function runCommentBotExecution(deps: {
+  client: LinearSessionCapableAdapter["linearClient"];
+  event: IssueCommentEvent;
+  forwardInput: ForwardSessionInput;
+  options: LinearbotOptions;
+  rootCommentId: string;
+  trace: LinearbotTrace;
+}): Promise<void> {
+  const { client, event, forwardInput, options, rootCommentId, trace } = deps;
+  const logger = options.logger ?? noopLogger;
+  let body: string;
+  for (let attempt = 0; ; attempt++) {
+    try {
+      const collector = new CommentReplyCollector();
+      const fallback = new LinearRenderFallback();
+      for await (const chunk of codexAppServerToChatSdkStream(
+        fallback.collectSource(
+          streamSessionAfterHandoff(options, forwardInput),
+        ),
+        rendererOptions(options),
+      )) {
+        collector.update(chunk);
+      }
+      const answer = collector.failed
+        ? `⚠️ I ran into an error before finishing:\n\n${collector.errorText || "unknown error"}`
+        : collector.answer;
+      body = buildCommentReplyBody({
+        answer,
+        cotLines: collector.cotLines,
+        fallback: fallback.text(),
+      });
+      break;
+    } catch (error) {
+      if (
+        isRetryableSessionApiError(error) &&
+        attempt < COMMENTBOT_MAX_RETRIES
+      ) {
+        const delayMs = renderRetryDelayMs(attempt);
+        traceLog(options, "linearbot_commentbot_retry", trace, {
+          retry_attempt: attempt + 1,
+          retry_delay_ms: delayMs,
+        });
+        await sleep(delayMs);
+        continue;
+      }
+      logger.warn("linearbot_commentbot_execution_failed", {
+        error: errorMessage(error),
+      });
+      body = `⚠️ I ran into an error before finishing: ${errorMessage(error)}`;
+      break;
+    }
+  }
+  if (client) {
+    try {
+      await postIssueReply(client, {
+        body,
+        issueId: event.issueId,
+        parentCommentId: rootCommentId,
+      });
+    } catch (error) {
+      logger.warn("linearbot_commentbot_reply_failed", {
+        error: errorMessage(error),
+      });
+    }
+  }
+  traceLog(options, "linearbot_commentbot_complete", trace, {
+    chars: body.length,
+  });
 }
 
 /**
@@ -1436,7 +1696,7 @@ async function acquireRenderLease(
  * timeline rather than a live growing message.
  */
 async function renderExecutionStream(
-  thread: Thread,
+  thread: Thread<LinearbotThreadState>,
   stream: AsyncIterable<LinearbotRendererSource>,
   message: LinearbotApiMessage,
   options: LinearbotOptions,
@@ -1463,7 +1723,12 @@ async function renderExecutionStream(
       // Flush remaining thoughts before the response so the timeline reads
       // in order; the response activity is what settles the session.
       await narrator.finish("done");
-      await thread.post(extracted.text.trim() ? extracted.text : finalText);
+      const answer = extracted.text.trim() ? extracted.text : finalText;
+      await thread.post(answer);
+      // Linear delta: the response activity above only lands in the detached
+      // agent-session widget. Mirror the answer as a real comment reply in the
+      // thread so the bot replies where the conversation is (see linear-reply).
+      await postAnswerAsThreadReply(thread, answer, options, trace);
       if (marker) {
         backgroundWaitUntil(
           applyTerminalStatusMarker(thread, marker, options, trace),
@@ -1481,6 +1746,46 @@ async function renderExecutionStream(
       errorMessage(error),
     );
     throw error;
+  }
+}
+
+/**
+ * Mirrors the agent's final answer into the issue's comment thread as a real
+ * comment, nested under the session's root comment when one exists. Only runs
+ * for agent-session threads: there `thread.post()` lands as a detached response
+ * activity, so without this the answer never appears inline where the bot was
+ * asked. In comments mode `thread.post()` already created the thread comment, so
+ * this no-ops to avoid a duplicate. Best-effort — the response activity is the
+ * durable answer, so a failed comment only logs (like narration).
+ */
+async function postAnswerAsThreadReply(
+  thread: Thread<LinearbotThreadState>,
+  body: string,
+  options: LinearbotOptions,
+  trace?: LinearbotTrace,
+): Promise<void> {
+  const { issueId, agentSessionId } = parseLinearThreadKey(thread.id);
+  if (!issueId || !agentSessionId) return;
+  const client = (thread.adapter as unknown as LinearSessionCapableAdapter)
+    .linearClient;
+  if (!client) return;
+  const { sessionRootCommentId } = (await thread.state) ?? {};
+  // A synthetic root (description mention / bare delegation) is not a real
+  // comment to reply under; post the answer top-level on the issue instead.
+  const parentCommentId =
+    sessionRootCommentId && !sessionRootCommentId.startsWith("agent-session-")
+      ? sessionRootCommentId
+      : undefined;
+  try {
+    await postIssueReply(client, { issueId, body, parentCommentId });
+    traceLog(options, "linearbot_thread_reply_posted", trace, {
+      issue_id: issueId,
+      nested: parentCommentId !== undefined,
+    });
+  } catch (error) {
+    (options.logger ?? noopLogger).warn("linearbot_thread_reply_failed", {
+      error: errorMessage(error),
+    });
   }
 }
 

@@ -97,6 +97,20 @@ export type LinearbotOptions = {
   apiKey?: string;
   apiUrl: string;
   /**
+   * Linear delta: when true, a comment that @-mentions the bot is answered as
+   * a plain visible comment (the comment-bot path: answer + collapsed
+   * chain-of-thought, no agent session). Off by default — only safe once the
+   * Linear app is reconfigured assignable-but-not-mentionable, so a mention no
+   * longer also spawns a session. Assigned/delegated issues always run as
+   * agent sessions regardless of this flag.
+   */
+  commentBot?: boolean;
+  /**
+   * Extra names (besides userName) that count as an @-mention of the bot in a
+   * comment, e.g. the app's Linear display name. Matched case-insensitively.
+   */
+  commentMentionAliases?: string[];
+  /**
    * Harness for new threads when no --claude/--amp/--codex flag is given
    * (HarnessType wire value: codex | amp | claudecode). Defaults to codex.
    */
@@ -147,6 +161,11 @@ export type LinearbotThreadState = {
   historyForwarded?: boolean;
   lastEventId?: number;
   renderObligation?: LinearbotRenderObligation | null;
+  /**
+   * Linear delta (comment-bot): ids of comments this thread has already
+   * answered, so a webhook redelivery never double-replies. Capped FIFO.
+   */
+  repliedCommentIds?: string[];
   /**
    * Linear delta: root comment id of the agent session's comment thread.
    * Comment webhooks matching it (or replying under it) already arrive as
