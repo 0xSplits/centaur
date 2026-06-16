@@ -255,12 +255,17 @@ impl SessionRuntime {
                 .and_then(|metadata| metadata.get("slack_user_id"))
                 .and_then(Value::as_str)
                 .map(ToOwned::to_owned);
-            // The human-readable channel/DM name the slackbot resolved, used as
-            // the principal's display name. Read it here for the same reason,
-            // before `metadata` is consumed below.
-            let slack_conversation_name = metadata
+            // The human-readable conversation name the chat bot resolved
+            // (Slack channel/DM, or Discord channel), used as the principal's
+            // display name. Read it here for the same reason, before `metadata`
+            // is consumed below.
+            let conversation_name = metadata
                 .as_ref()
-                .and_then(|metadata| metadata.get("slack_conversation_name"))
+                .and_then(|metadata| {
+                    metadata
+                        .get("slack_conversation_name")
+                        .or_else(|| metadata.get("discord_conversation_name"))
+                })
                 .and_then(Value::as_str)
                 .map(ToOwned::to_owned);
             let mut harness_switched = false;
@@ -295,7 +300,7 @@ impl SessionRuntime {
                     .register_session(
                         thread_key.as_str(),
                         slack_user_id.as_deref(),
-                        slack_conversation_name.as_deref(),
+                        conversation_name.as_deref(),
                     )
                     .await?;
                 // Persist the principal OID on the session row so a resumed session
