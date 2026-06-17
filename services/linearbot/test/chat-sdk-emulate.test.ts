@@ -495,10 +495,61 @@ describe("linearbot comment-thread pipeline", () => {
     )!;
     expect(reply.body).toContain("Shipped.");
     expect(reply.body).not.toContain("Linear-Status:");
+    expect(reply.body).toContain(">>> Chain of thought");
     // Terminal marker moves the assigned issue to Done.
     await waitFor(() =>
       linearApi.issueStateUpdates.some((u) => u.stateId === "st-done"),
     );
+    // Kickoff moved it to In Progress when work started (from Todo/unstarted).
+    expect(
+      linearApi.issueStateUpdates.some((u) => u.stateId === "st-progress"),
+    ).toBe(true);
+  });
+
+  it("posts a 'starting work' comment up front on assignment, then swaps it to the answer", async () => {
+    const threadKey = `linear:${ISSUE_ID}`;
+    await postWebhook(
+      issueAssignmentPayload({ updatedAt: "2026-06-16T04:00:00.000Z" }),
+    );
+    // The comment lands before any agent output is emitted.
+    await waitFor(() =>
+      linearApi.botComments.some((c) => c.issueId === ISSUE_ID && !c.parentId),
+    );
+    const start = linearApi.botComments.find(
+      (c) => c.issueId === ISSUE_ID && !c.parentId,
+    )!;
+    expect(start.body).toContain("On it");
+    expect(start.body).toContain(">>> Thinking…");
+
+    codexApi.emitOutputLines(threadKey, sampleCodexOutputLines("All done."));
+    await waitFor(() =>
+      linearApi.botComments.some(
+        (c) =>
+          c.issueId === ISSUE_ID && !c.parentId && c.body.includes("All done."),
+      ),
+    );
+    // Edited in place: still a single top-level comment.
+    expect(
+      linearApi.botComments.filter(
+        (c) => c.issueId === ISSUE_ID && !c.parentId,
+      ),
+    ).toHaveLength(1);
+  });
+
+  it("does not run a turn on a non-assignee edit to an issue the bot owns", async () => {
+    await postWebhook(
+      issueAssignmentPayload({
+        updatedAt: "2026-06-16T05:00:00.000Z",
+        updatedFrom: { description: "old description" },
+      }),
+    );
+    await Bun.sleep(100);
+    expect(
+      codexApi.executes.some((e) => e.threadKey === `linear:${ISSUE_ID}`),
+    ).toBe(false);
+    expect(
+      linearApi.botComments.some((c) => c.issueId === ISSUE_ID && !c.parentId),
+    ).toBe(false);
   });
 
   it("dedupes a redelivered assignment webhook", async () => {
@@ -697,6 +748,7 @@ function agentSessionPromptedPayload(input: {
 function issueAssignmentPayload(input: {
   updatedAt: string;
   assigneeId?: string;
+  updatedFrom?: Record<string, unknown>;
 }) {
   return {
     action: "update",
@@ -705,6 +757,7 @@ function issueAssignmentPayload(input: {
     organizationId: ORG_ID,
     webhookTimestamp: Date.now(),
     webhookId: "wh-issue",
+    ...(input.updatedFrom ? { updatedFrom: input.updatedFrom } : {}),
     data: {
       id: ISSUE_ID,
       assigneeId: input.assigneeId ?? BOT_USER_ID,

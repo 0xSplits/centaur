@@ -46,6 +46,7 @@ import { postIssueReply, updateIssueReply } from "./linear-reply";
 import {
   extractStatusMarker,
   fetchIssueStatus,
+  kickoffTargetState,
   markerTargetState,
   statusTraceFields,
   updateIssueState,
@@ -408,6 +409,11 @@ const LIVE_THINKING_EDIT_MIN_INTERVAL_MS = 2_500;
 // description rides inline in the execute, so keep it bounded (the whole issue
 // description, untruncated, could be huge).
 const ISSUE_CONTEXT_PREAMBLE_MAX_CHARS = 8_000;
+// Headline of the comment posted the moment the bot picks up a delegated issue
+// (an assignment turn has no triggering comment to react to, so the comment
+// itself is the "I've started" signal). Replaced by the live thought, then the
+// final answer, as the run proceeds.
+const WORK_START_HEADLINE = "On it — working on this issue.";
 const PROFILE_HANDLE_PATTERN = /\/profiles\/([^/?#]+)/;
 
 type ThreadHandlerInput = {
@@ -700,6 +706,7 @@ function handleIssueAssignment(
       .linearClient;
     backgroundWaitUntil(
       runThreadTurn({
+        announceStart: true,
         applyStatus: true,
         client,
         executeMessage: assignmentInstructionMessage(event, threadKey),
@@ -723,6 +730,13 @@ function handleIssueAssignment(
  * retry on transient (cold-start) failures; a hard failure shows an error.
  */
 async function runThreadTurn(input: {
+  /**
+   * Post the reply (and move the issue to In Progress) the moment work starts,
+   * before any thought streams — for assignment turns, which have no triggering
+   * comment to react to. Mentions leave this off (they post on the first thought
+   * and ack with a 👀 reaction instead).
+   */
+  announceStart?: boolean;
   applyStatus: boolean;
   client: LinearSessionCapableAdapter["linearClient"];
   executeMessage: LinearbotApiMessage;
@@ -737,6 +751,7 @@ async function runThreadTurn(input: {
   trace: LinearbotTrace;
 }): Promise<void> {
   const {
+    announceStart,
     applyStatus,
     client,
     executeMessage,
@@ -764,6 +779,14 @@ async function runThreadTurn(input: {
         error: errorMessage(error),
       });
     }
+  }
+  // Delegation is ownership: move the issue to In Progress the moment work
+  // starts (the agent signals the terminal status itself at the end). Gated on
+  // applyStatus, so mention turns never touch status. Best-effort; backgrounded
+  // — and since the assignment trigger now requires the assignee to actually
+  // change, this status write won't bounce back as a fresh assignment turn.
+  if (applyStatus && client) {
+    backgroundWaitUntil(applyKickoffStatus(client, issueId, options, trace));
   }
   const threadState = (await thread.state) ?? {};
   // Tell the agent what task it's on by riding the issue context inline in the
@@ -844,6 +867,25 @@ async function runThreadTurn(input: {
       });
     }
   };
+  // Assignment turns have no triggering comment to react to, so post the reply
+  // up front as the "I've started" signal — the chain of thought then fills in
+  // live (renderThinking) and the answer takes over when the run settles.
+  if (announceStart && client) {
+    livePostStarted = true;
+    lastLiveLineCount = 0;
+    lastLiveRenderAtMs = nowMs();
+    try {
+      liveCommentId = await postIssueReply(client, {
+        body: buildThinkingReplyBody([], WORK_START_HEADLINE),
+        issueId,
+        parentCommentId,
+      });
+    } catch (error) {
+      logger.debug("linearbot_live_render_failed", {
+        error: errorMessage(error),
+      });
+    }
+  }
 
   let body: string | undefined;
   let marker: LinearStatusMarker | undefined;
@@ -975,6 +1017,38 @@ function assignmentInstructionMessage(
     threadId: threadKey,
     timestamp: new Date().toISOString(),
   };
+}
+
+/**
+ * Moves a freshly delegated issue to a started ("In Progress") state when the
+ * agent kicks off work — only from triage/backlog/unstarted, never overriding a
+ * state a human or the agent set deliberately. Best-effort; never throws.
+ */
+async function applyKickoffStatus(
+  client: LinearSessionCapableAdapter["linearClient"],
+  issueId: string,
+  options: LinearbotOptions,
+  trace: LinearbotTrace,
+): Promise<void> {
+  if (!client) return;
+  try {
+    const status = await fetchIssueStatus(client, issueId);
+    if (!status) return;
+    const target = kickoffTargetState(status);
+    if (!target) return;
+    await updateIssueState(client, issueId, target.id);
+    traceLog(
+      options,
+      "linearbot_assignment_kickoff_status_applied",
+      trace,
+      statusTraceFields(issueId, target),
+    );
+  } catch (error) {
+    (options.logger ?? noopLogger).warn(
+      "linearbot_assignment_kickoff_status_failed",
+      { error: errorMessage(error) },
+    );
+  }
 }
 
 /**

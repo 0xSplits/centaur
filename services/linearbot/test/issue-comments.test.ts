@@ -2,8 +2,29 @@ import { describe, expect, it } from "bun:test";
 import {
   isSessionThreadComment,
   issueSessionsKey,
+  parseIssueAssignmentWebhook,
   parseIssueCommentWebhook,
 } from "../src/issue-comments";
+
+const BOT_USER_ID = "bot-1";
+
+function assignmentPayload(
+  topLevel: Record<string, unknown> = {},
+  dataOverrides: Record<string, unknown> = {},
+): string {
+  return JSON.stringify({
+    action: "update",
+    type: "Issue",
+    organizationId: "org-1",
+    data: {
+      id: "issue-1",
+      assigneeId: BOT_USER_ID,
+      updatedAt: "2026-06-17T00:00:00.000Z",
+      ...dataOverrides,
+    },
+    ...topLevel,
+  });
+}
 
 function commentPayload(overrides: Record<string, unknown> = {}): string {
   return JSON.stringify({
@@ -70,6 +91,62 @@ describe("parseIssueCommentWebhook", () => {
     expect(parseIssueCommentWebhook(commentPayload({ body: "  " }))).toBeNull();
     expect(
       parseIssueCommentWebhook(commentPayload({ issueId: undefined })),
+    ).toBeNull();
+  });
+});
+
+describe("parseIssueAssignmentWebhook", () => {
+  it("fires when the assignee just changed to the bot", () => {
+    const event = parseIssueAssignmentWebhook(
+      assignmentPayload({ updatedFrom: { assigneeId: "user-9" } }),
+      BOT_USER_ID,
+    );
+    expect(event?.issueId).toBe("issue-1");
+    expect(event?.assigneeId).toBe(BOT_USER_ID);
+  });
+
+  it("fires when assigned from unassigned (null) to the bot", () => {
+    expect(
+      parseIssueAssignmentWebhook(
+        assignmentPayload({ updatedFrom: { assigneeId: null } }),
+        BOT_USER_ID,
+      ),
+    ).not.toBeNull();
+  });
+
+  it("does NOT fire on an edit to an issue the bot already owns", () => {
+    expect(
+      parseIssueAssignmentWebhook(
+        assignmentPayload({ updatedFrom: { description: "old text" } }),
+        BOT_USER_ID,
+      ),
+    ).toBeNull();
+  });
+
+  it("does NOT fire on the bot's own status change (updatedFrom lacks assigneeId)", () => {
+    expect(
+      parseIssueAssignmentWebhook(
+        assignmentPayload({ updatedFrom: { stateId: "st-old" } }),
+        BOT_USER_ID,
+      ),
+    ).toBeNull();
+  });
+
+  it("falls back to the assignee check when updatedFrom is absent", () => {
+    expect(
+      parseIssueAssignmentWebhook(assignmentPayload(), BOT_USER_ID),
+    ).not.toBeNull();
+  });
+
+  it("ignores updates whose current assignee is not the bot", () => {
+    expect(
+      parseIssueAssignmentWebhook(
+        assignmentPayload(
+          { updatedFrom: { assigneeId: BOT_USER_ID } },
+          { assigneeId: "user-9" },
+        ),
+        BOT_USER_ID,
+      ),
     ).toBeNull();
   });
 });

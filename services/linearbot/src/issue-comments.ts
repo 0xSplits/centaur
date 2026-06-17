@@ -72,10 +72,18 @@ export type IssueAssignmentEvent = {
 };
 
 /**
- * Parses an `Issue`/`update` webhook into an IssueAssignmentEvent when the
- * issue's assignee is now `botUserId` (the bot was assigned/delegated the
- * issue). Returns null otherwise. The Centaur-forward model uses this instead
- * of an AgentSessionEvent so assignment turns survive agent sessions being off.
+ * Parses an `Issue`/`update` webhook into an IssueAssignmentEvent when the issue
+ * was just (re)assigned TO `botUserId` — not on every later edit to an issue the
+ * bot already owns. Returns null otherwise. The Centaur-forward model uses this
+ * instead of an AgentSessionEvent so assignment turns survive agent sessions
+ * being off.
+ *
+ * Linear's update webhook lists the prior values of changed fields in
+ * `updatedFrom`; so when it's present without `assigneeId`, the assignee did NOT
+ * change and we must not re-run the agent (otherwise a label/description edit —
+ * or the bot's own end-of-turn status change, itself an Issue update — would
+ * trigger a fresh turn). When `updatedFrom` is absent we fall back to the
+ * assignee check alone, to stay robust if a payload omits it.
  */
 export function parseIssueAssignmentWebhook(
   rawBody: string,
@@ -94,6 +102,12 @@ export function parseIssueAssignmentWebhook(
   const issueId = stringValue(data.id);
   const assigneeId = stringValue(data.assigneeId);
   if (!issueId || !assigneeId || assigneeId !== botUserId) return null;
+  const updatedFrom = isJsonObject(payload.updatedFrom)
+    ? payload.updatedFrom
+    : isJsonObject(data.updatedFrom)
+      ? data.updatedFrom
+      : undefined;
+  if (updatedFrom && !("assigneeId" in updatedFrom)) return null;
   return {
     issueId,
     assigneeId,
