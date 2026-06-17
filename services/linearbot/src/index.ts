@@ -70,7 +70,13 @@ import type {
   LinearbotTrace,
   LinearSessionCapableAdapter,
 } from "./types";
-import { errorMessage, noopLogger, nowMs, traceLog } from "./utils";
+import {
+  errorMessage,
+  noopLogger,
+  nowMs,
+  stringValue,
+  traceLog,
+} from "./utils";
 
 export type {
   Linearbot,
@@ -208,12 +214,17 @@ export function createLinearbot(options: LinearbotOptions): Linearbot {
 
   // The Linear adapter resolves the bot's user id during chat.initialize();
   // assignment (an Issue webhook the adapter doesn't otherwise touch) needs it.
-  // Init once, lazily, on the first webhook — idempotent and best-effort.
+  // We also resolve the bot's profile handle here: Linear renders a mention as
+  // the mentioned profile's plain URL, so commentMentionsBot matches that handle
+  // (linear.app/.../profiles/{handle}) in the body. Init once, lazily, on the
+  // first webhook — idempotent and best-effort.
   let chatInitialized = false;
+  let botProfileHandle: string | undefined;
   const ensureChatInitialized = async (): Promise<void> => {
     if (chatInitialized) return;
     try {
       await chat.initialize();
+      botProfileHandle = await resolveBotProfileHandle(linear, logger);
     } catch (error) {
       logger.warn("linearbot_chat_initialize_failed", {
         error: errorMessage(error),
@@ -256,6 +267,7 @@ export function createLinearbot(options: LinearbotOptions): Linearbot {
         botUserId = undefined;
       }
       const handlerInput: ThreadHandlerInput = {
+        botProfileHandle,
         botUserId,
         chat,
         options,
@@ -382,13 +394,43 @@ function issueCommentMessage(
 }
 
 const THREAD_TURN_MAX_RETRIES = 3;
+const PROFILE_HANDLE_PATTERN = /\/profiles\/([^/?#]+)/;
 
 type ThreadHandlerInput = {
+  botProfileHandle: string | undefined;
   botUserId: string | undefined;
   chat: Chat<Record<string, Adapter>, LinearbotThreadState>;
   options: LinearbotOptions;
   state: StateAdapter;
 };
+
+/**
+ * Resolves the bot's profile handle (the `{handle}` in its
+ * linear.app/.../profiles/{handle} URL) so commentMentionsBot can match the
+ * mention Linear renders into the comment body. Best-effort; returns undefined
+ * on failure (detection falls back to user id / @name).
+ */
+async function resolveBotProfileHandle(
+  linear: unknown,
+  logger: Logger,
+): Promise<string | undefined> {
+  const client = (linear as LinearSessionCapableAdapter).linearClient;
+  if (!client?.client?.rawRequest) return undefined;
+  try {
+    const response = await client.client.rawRequest<{
+      viewer?: { url?: unknown };
+    }>("query LinearbotBotProfile { viewer { id url } }");
+    const url = stringValue(response.data?.viewer?.url);
+    return url
+      ? (PROFILE_HANDLE_PATTERN.exec(url)?.[1] ?? undefined)
+      : undefined;
+  } catch (error) {
+    logger.debug("linearbot_bot_profile_resolve_failed", {
+      error: errorMessage(error),
+    });
+    return undefined;
+  }
+}
 
 /**
  * Centaur-forward model: the Linear agent session an @-mention creates is
@@ -427,7 +469,14 @@ function handleCommentMention(
   const event = parseIssueCommentWebhook(rawBody);
   if (!event) return null;
   const names = [input.options.userName ?? "centaur"];
-  if (!commentMentionsBot(event.body, names, input.botUserId)) return null;
+  if (
+    !commentMentionsBot(event.body, names, {
+      botUserId: input.botUserId,
+      profileHandle: input.botProfileHandle,
+    })
+  ) {
+    return null;
+  }
   const { chat, options } = input;
   const rootCommentId = event.parentId ?? event.commentId;
   const threadKey = `linear:${event.issueId}:c:${rootCommentId}`;

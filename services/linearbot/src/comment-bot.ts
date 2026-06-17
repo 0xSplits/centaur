@@ -15,18 +15,26 @@ const ANSWER_MAX_CHARS = 50_000;
 type CommentBotTaskChunk = Extract<ChatSDKStreamChunk, { type: "task_update" }>;
 
 /**
- * True when the comment addresses the bot. The bot stays mentionable, so a real
- * mention is encoded in the body — match either the bot's user id (the mention
- * markup carries it) or one of its `@name` handles, case-insensitively. The
- * exact token is worth confirming live; `names`/`botUserId` widen easily.
+ * True when the comment addresses the bot. Linear encodes a mention as the
+ * mentioned profile's PLAIN URL in the markdown body
+ * (`https://linear.app/{ws}/profiles/{handle}`) — NOT `@name` text or the user
+ * UUID (see linear.app/developers/graphql#adding-mentions-in-markdown). So match
+ * the bot's profile handle in such a URL first; fall back to the user id and a
+ * typed `@name` for robustness.
  */
 export function commentMentionsBot(
   body: string,
   names: string[],
-  botUserId?: string,
+  markers: { botUserId?: string; profileHandle?: string } = {},
 ): boolean {
+  if (
+    markers.profileHandle &&
+    body.includes(`/profiles/${markers.profileHandle}`)
+  ) {
+    return true;
+  }
+  if (markers.botUserId && body.includes(markers.botUserId)) return true;
   const haystack = body.toLowerCase();
-  if (botUserId && body.includes(botUserId)) return true;
   return names.some((name) => {
     const needle = name.trim().toLowerCase();
     return needle.length > 0 && haystack.includes(`@${needle}`);

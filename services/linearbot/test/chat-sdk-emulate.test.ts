@@ -39,6 +39,7 @@ import { noopLogger } from "../src/utils";
 const WEBHOOK_SECRET = "linearbot-emulate-secret";
 const ORG_ID = "org-1";
 const BOT_USER_ID = "bot-user-1";
+const BOT_PROFILE_HANDLE = "centaur-bot";
 const USER_ID = "user-1";
 const ISSUE_ID = "issue-1";
 
@@ -115,6 +116,26 @@ describe("linearbot comment-thread pipeline", () => {
     expect(codexApi.executes.some((e) => e.threadKey.includes(":s:"))).toBe(
       false,
     );
+  });
+
+  it("detects a mention rendered as Linear's profile URL (not @name text)", async () => {
+    const threadKey = `linear:${ISSUE_ID}:c:comment-url`;
+    await postWebhook(
+      commentCreatedPayload({
+        id: "comment-url",
+        body: `https://linear.app/acme/profiles/${BOT_PROFILE_HANDLE} how long will this take?`,
+      }),
+    );
+    await waitFor(() =>
+      codexApi.executes.some((e) => e.threadKey === threadKey),
+    );
+    codexApi.emitOutputLines(threadKey, sampleCodexOutputLines("A day."));
+    await waitFor(() =>
+      linearApi.botComments.some((c) => c.parentId === "comment-url"),
+    );
+    expect(
+      linearApi.botComments.find((c) => c.parentId === "comment-url")!.body,
+    ).toContain("A day.");
   });
 
   it("reacts 👀 on notice and swaps to ✅ when finished", async () => {
@@ -750,6 +771,14 @@ function startFakeLinearApi(): FakeLinearApi {
           id: BOT_USER_ID,
           displayName: "centaur",
           organization: { id: ORG_ID },
+        },
+      };
+    }
+    if (query.includes("LinearbotBotProfile")) {
+      return {
+        viewer: {
+          id: BOT_USER_ID,
+          url: `https://linear.app/acme/profiles/${BOT_PROFILE_HANDLE}`,
         },
       };
     }
