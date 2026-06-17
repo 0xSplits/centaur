@@ -77,7 +77,6 @@ import type {
 } from "./types";
 import {
   errorMessage,
-  isJsonObject,
   noopLogger,
   nowMs,
   stringValue,
@@ -247,9 +246,6 @@ export function createLinearbot(options: LinearbotOptions): Linearbot {
   const handleLinearWebhook = async (c: Context) => {
     const rawBody = await c.req.raw.clone().text();
     await ensureChatInitialized();
-    // TEMP delegate diagnostic — remove once we've confirmed how delegation
-    // surfaces in webhooks (see logIncomingWebhookShape).
-    logIncomingWebhookShape(rawBody, linear, logger);
     const awaitHandoff = shouldAwaitLinearHandoff(rawBody);
     const handoffTasks: Promise<unknown>[] = [];
     const context: LinearbotRequestContext = {
@@ -1248,53 +1244,6 @@ function backgroundWaitUntil(promise: Promise<unknown>): void {
     return;
   }
   void promise.catch(() => undefined);
-}
-
-/**
- * TEMP delegate diagnostic — remove once we've confirmed how delegation reaches
- * us. Logs (at info, so it's visible without flipping log levels) a compact
- * shape of every incoming webhook: type/action, the bot's own id, the issue's
- * assignee/delegate ids and `data` keys, and which fields are in `updatedFrom`.
- * Delegate one test issue and read off whether an Issue webhook carries a
- * `delegate_id` matching `bot_user_id`. Compact (keys + ids only, no full body)
- * so it doesn't block the event loop.
- */
-function logIncomingWebhookShape(
-  rawBody: string,
-  linear: unknown,
-  logger: Logger,
-): void {
-  let payload: unknown;
-  try {
-    payload = JSON.parse(rawBody);
-  } catch {
-    return;
-  }
-  if (!isJsonObject(payload)) return;
-  let botUserId: string | undefined;
-  try {
-    botUserId = (linear as LinearSessionCapableAdapter).botUserId;
-  } catch {
-    botUserId = undefined;
-  }
-  const data = isJsonObject(payload.data) ? payload.data : undefined;
-  const updatedFrom = isJsonObject(payload.updatedFrom)
-    ? payload.updatedFrom
-    : undefined;
-  logger.info("linearbot_webhook_debug", {
-    type: payload.type,
-    action: payload.action,
-    bot_user_id: botUserId,
-    ...(data
-      ? {
-          data_id: data.id,
-          assignee_id: data.assigneeId ?? null,
-          delegate_id: data.delegateId ?? null,
-          data_keys: Object.keys(data),
-        }
-      : {}),
-    ...(updatedFrom ? { updated_from_keys: Object.keys(updatedFrom) } : {}),
-  });
 }
 
 /**
