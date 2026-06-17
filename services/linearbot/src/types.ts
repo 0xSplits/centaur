@@ -127,8 +127,13 @@ export type Linearbot = {
 };
 
 export type LinearbotThreadState = {
-  /** Set once the thread's first turn has seeded the issue context. */
+  /** Set once the thread's first turn has run (gates follow-up ingestion). */
   historyForwarded?: boolean;
+  /**
+   * Set once the full issue context (with description) has ridden a turn's
+   * execute; later turns prepend only the compact id/title header instead.
+   */
+  contextSeeded?: boolean;
   /** Highest session-event id seen, used as the replay watermark. */
   lastEventId?: number;
   /**

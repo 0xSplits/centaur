@@ -94,11 +94,16 @@ describe("linearbot comment-thread pipeline", () => {
     await waitFor(() =>
       codexApi.executes.some((e) => e.threadKey === threadKey),
     );
-    // Issue context is fetched and seeded on the thread's first turn.
-    const seeded = codexApi.appends
-      .filter((a) => a.threadKey === threadKey)
-      .flatMap((a) => sessionMessageTexts(a.body.messages));
-    expect(seeded.some((t) => t.includes("[Linear issue context]"))).toBe(true);
+    // The issue context rides inline in the first turn's execute prompt (so the
+    // agent always knows what the task is), including the issue description.
+    const execTexts = executeInputTexts(threadKey);
+    expect(execTexts.some((t) => t.includes("[Linear issue context]"))).toBe(
+      true,
+    );
+    expect(execTexts.some((t) => t.includes("Something broke"))).toBe(true);
+    expect(execTexts.some((t) => t.includes("The deploy fails on boot."))).toBe(
+      true,
+    );
 
     codexApi.emitOutputLines(threadKey, sampleCodexOutputLines("About a day."));
 
@@ -124,6 +129,58 @@ describe("linearbot comment-thread pipeline", () => {
     expect(codexApi.executes.some((e) => e.threadKey.includes(":s:"))).toBe(
       false,
     );
+  });
+
+  it("seeds full context on the first turn, then only the compact header on later turns", async () => {
+    const threadKey = `linear:${ISSUE_ID}:c:comment-twoturn`;
+    await postWebhook(
+      commentCreatedPayload({ id: "comment-twoturn", body: "@centaur first" }),
+    );
+    await waitFor(() =>
+      codexApi.executes.some((e) => e.threadKey === threadKey),
+    );
+    codexApi.emitOutputLines(threadKey, sampleCodexOutputLines("One."));
+    await waitFor(() =>
+      linearApi.botComments.some(
+        (c) => c.parentId === "comment-twoturn" && c.body.includes("One."),
+      ),
+    );
+    // First turn carries the full context, description included.
+    expect(
+      executeInputTexts(threadKey).some((t) =>
+        t.includes("The deploy fails on boot."),
+      ),
+    ).toBe(true);
+    const execsAfterFirst = codexApi.executes.filter(
+      (e) => e.threadKey === threadKey,
+    ).length;
+
+    // A second mention in the same thread (reply under the root comment).
+    await postWebhook(
+      commentCreatedPayload({
+        id: "comment-twoturn-2",
+        parentId: "comment-twoturn",
+        body: "@centaur second",
+      }),
+    );
+    await waitFor(
+      () =>
+        codexApi.executes.filter((e) => e.threadKey === threadKey).length >
+        execsAfterFirst,
+    );
+    // The second turn carries the compact header (task id + title) but not the
+    // full description again.
+    const secondExec = codexApi.executes
+      .filter((e) => e.threadKey === threadKey)
+      .at(-1)!;
+    const secondTexts = secondExec.body.input_lines.flatMap(inputLineTexts);
+    expect(secondTexts.some((t) => t.includes("[Linear issue context]"))).toBe(
+      true,
+    );
+    expect(secondTexts.some((t) => t.includes("Something broke"))).toBe(true);
+    expect(
+      secondTexts.some((t) => t.includes("The deploy fails on boot.")),
+    ).toBe(false);
   });
 
   it("posts a live 'Thinking…' comment on the first thought, then swaps it to the answer in place", async () => {
@@ -671,6 +728,28 @@ function appendedTexts(): string[] {
   return codexApi.appends.flatMap((append) =>
     sessionMessageTexts(append.body.messages),
   );
+}
+
+// Text parts of every execute prompt on a thread — the issue context rides here
+// (as a contextPreamble) ahead of the user's message.
+function executeInputTexts(threadKey: string): string[] {
+  return codexApi.executes
+    .filter((e) => e.threadKey === threadKey)
+    .flatMap((e) => e.body.input_lines)
+    .flatMap(inputLineTexts);
+}
+
+function inputLineTexts(line: string): string[] {
+  try {
+    const parsed = JSON.parse(line) as {
+      message?: { content?: Array<{ text?: unknown }> };
+    };
+    return (parsed.message?.content ?? []).flatMap((part) =>
+      typeof part.text === "string" ? [part.text] : [],
+    );
+  } catch {
+    return [];
+  }
 }
 
 // Number of append requests on a thread whose messages contain `text` — used to

@@ -30,7 +30,9 @@ import {
 } from "./comment-bot";
 import {
   EMPTY_PROMPT_INSTRUCTION,
-  fetchIssueContextText,
+  fetchLinearIssueContext,
+  formatIssueContext,
+  formatIssueContextHeader,
 } from "./linear-context";
 import { ackWorking } from "./linear-narrator";
 import {
@@ -402,6 +404,10 @@ const THREAD_TURN_MAX_RETRIES = 3;
 // thought posts immediately; subsequent thoughts coalesce to stay well under
 // Linear's mutation rate limits. The final answer always writes regardless.
 const LIVE_THINKING_EDIT_MIN_INTERVAL_MS = 2_500;
+// Cap on the full issue-context preamble seeded on a thread's first turn. The
+// description rides inline in the execute, so keep it bounded (the whole issue
+// description, untruncated, could be huge).
+const ISSUE_CONTEXT_PREAMBLE_MAX_CHARS = 8_000;
 const PROFILE_HANDLE_PATTERN = /\/profiles\/([^/?#]+)/;
 
 type ThreadHandlerInput = {
@@ -760,21 +766,35 @@ async function runThreadTurn(input: {
     }
   }
   const threadState = (await thread.state) ?? {};
-  const contextMessages: LinearbotApiMessage[] = [];
-  if (!threadState.historyForwarded && client) {
-    const contextText = await fetchIssueContextText(client, issueId, logger);
-    if (contextText) {
-      contextMessages.push(
-        issueContextMessage(contextText, threadKey, executeMessage.timestamp),
-      );
+  // Tell the agent what task it's on by riding the issue context inline in the
+  // execute (contextPreamble lands directly in the prompt's input lines) rather
+  // than as a one-time appended session message — so a recycled sandbox or a
+  // single failed fetch never leaves the agent guessing what "this task" is.
+  // Full context (with description) on the thread's first turn; a compact
+  // id/title header thereafter, when the session already carries the rest.
+  let contextPreamble: string | undefined;
+  let seededFullContext = false;
+  if (client) {
+    const issueContext = await fetchLinearIssueContext(client, issueId, logger);
+    if (issueContext) {
+      if (threadState.contextSeeded) {
+        contextPreamble = formatIssueContextHeader(issueContext);
+      } else {
+        contextPreamble = formatIssueContext(
+          issueContext,
+          ISSUE_CONTEXT_PREAMBLE_MAX_CHARS,
+        );
+        seededFullContext = true;
+      }
     }
   }
   let lastEventId = threadState.lastEventId ?? 0;
   const forwardInput: ForwardSessionInput = {
     afterEventId: lastEventId,
+    contextPreamble,
     executeMessage,
     harnessType: overrides.harnessType,
-    messages: contextMessages,
+    messages: [],
     model: overrides.model,
     onEventId: (eventId) => {
       lastEventId = Math.max(lastEventId, eventId);
@@ -847,7 +867,12 @@ async function runThreadTurn(input: {
         collector.update(chunk);
         await renderThinking(collector);
       }
-      await thread.setState({ historyForwarded: true });
+      await thread.setState({
+        historyForwarded: true,
+        // Only mark seeded once the full context actually rode a turn, so a
+        // failed first fetch re-seeds (not just the compact header) next time.
+        ...(seededFullContext ? { contextSeeded: true } : {}),
+      });
       if (collector.failed) {
         failed = true;
         body = buildCommentReplyBody({
@@ -927,30 +952,6 @@ async function runThreadTurn(input: {
     chars: body?.length ?? 0,
     failed,
   });
-}
-
-/** Synthetic issue-context message seeding a thread's first turn. */
-function issueContextMessage(
-  text: string,
-  threadKey: string,
-  timestamp: string,
-): LinearbotApiMessage {
-  return {
-    attachments: [],
-    author: {
-      fullName: "Linear",
-      isBot: true,
-      isMe: false,
-      userId: "linear",
-      userName: "linear",
-    },
-    id: `linear-context-${threadKey}`,
-    isMention: false,
-    raw: { linearbotSyntheticContext: true },
-    text,
-    threadId: threadKey,
-    timestamp,
-  };
 }
 
 /** Synthetic "work this assigned issue" prompt for an assignment turn. */

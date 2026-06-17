@@ -174,16 +174,28 @@ type IssueContextData = {
   } | null;
 };
 
+export const ISSUE_CONTEXT_HEADER = "[Linear issue context]";
+
+/** The issue an @-mention / assignment is about, reduced to context fields. */
+export type LinearIssueContext = {
+  identifier?: string;
+  title?: string;
+  description?: string;
+  url?: string;
+  status?: string;
+};
+
 /**
  * Centaur-forward model: a Comment/Issue webhook carries no `promptContext`
- * blob, so the bot fetches the issue itself to seed a thread's first turn with
- * what it's working on. Returns null on any failure (never fail the turn).
+ * blob, so the bot fetches the issue itself to tell the agent what it's working
+ * on. Returns null on any failure or when the issue has no identifying fields
+ * (never fail the turn); logs the reason so a persistent miss is diagnosable.
  */
-export async function fetchIssueContextText(
+export async function fetchLinearIssueContext(
   client: LinearRawRequestClient,
   issueId: string,
   logger: Logger,
-): Promise<string | null> {
+): Promise<LinearIssueContext | null> {
   if (!client.client?.rawRequest) return null;
   let issue: IssueContextData["issue"];
   try {
@@ -194,35 +206,75 @@ export async function fetchIssueContextText(
     issue = response.data?.issue;
   } catch (error) {
     logger.warn("linearbot_issue_context_failed", {
+      issue_id: issueId,
       error: errorMessage(error),
     });
     return null;
   }
-  if (!issue) return null;
-  const header = [stringValue(issue.identifier), stringValue(issue.title)]
-    .filter(Boolean)
-    .join(": ");
-  const facts = [
-    issue.state?.name ? `Status: ${stringValue(issue.state.name)}` : undefined,
-    issue.url ? `URL: ${stringValue(issue.url)}` : undefined,
-  ].filter(Boolean);
-  const description = stringValue(issue.description);
-  const sections = [
-    "[Linear issue context]",
-    header,
-    facts.join("\n"),
-    description ? `Description:\n${description}` : undefined,
-  ].filter(Boolean);
-  if (sections.length <= 1) return null;
-  return truncateContext(sections.join("\n\n"));
+  if (!issue) {
+    logger.warn("linearbot_issue_context_empty", { issue_id: issueId });
+    return null;
+  }
+  const context: LinearIssueContext = {
+    identifier: stringValue(issue.identifier),
+    title: stringValue(issue.title),
+    description: stringValue(issue.description),
+    url: stringValue(issue.url),
+    status: issue.state?.name ? stringValue(issue.state.name) : undefined,
+  };
+  // Without an identifier or title there's nothing that tells the agent which
+  // task this is — the whole point of the context.
+  if (!context.identifier && !context.title) {
+    logger.warn("linearbot_issue_context_insufficient", { issue_id: issueId });
+    return null;
+  }
+  return context;
 }
 
-function truncateContext(text: string): string {
-  if (text.length <= CONTEXT_MAX_CHARS) return text;
-  let omitted = text.length - CONTEXT_MAX_CHARS;
+/**
+ * Full issue context (identifier, title, status, url, description) — seeded on a
+ * thread's first turn so the agent knows what the task is.
+ */
+export function formatIssueContext(
+  context: LinearIssueContext,
+  maxChars = CONTEXT_MAX_CHARS,
+): string {
+  const header = [context.identifier, context.title].filter(Boolean).join(": ");
+  const facts = [
+    context.status ? `Status: ${context.status}` : undefined,
+    context.url ? `URL: ${context.url}` : undefined,
+  ].filter(Boolean);
+  const sections = [
+    ISSUE_CONTEXT_HEADER,
+    header,
+    facts.join("\n"),
+    context.description ? `Description:\n${context.description}` : undefined,
+  ].filter(Boolean);
+  return truncateContext(sections.join("\n\n"), maxChars);
+}
+
+/**
+ * Compact one-line issue header (no description) — prepended on follow-up turns
+ * so the agent always knows the task id/title, even if its sandbox lost the
+ * fuller context that the first turn seeded.
+ */
+export function formatIssueContextHeader(context: LinearIssueContext): string {
+  const name = [context.identifier, context.title].filter(Boolean).join(": ");
+  return [
+    `${ISSUE_CONTEXT_HEADER} ${name}`.trim(),
+    context.status ? `(${context.status})` : undefined,
+    context.url,
+  ]
+    .filter(Boolean)
+    .join(" ");
+}
+
+function truncateContext(text: string, maxChars = CONTEXT_MAX_CHARS): string {
+  if (text.length <= maxChars) return text;
+  let omitted = text.length - maxChars;
   while (true) {
     const suffix = `\n[truncated ${omitted} chars from Linear issue context]`;
-    const keep = Math.max(0, CONTEXT_MAX_CHARS - suffix.length);
+    const keep = Math.max(0, maxChars - suffix.length);
     const actualOmitted = text.length - keep;
     if (actualOmitted === omitted)
       return `${text.slice(0, keep).trimEnd()}${suffix}`;
