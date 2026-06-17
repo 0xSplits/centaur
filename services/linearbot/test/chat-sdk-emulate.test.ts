@@ -102,8 +102,12 @@ describe("linearbot comment-thread pipeline", () => {
 
     codexApi.emitOutputLines(threadKey, sampleCodexOutputLines("About a day."));
 
+    // The live comment is posted with the first thought, then finalized in
+    // place — wait for the settled answer body, not just the comment.
     await waitFor(() =>
-      linearApi.botComments.some((c) => c.parentId === "comment-q"),
+      linearApi.botComments.some(
+        (c) => c.parentId === "comment-q" && c.body.includes("About a day."),
+      ),
     );
     const reply = linearApi.botComments.find(
       (c) => c.parentId === "comment-q",
@@ -112,10 +116,57 @@ describe("linearbot comment-thread pipeline", () => {
     expect(reply.body).toContain("About a day.");
     expect(reply.body).toContain(">>> Chain of thought");
     expect(reply.body).toContain("pnpm test");
+    // Edited in place, not re-posted: exactly one comment in this thread.
+    expect(
+      linearApi.botComments.filter((c) => c.parentId === "comment-q"),
+    ).toHaveLength(1);
     // The vestigial session is never the surface: no session-keyed execution.
     expect(codexApi.executes.some((e) => e.threadKey.includes(":s:"))).toBe(
       false,
     );
+  });
+
+  it("posts a live 'Thinking…' comment on the first thought, then swaps it to the answer in place", async () => {
+    const threadKey = `linear:${ISSUE_ID}:c:comment-live`;
+    await postWebhook(
+      commentCreatedPayload({ id: "comment-live", body: "@centaur go" }),
+    );
+    await waitFor(() =>
+      codexApi.executes.some((e) => e.threadKey === threadKey),
+    );
+
+    // Stream the thinking phase only — enough to settle one chain-of-thought
+    // line, with no answer or terminal event yet.
+    codexApi.emitOutputLines(threadKey, thinkingOnlyOutputLines());
+    await waitFor(() =>
+      linearApi.botComments.some((c) => c.parentId === "comment-live"),
+    );
+    const live = linearApi.botComments.find(
+      (c) => c.parentId === "comment-live",
+    )!;
+    expect(live.body).toContain(">>> Thinking…");
+    expect(live.body).toContain("pnpm test");
+    expect(live.body).not.toContain(">>> Chain of thought");
+
+    // Stream the answer + terminal — the SAME comment switches to its final
+    // form (answer above a "Chain of thought" section).
+    codexApi.emitOutputLines(threadKey, answerOutputLines("All set."));
+    await waitFor(() =>
+      linearApi.botComments.some(
+        (c) => c.parentId === "comment-live" && c.body.includes("All set."),
+      ),
+    );
+    const finalReply = linearApi.botComments.find(
+      (c) => c.parentId === "comment-live",
+    )!;
+    expect(finalReply.id).toBe(live.id);
+    expect(finalReply.body).toContain("All set.");
+    expect(finalReply.body).toContain(">>> Chain of thought");
+    expect(finalReply.body).not.toContain(">>> Thinking…");
+    // Edited in place, never re-posted.
+    expect(
+      linearApi.botComments.filter((c) => c.parentId === "comment-live"),
+    ).toHaveLength(1);
   });
 
   it("detects a mention rendered as Linear's profile URL (not @name text)", async () => {
@@ -131,7 +182,9 @@ describe("linearbot comment-thread pipeline", () => {
     );
     codexApi.emitOutputLines(threadKey, sampleCodexOutputLines("A day."));
     await waitFor(() =>
-      linearApi.botComments.some((c) => c.parentId === "comment-url"),
+      linearApi.botComments.some(
+        (c) => c.parentId === "comment-url" && c.body.includes("A day."),
+      ),
     );
     expect(
       linearApi.botComments.find((c) => c.parentId === "comment-url")!.body,
@@ -226,6 +279,126 @@ describe("linearbot comment-thread pipeline", () => {
     ).toBe(false);
   });
 
+  it("appends a non-mention follow-up to an active thread's session as context (no run, no reply)", async () => {
+    const threadKey = `linear:${ISSUE_ID}:c:comment-active`;
+    // A mention runs a turn — the thread becomes active (historyForwarded).
+    await postWebhook(
+      commentCreatedPayload({ id: "comment-active", body: "@centaur hi" }),
+    );
+    await waitFor(() =>
+      codexApi.executes.some((e) => e.threadKey === threadKey),
+    );
+    codexApi.emitOutputLines(threadKey, sampleCodexOutputLines("Hello."));
+    await waitFor(() =>
+      linearApi.botComments.some(
+        (c) => c.parentId === "comment-active" && c.body.includes("Hello."),
+      ),
+    );
+    const executesBefore = codexApi.executes.filter(
+      (e) => e.threadKey === threadKey,
+    ).length;
+    const repliesBefore = linearApi.botComments.filter(
+      (c) => c.parentId === "comment-active",
+    ).length;
+
+    // A reply in the thread that does NOT mention the bot.
+    await postWebhook(
+      commentCreatedPayload({
+        id: "comment-follow",
+        parentId: "comment-active",
+        body: "actually, hold off on the deploy",
+      }),
+    );
+    // It is appended to the session as context...
+    await waitFor(() => appendCount(threadKey, "hold off on the deploy") === 1);
+    await Bun.sleep(50);
+    // ...without running a new turn or posting another reply.
+    expect(
+      codexApi.executes.filter((e) => e.threadKey === threadKey).length,
+    ).toBe(executesBefore);
+    expect(
+      linearApi.botComments.filter((c) => c.parentId === "comment-active")
+        .length,
+    ).toBe(repliesBefore);
+  });
+
+  it("ingests a non-mention follow-up that arrives before the first turn finishes", async () => {
+    const threadKey = `linear:${ISSUE_ID}:c:comment-midturn`;
+    // The mention claims the thread and starts a turn; we hold off emitting any
+    // output, so the turn is still streaming (historyForwarded not yet set).
+    await postWebhook(
+      commentCreatedPayload({ id: "comment-midturn", body: "@centaur begin" }),
+    );
+    await waitFor(() =>
+      codexApi.executes.some((e) => e.threadKey === threadKey),
+    );
+
+    // A non-mention reply lands mid-run — still ingested, because the thread is
+    // active via the claimed mention (not yet via historyForwarded).
+    await postWebhook(
+      commentCreatedPayload({
+        id: "comment-midturn-follow",
+        parentId: "comment-midturn",
+        body: "extra detail mid-run",
+      }),
+    );
+    await waitFor(() => appendCount(threadKey, "extra detail mid-run") === 1);
+
+    // Letting the turn finish still posts its answer as normal.
+    codexApi.emitOutputLines(threadKey, sampleCodexOutputLines("Done."));
+    await waitFor(() =>
+      linearApi.botComments.some(
+        (c) => c.parentId === "comment-midturn" && c.body.includes("Done."),
+      ),
+    );
+  });
+
+  it("does not ingest a non-mention comment in a thread the bot is not active in", async () => {
+    const threadKey = `linear:${ISSUE_ID}:c:comment-cold`;
+    await postWebhook(
+      commentCreatedPayload({
+        id: "comment-cold-follow",
+        parentId: "comment-cold",
+        body: "just two humans chatting, no bot involved",
+      }),
+    );
+    await Bun.sleep(100);
+    expect(codexApi.appends.some((a) => a.threadKey === threadKey)).toBe(false);
+    expect(codexApi.creates.some((c) => c.threadKey === threadKey)).toBe(false);
+    expect(codexApi.executes.some((e) => e.threadKey === threadKey)).toBe(
+      false,
+    );
+  });
+
+  it("dedupes a redelivered non-mention follow-up (appends once)", async () => {
+    const threadKey = `linear:${ISSUE_ID}:c:comment-dedup`;
+    await postWebhook(
+      commentCreatedPayload({ id: "comment-dedup", body: "@centaur start" }),
+    );
+    await waitFor(() =>
+      codexApi.executes.some((e) => e.threadKey === threadKey),
+    );
+    codexApi.emitOutputLines(threadKey, sampleCodexOutputLines("Started."));
+    await waitFor(() =>
+      linearApi.botComments.some(
+        (c) => c.parentId === "comment-dedup" && c.body.includes("Started."),
+      ),
+    );
+
+    const followup = () =>
+      commentCreatedPayload({
+        id: "comment-redeliver",
+        parentId: "comment-dedup",
+        body: "one more note for context",
+      });
+    await postWebhook(followup());
+    await waitFor(() => appendCount(threadKey, "one more note") === 1);
+    await Bun.sleep(50);
+    await postWebhook(followup());
+    await Bun.sleep(100);
+    expect(appendCount(threadKey, "one more note")).toBe(1);
+  });
+
   it("runs an agent turn when the issue is assigned to the bot, posting a comment + applying status", async () => {
     const threadKey = `linear:${ISSUE_ID}`;
     const res = await postWebhook(
@@ -252,7 +425,10 @@ describe("linearbot comment-thread pipeline", () => {
       sampleCodexOutputLines("Shipped.\n\nLinear-Status: done"),
     );
     await waitFor(() =>
-      linearApi.botComments.some((c) => c.issueId === ISSUE_ID && !c.parentId),
+      linearApi.botComments.some(
+        (c) =>
+          c.issueId === ISSUE_ID && !c.parentId && c.body.includes("Shipped."),
+      ),
     );
     const reply = linearApi.botComments.find(
       (c) => c.issueId === ISSUE_ID && !c.parentId,
@@ -497,6 +673,16 @@ function appendedTexts(): string[] {
   );
 }
 
+// Number of append requests on a thread whose messages contain `text` — used to
+// assert a non-mention follow-up is appended (and appended exactly once).
+function appendCount(threadKey: string, text: string): number {
+  return codexApi.appends.filter(
+    (a) =>
+      a.threadKey === threadKey &&
+      sessionMessageTexts(a.body.messages).some((t) => t.includes(text)),
+  ).length;
+}
+
 function sessionMessageTexts(messages: LinearbotSessionMessage[]): string[] {
   return messages.flatMap((message) =>
     message.parts.flatMap((part) => {
@@ -532,7 +718,50 @@ async function waitFor(
 // ---------------------------------------------------------------------------
 
 function sampleCodexOutputLines(answer: string): string[] {
-  const notifications = [
+  return [
+    ...sampleCodexNotifications(answer).map((notification) =>
+      JSON.stringify(notification),
+    ),
+    JSON.stringify({
+      type: "turn.completed",
+      turn: { id: "turn-1", items: [] },
+    }),
+  ];
+}
+
+// The thinking phase only: turn start, the answer item, a reasoning delta, and a
+// completed command — enough to settle the first chain-of-thought line, with no
+// answer text or terminal event. Pair with answerOutputLines to finish the run.
+function thinkingOnlyOutputLines(): string[] {
+  return sampleCodexNotifications("")
+    .slice(0, 5)
+    .map((notification) => JSON.stringify(notification));
+}
+
+// The answer delta + terminal event that finalize a run begun with
+// thinkingOnlyOutputLines.
+function answerOutputLines(answer: string): string[] {
+  return [
+    JSON.stringify({
+      method: "item/agentMessage/delta",
+      params: {
+        threadId: "thread-1",
+        turnId: "turn-1",
+        itemId: "answer-1",
+        delta: answer,
+      },
+    }),
+    JSON.stringify({
+      type: "turn.completed",
+      turn: { id: "turn-1", items: [] },
+    }),
+  ];
+}
+
+function sampleCodexNotifications(
+  answer: string,
+): Array<Record<string, unknown>> {
+  return [
     {
       method: "turn/started",
       params: {
@@ -626,13 +855,6 @@ function sampleCodexOutputLines(answer: string): string[] {
       },
     },
   ];
-  return [
-    ...notifications.map((notification) => JSON.stringify(notification)),
-    JSON.stringify({
-      type: "turn.completed",
-      turn: { id: "turn-1", items: [] },
-    }),
-  ];
 }
 
 // ---------------------------------------------------------------------------
@@ -657,7 +879,12 @@ type FakeComment = {
   userId?: string;
 };
 
-type RecordedBotComment = { issueId: string; body: string; parentId?: string };
+type RecordedBotComment = {
+  id: string;
+  issueId: string;
+  body: string;
+  parentId?: string;
+};
 
 type RecordedReaction = { id: string; commentId: string; emoji: string };
 
@@ -840,11 +1067,21 @@ function startFakeLinearApi(): FakeLinearApi {
         botActor: { id: BOT_USER_ID, name: "centaur" },
       });
       botComments.push({
+        id,
         issueId: String(variables.issueId ?? ""),
         body,
         parentId,
       });
-      return { commentCreate: { success: true } };
+      return { commentCreate: { success: true, comment: { id } } };
+    }
+    if (query.includes("LinearbotCommentUpdate")) {
+      const id = String(variables.id ?? "");
+      const body = String(variables.body ?? "");
+      const existing = comments.get(id);
+      if (existing) existing.body = body;
+      const record = botComments.find((comment) => comment.id === id);
+      if (record) record.body = body;
+      return { commentUpdate: { success: true } };
     }
     if (query.includes("LinearbotReactionCreate")) {
       const id = nextId("reaction");

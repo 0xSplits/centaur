@@ -137,6 +137,13 @@ export type LinearbotThreadState = {
    */
   repliedCommentIds?: string[];
   /**
+   * Centaur-forward model: ids of non-mention comments this thread has already
+   * appended to its session as context, so a webhook redelivery never
+   * double-appends. Separate from repliedCommentIds so the high-volume followup
+   * stream can't evict mention ids from their dedup window. Capped FIFO.
+   */
+  ingestedCommentIds?: string[];
+  /**
    * Centaur-forward model: the last assignment trigger (issue `updatedAt`) the
    * bot ran a turn for, so a redelivered Issue webhook doesn't re-run.
    */

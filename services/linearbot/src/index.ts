@@ -24,6 +24,7 @@ import {
 } from "./issue-comments";
 import {
   buildCommentReplyBody,
+  buildThinkingReplyBody,
   commentMentionsBot,
   CommentReplyCollector,
 } from "./comment-bot";
@@ -39,7 +40,7 @@ import {
   REACTION_FAILED,
   REACTION_WORKING,
 } from "./linear-reactions";
-import { postIssueReply } from "./linear-reply";
+import { postIssueReply, updateIssueReply } from "./linear-reply";
 import {
   extractStatusMarker,
   fetchIssueStatus,
@@ -278,6 +279,9 @@ export function createLinearbot(options: LinearbotOptions): Linearbot {
           handleCommentMention(rawBody, handlerInput),
         ) ??
         requestContext.run(context, () =>
+          handleThreadFollowup(rawBody, handlerInput),
+        ) ??
+        requestContext.run(context, () =>
           handleIssueAssignment(rawBody, handlerInput),
         );
       if (handled) handoffTasks.push(handled);
@@ -394,6 +398,10 @@ function issueCommentMessage(
 }
 
 const THREAD_TURN_MAX_RETRIES = 3;
+// Min gap between live edits of the streaming "Thinking…" comment. The first
+// thought posts immediately; subsequent thoughts coalesce to stay well under
+// Linear's mutation rate limits. The final answer always writes regardless.
+const LIVE_THINKING_EDIT_MIN_INTERVAL_MS = 2_500;
 const PROFILE_HANDLE_PATTERN = /\/profiles\/([^/?#]+)/;
 
 type ThreadHandlerInput = {
@@ -533,6 +541,121 @@ function handleCommentMention(
 }
 
 /**
+ * Thread-followup ingester (context only). A comment that does NOT mention the
+ * bot but lands in a comment thread the bot is already active in (the root
+ * thread key has run a turn) is appended to that thread's session as context —
+ * so the next mention turn sees it — without running a turn or posting a reply.
+ * Mirrors slackbotv2's onSubscribedMessage append for non-mention messages,
+ * scoped to active threads (a Linear issue can host many unrelated threads).
+ * Returns null when the webhook is not such a comment.
+ */
+function handleThreadFollowup(
+  rawBody: string,
+  input: ThreadHandlerInput,
+): Promise<void> | null {
+  const event = parseIssueCommentWebhook(rawBody);
+  if (!event) return null;
+  // Mentions are answered by handleCommentMention; only ingest the rest here.
+  const names = [input.options.userName ?? "centaur"];
+  if (
+    commentMentionsBot(event.body, names, {
+      botUserId: input.botUserId,
+      profileHandle: input.botProfileHandle,
+    })
+  ) {
+    return null;
+  }
+  // Loop guard: never ingest the bot's own comments. (parseIssueCommentWebhook
+  // already drops botActor-authored comments; this covers app-user authorship.)
+  if (input.botUserId && event.authorId === input.botUserId) return null;
+  const { chat, options } = input;
+  const rootCommentId = event.parentId ?? event.commentId;
+  const threadKey = `linear:${event.issueId}:c:${rootCommentId}`;
+  const trace: LinearbotTrace = {
+    includeContext: false,
+    messageId: event.commentId,
+    mode: "execute",
+    openStream: false,
+    startedAtMs: nowMs(),
+    threadId: threadKey,
+  };
+  return (async () => {
+    const thread = chat.thread(threadKey);
+    const threadState = (await thread.state) ?? {};
+    // Only ingest into threads the bot is active in: a turn has finished there
+    // (historyForwarded) OR a mention turn has been claimed (repliedCommentIds)
+    // and may still be streaming. The latter captures a followup that lands
+    // mid-run — the session already exists, so the append targets it (and is
+    // seen by the next turn). createSession is idempotent, so even if the
+    // followup wins a race against the first turn's create, it's harmless.
+    const isActiveThread =
+      threadState.historyForwarded === true ||
+      (threadState.repliedCommentIds ?? []).length > 0;
+    if (!isActiveThread) {
+      traceLog(options, "linearbot_followup_inactive_thread_skipped", trace, {
+        comment_id: event.commentId,
+      });
+      return;
+    }
+    if ((threadState.ingestedCommentIds ?? []).includes(event.commentId)) {
+      traceLog(options, "linearbot_followup_duplicate_skipped", trace, {
+        comment_id: event.commentId,
+      });
+      return;
+    }
+    // Claim before the background append so a redelivery never double-appends.
+    await thread.setState({
+      ingestedCommentIds: [
+        ...(threadState.ingestedCommentIds ?? []),
+        event.commentId,
+      ].slice(-200),
+    });
+    const serialized = await serializeMessage(
+      issueCommentMessage(event, threadKey),
+    );
+    backgroundWaitUntil(
+      appendThreadFollowup({ options, serialized, threadKey, trace }),
+    );
+  })();
+}
+
+/**
+ * Appends a non-mention thread followup to its session as context (create is
+ * idempotent on an active thread; no execute, no stream, no reply). Best-effort
+ * — context enrichment must not surface errors to the thread.
+ */
+async function appendThreadFollowup(input: {
+  options: LinearbotOptions;
+  serialized: LinearbotApiMessage;
+  threadKey: string;
+  trace: LinearbotTrace;
+}): Promise<void> {
+  const { options, serialized, threadKey, trace } = input;
+  try {
+    await forwardToSessionApi(
+      options,
+      {
+        afterEventId: 0,
+        executeMessage: undefined,
+        messages: [serialized],
+        onEventId: () => undefined,
+        openStream: false,
+        threadId: threadKey,
+        trace,
+      },
+      {},
+    );
+    traceLog(options, "linearbot_followup_appended", trace, {
+      message_id: serialized.id,
+    });
+  } catch (error) {
+    (options.logger ?? noopLogger).warn("linearbot_followup_append_failed", {
+      error: errorMessage(error),
+    });
+  }
+}
+
+/**
  * Assignment turn. When an issue is assigned/delegated to the bot, run a turn
  * on the issue's sandbox and post the result as a comment. Uses the Issue
  * webhook (not an AgentSessionEvent) so it survives agent sessions being off.
@@ -586,10 +709,12 @@ function handleIssueAssignment(
 }
 
 /**
- * Runs one agent turn on a thread's sandbox and posts the result as a single
- * comment (answer + collapsed chain-of-thought). Seeds the issue context on the
- * thread's first turn. Best-effort with a bounded retry on transient
- * (cold-start) failures; a hard failure posts an error comment.
+ * Runs one agent turn on a thread's sandbox in a single, live comment. The
+ * comment is posted with the first thought as a collapsed "Thinking…" section
+ * that logs thoughts as the run streams (throttled), then swapped in place to
+ * the final answer above a "Chain of thought" section when the run settles.
+ * Seeds the issue context on the thread's first turn. Best-effort with a bounded
+ * retry on transient (cold-start) failures; a hard failure shows an error.
  */
 async function runThreadTurn(input: {
   applyStatus: boolean;
@@ -658,6 +783,48 @@ async function runThreadTurn(input: {
     threadId: threadKey,
     trace,
   };
+  // The live reply: posted with the first thought as a "Thinking…" section,
+  // edited (throttled) as more thoughts settle, then swapped to the final
+  // answer. `liveCommentId` persists across retries so a transient failure
+  // mid-stream keeps editing the same comment.
+  let liveCommentId: string | undefined;
+  let livePostStarted = false;
+  let lastLiveRenderAtMs = 0;
+  let lastLiveLineCount = 0;
+  const renderThinking = async (
+    collector: CommentReplyCollector,
+  ): Promise<void> => {
+    if (!client) return;
+    const cotLines = collector.cotLines;
+    if (cotLines.length === 0) return;
+    try {
+      if (!livePostStarted) {
+        livePostStarted = true;
+        lastLiveLineCount = cotLines.length;
+        lastLiveRenderAtMs = nowMs();
+        liveCommentId = await postIssueReply(client, {
+          body: buildThinkingReplyBody(cotLines),
+          issueId,
+          parentCommentId,
+        });
+        return;
+      }
+      if (!liveCommentId || cotLines.length === lastLiveLineCount) return;
+      if (nowMs() - lastLiveRenderAtMs < LIVE_THINKING_EDIT_MIN_INTERVAL_MS)
+        return;
+      lastLiveLineCount = cotLines.length;
+      lastLiveRenderAtMs = nowMs();
+      await updateIssueReply(client, {
+        body: buildThinkingReplyBody(cotLines),
+        commentId: liveCommentId,
+      });
+    } catch (error) {
+      logger.debug("linearbot_live_render_failed", {
+        error: errorMessage(error),
+      });
+    }
+  };
+
   let body: string | undefined;
   let marker: LinearStatusMarker | undefined;
   let failed = false;
@@ -678,6 +845,7 @@ async function runThreadTurn(input: {
         rendererOptions(options),
       )) {
         collector.update(chunk);
+        await renderThinking(collector);
       }
       await thread.setState({ historyForwarded: true });
       if (collector.failed) {
@@ -719,7 +887,13 @@ async function runThreadTurn(input: {
   }
   if (client && body !== undefined) {
     try {
-      await postIssueReply(client, { body, issueId, parentCommentId });
+      // Swap the live "Thinking…" comment to the final answer in place; if no
+      // thought ever streamed (no live comment), post the answer fresh.
+      if (liveCommentId) {
+        await updateIssueReply(client, { body, commentId: liveCommentId });
+      } else {
+        await postIssueReply(client, { body, issueId, parentCommentId });
+      }
     } catch (error) {
       logger.warn("linearbot_thread_reply_failed", {
         error: errorMessage(error),

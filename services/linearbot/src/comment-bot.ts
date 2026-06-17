@@ -2,10 +2,12 @@ import type { ChatSDKStreamChunk } from "@centaur/rendering";
 
 // Centaur-forward Linear model: threads are king. A Linear comment thread maps
 // to one centaur sandbox/context, and the bot answers IN the thread with a
-// single visible comment — the answer, with its chain-of-thought tucked into a
-// collapsed section (slackbot-style). The agent-session widget is vestigial
-// (settled minimally; see index.ts). This module is the pure rendering side:
-// mention detection, the stream→reply collector, and the comment body.
+// single visible comment that is live-edited: posted with the first thought as a
+// collapsed "Thinking…" section, then swapped in place to the answer with its
+// chain-of-thought tucked into a collapsed section (slackbot-style). The
+// agent-session widget is vestigial (settled minimally; see index.ts). This
+// module is the pure rendering side: mention detection, the stream→reply
+// collector, and the comment bodies (thinking + final).
 
 const COT_MAX_LINES = 40;
 const COT_LINE_MAX_CHARS = 300;
@@ -129,6 +131,19 @@ export class CommentReplyCollector {
     this.cot.push(capped);
     this.cotChars += capped.length;
   }
+}
+
+/**
+ * The in-progress body for the live reply: the chain-of-thought so far folded
+ * into a collapsed "Thinking…" section. Posted with the first thought and edited
+ * as more arrive; once the run settles, buildCommentReplyBody replaces it with
+ * the answer above a "Chain of thought" section.
+ */
+export function buildThinkingReplyBody(cotLines: string[]): string {
+  const cot = cotLines.length
+    ? cotLines.map((line) => `- ${line}`).join("\n")
+    : "…";
+  return collapsibleSection("Thinking…", cot);
 }
 
 /**
