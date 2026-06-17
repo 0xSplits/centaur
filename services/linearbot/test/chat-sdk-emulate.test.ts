@@ -117,6 +117,40 @@ describe("linearbot comment-thread pipeline", () => {
     );
   });
 
+  it("reacts 👀 on notice and swaps to ✅ when finished", async () => {
+    const threadKey = `linear:${ISSUE_ID}:c:comment-r`;
+    await postWebhook(
+      commentCreatedPayload({ id: "comment-r", body: "@centaur status?" }),
+    );
+    // 👀 lands as soon as the run starts, before the answer.
+    await waitFor(() =>
+      linearApi.reactions.some(
+        (r) => r.commentId === "comment-r" && r.emoji === "👀",
+      ),
+    );
+    const working = linearApi.reactions.find(
+      (r) => r.commentId === "comment-r" && r.emoji === "👀",
+    )!;
+
+    await waitFor(() =>
+      codexApi.executes.some((e) => e.threadKey === threadKey),
+    );
+    codexApi.emitOutputLines(threadKey, sampleCodexOutputLines("Green."));
+
+    // On settle: ✅ added and 👀 removed; no ❌.
+    await waitFor(() =>
+      linearApi.reactions.some(
+        (r) => r.commentId === "comment-r" && r.emoji === "✅",
+      ),
+    );
+    await waitFor(() => linearApi.removedReactionIds.includes(working.id));
+    expect(
+      linearApi.reactions.some(
+        (r) => r.commentId === "comment-r" && r.emoji === "❌",
+      ),
+    ).toBe(false);
+  });
+
   it("dedupes a redelivered mention comment", async () => {
     const threadKey = `linear:${ISSUE_ID}:c:comment-d`;
     await postWebhook(
@@ -604,6 +638,8 @@ type FakeComment = {
 
 type RecordedBotComment = { issueId: string; body: string; parentId?: string };
 
+type RecordedReaction = { id: string; commentId: string; emoji: string };
+
 type FakeLinearApi = {
   activities: RecordedActivity[];
   addAgentSession(input: { id: string; rootCommentId?: string }): void;
@@ -611,6 +647,8 @@ type FakeLinearApi = {
   botComments: RecordedBotComment[];
   close(): void;
   issueStateUpdates: Array<{ issueId: string; stateId: string }>;
+  reactions: RecordedReaction[];
+  removedReactionIds: string[];
   reset(): void;
   setIssueDelegate(userId: string | null): void;
   unhandledOperations: string[];
@@ -627,6 +665,8 @@ const WORKFLOW_STATES = [
 function startFakeLinearApi(): FakeLinearApi {
   const activities: RecordedActivity[] = [];
   const botComments: RecordedBotComment[] = [];
+  const reactions: RecordedReaction[] = [];
+  const removedReactionIds: string[] = [];
   const comments = new Map<string, FakeComment>();
   const sessions = new Map<string, { id: string; rootCommentId?: string }>();
   const unhandledOperations: string[] = [];
@@ -777,6 +817,19 @@ function startFakeLinearApi(): FakeLinearApi {
       });
       return { commentCreate: { success: true } };
     }
+    if (query.includes("LinearbotReactionCreate")) {
+      const id = nextId("reaction");
+      reactions.push({
+        id,
+        commentId: String(variables.commentId ?? ""),
+        emoji: String(variables.emoji ?? ""),
+      });
+      return { reactionCreate: { reaction: { id } } };
+    }
+    if (query.includes("LinearbotReactionDelete")) {
+      removedReactionIds.push(String(variables.id ?? ""));
+      return { reactionDelete: { success: true } };
+    }
     if (
       /query\s+agentActivity\b/i.test(query) ||
       query.includes("agentActivity(id:")
@@ -880,6 +933,8 @@ function startFakeLinearApi(): FakeLinearApi {
     activities,
     botComments,
     issueStateUpdates,
+    reactions,
+    removedReactionIds,
     unhandledOperations,
     url: `http://127.0.0.1:${server.port}/graphql`,
     setIssueDelegate(userId) {
@@ -904,6 +959,8 @@ function startFakeLinearApi(): FakeLinearApi {
     reset() {
       activities.length = 0;
       botComments.length = 0;
+      reactions.length = 0;
+      removedReactionIds.length = 0;
       comments.clear();
       sessions.clear();
       unhandledOperations.length = 0;

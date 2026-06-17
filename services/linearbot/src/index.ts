@@ -32,6 +32,13 @@ import {
   fetchIssueContextText,
 } from "./linear-context";
 import { ackWorking } from "./linear-narrator";
+import {
+  addCommentReaction,
+  removeCommentReaction,
+  REACTION_DONE,
+  REACTION_FAILED,
+  REACTION_WORKING,
+} from "./linear-reactions";
 import { postIssueReply } from "./linear-reply";
 import {
   extractStatusMarker,
@@ -467,6 +474,7 @@ function handleCommentMention(
           model: overrides.model,
         },
         parentCommentId: rootCommentId,
+        reactCommentId: event.commentId,
         thread,
         threadKey,
         trace,
@@ -542,6 +550,8 @@ async function runThreadTurn(input: {
   options: LinearbotOptions;
   overrides: { harnessType?: string; model?: string };
   parentCommentId?: string;
+  /** Comment to react to (👀 → ✅/❌); the triggering mention, if any. */
+  reactCommentId?: string;
   thread: Thread<LinearbotThreadState>;
   threadKey: string;
   trace: LinearbotTrace;
@@ -554,11 +564,27 @@ async function runThreadTurn(input: {
     options,
     overrides,
     parentCommentId,
+    reactCommentId,
     thread,
     threadKey,
     trace,
   } = input;
   const logger = options.logger ?? noopLogger;
+  // Instant 👀 ack on the triggering comment while the bot works (best-effort).
+  let workingReactionId: string | undefined;
+  if (client && reactCommentId) {
+    try {
+      workingReactionId = await addCommentReaction(
+        client,
+        reactCommentId,
+        REACTION_WORKING,
+      );
+    } catch (error) {
+      logger.debug("linearbot_reaction_ack_failed", {
+        error: errorMessage(error),
+      });
+    }
+  }
   const threadState = (await thread.state) ?? {};
   const contextMessages: LinearbotApiMessage[] = [];
   if (!threadState.historyForwarded && client) {
@@ -585,6 +611,7 @@ async function runThreadTurn(input: {
   };
   let body: string | undefined;
   let marker: LinearStatusMarker | undefined;
+  let failed = false;
   for (let attempt = 0; attempt <= THREAD_TURN_MAX_RETRIES; attempt++) {
     try {
       // create + append context (idempotent), then execute + stream.
@@ -605,6 +632,7 @@ async function runThreadTurn(input: {
       }
       await thread.setState({ historyForwarded: true });
       if (collector.failed) {
+        failed = true;
         body = buildCommentReplyBody({
           answer: `⚠️ I ran into an error before finishing:\n\n${collector.errorText || "unknown error"}`,
           cotLines: collector.cotLines,
@@ -635,6 +663,7 @@ async function runThreadTurn(input: {
       logger.warn("linearbot_thread_turn_failed", {
         error: errorMessage(error),
       });
+      failed = true;
       body = `⚠️ I ran into an error before finishing: ${errorMessage(error)}`;
       break;
     }
@@ -653,8 +682,27 @@ async function runThreadTurn(input: {
       );
     }
   }
+  // Settle the reaction: add ✅/❌ then drop 👀, so the comment always carries
+  // an indicator (best-effort, mirrors discordbot).
+  if (client && reactCommentId) {
+    try {
+      await addCommentReaction(
+        client,
+        reactCommentId,
+        failed ? REACTION_FAILED : REACTION_DONE,
+      );
+      if (workingReactionId) {
+        await removeCommentReaction(client, workingReactionId);
+      }
+    } catch (error) {
+      logger.debug("linearbot_reaction_settle_failed", {
+        error: errorMessage(error),
+      });
+    }
+  }
   traceLog(options, "linearbot_thread_turn_complete", trace, {
     chars: body?.length ?? 0,
+    failed,
   });
 }
 
