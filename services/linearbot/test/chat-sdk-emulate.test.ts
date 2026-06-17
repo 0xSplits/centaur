@@ -66,12 +66,11 @@ function createTestBot(overrides: Partial<LinearbotOptions> = {}): Linearbot {
   const state = overrides.state ?? createMemoryState();
   return createLinearbot({
     apiUrl: codexApi.url,
+    connectStateOnStart: false,
     linearAccessToken: "linear-emulate-token",
     linearApiUrl: linearApi.url,
     linearWebhookSecret: WEBHOOK_SECRET,
     logger: noopLogger,
-    narratorMinPostGapMs: 1,
-    recoverRenderObligationsOnStart: false,
     state,
     userName: "centaur",
     ...overrides,

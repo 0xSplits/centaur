@@ -97,6 +97,12 @@ export type LinearbotOptions = {
   apiKey?: string;
   apiUrl: string;
   /**
+   * Connect the Postgres state (and initialize the adapter) at startup.
+   * Defaults to true; tests pass false to skip the live connect against mock
+   * backends.
+   */
+  connectStateOnStart?: boolean;
+  /**
    * Harness for new threads when no --claude/--amp/--codex flag is given
    * (HarnessType wire value: codex | amp | claudecode). Defaults to codex.
    */
