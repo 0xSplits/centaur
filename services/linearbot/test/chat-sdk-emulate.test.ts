@@ -120,7 +120,10 @@ describe("linearbot comment-thread pipeline", () => {
     expect(reply.issueId).toBe(ISSUE_ID);
     expect(reply.body).toContain("About a day.");
     expect(reply.body).toContain(">>> Chain of thought");
-    expect(reply.body).toContain("pnpm test");
+    // The command renders as an inline code span, not a fenced block that
+    // would swallow the rest of the chain-of-thought list.
+    expect(reply.body).toContain("Command execution: `pnpm test`");
+    expect(reply.body).not.toContain("```");
     // Edited in place, not re-posted: exactly one comment in this thread.
     expect(
       linearApi.botComments.filter((c) => c.parentId === "comment-q"),

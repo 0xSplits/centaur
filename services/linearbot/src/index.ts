@@ -823,7 +823,7 @@ async function runThreadTurn(input: {
         lastLiveLineCount = cotLines.length;
         lastLiveRenderAtMs = nowMs();
         liveCommentId = await postIssueReply(client, {
-          body: buildThinkingReplyBody(cotLines),
+          body: buildThinkingReplyBody(cotLines, collector.latestThought),
           issueId,
           parentCommentId,
         });
@@ -835,7 +835,7 @@ async function runThreadTurn(input: {
       lastLiveLineCount = cotLines.length;
       lastLiveRenderAtMs = nowMs();
       await updateIssueReply(client, {
-        body: buildThinkingReplyBody(cotLines),
+        body: buildThinkingReplyBody(cotLines, collector.latestThought),
         commentId: liveCommentId,
       });
     } catch (error) {

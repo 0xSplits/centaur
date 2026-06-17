@@ -62,6 +62,9 @@ export class CommentReplyCollector {
   private readonly taskDetails = new Map<string, string>();
   private sawError = false;
   private errorTextValue = "";
+  // The most recent reasoning line — shown live in the comment body (outside the
+  // collapsed transcript) as "what I'm doing now".
+  private latestThoughtText = "";
 
   update(chunk: ChatSDKStreamChunk): void {
     if (chunk.type === "markdown_text") {
@@ -85,7 +88,11 @@ export class CommentReplyCollector {
     if (chunk.status !== "complete" && chunk.status !== "error") return;
     if (this.settledTaskIds.has(chunk.id)) return;
     this.settledTaskIds.add(chunk.id);
-    this.pushCot(this.formatTaskLine(chunk));
+    const line = flattenCotLine(this.formatTaskLine(chunk));
+    if (chunk.title === "Thinking" && line) {
+      this.latestThoughtText = line.slice(0, THOUGHT_MAX_CHARS);
+    }
+    this.pushCot(line);
   }
 
   private formatTaskLine(chunk: CommentBotTaskChunk): string {
@@ -116,34 +123,89 @@ export class CommentReplyCollector {
     return this.errorTextValue;
   }
 
+  /** The latest reasoning line, shown live in the comment body. */
+  get latestThought(): string {
+    return this.latestThoughtText;
+  }
+
   private pushCot(line: string): void {
-    const trimmed = line.trim();
-    if (!trimmed) return;
+    const flattened = flattenCotLine(line);
+    if (!flattened) return;
     if (
       this.cot.length >= COT_MAX_LINES ||
       this.cotChars >= COT_TOTAL_MAX_CHARS
     )
       return;
-    const capped =
-      trimmed.length > COT_LINE_MAX_CHARS
-        ? `${trimmed.slice(0, COT_LINE_MAX_CHARS)}…`
-        : trimmed;
+    const capped = capCotLine(flattened);
     this.cot.push(capped);
     this.cotChars += capped.length;
   }
 }
 
+const INLINE_CODE_MAX_CHARS = 240;
+const THOUGHT_MAX_CHARS = 600;
+
 /**
- * The in-progress body for the live reply: the chain-of-thought so far folded
- * into a collapsed "Thinking…" section. Posted with the first thought and edited
- * as more arrive; once the run settles, buildCommentReplyBody replaces it with
- * the answer above a "Chain of thought" section.
+ * Makes a task/reasoning detail safe for a single bullet line: turns fenced code
+ * blocks into inline code spans (so a command renders as `the command`, not a
+ * ```fence``` that swallows the rest of the list), strips stray fences, and
+ * collapses newlines so the entry stays on its own bullet.
  */
-export function buildThinkingReplyBody(cotLines: string[]): string {
+function flattenCotLine(text: string): string {
+  return text
+    .replace(/```[^\n`]*\r?\n?([\s\S]*?)```/g, (_match, code) =>
+      inlineCode(String(code)),
+    )
+    .replace(/`{3,}/g, "")
+    .replace(/\r?\n+/g, " ")
+    .replace(/[ \t]{2,}/g, " ")
+    .trim();
+}
+
+/**
+ * Wraps text as an inline code span, bounded and stripped of backticks so the
+ * single-backtick delimiters can never be left unbalanced by the content.
+ */
+function inlineCode(code: string): string {
+  let inner = code
+    .replace(/\r?\n+/g, " ")
+    .replace(/`/g, "'")
+    .replace(/[ \t]{2,}/g, " ")
+    .trim();
+  if (!inner) return "";
+  if (inner.length > INLINE_CODE_MAX_CHARS) {
+    inner = `${inner.slice(0, INLINE_CODE_MAX_CHARS)}…`;
+  }
+  return `\`${inner}\``;
+}
+
+/** Cap a (flattened) cot line, closing a code span the cut may have opened. */
+function capCotLine(text: string): string {
+  if (text.length <= COT_LINE_MAX_CHARS) return text;
+  let capped = `${text.slice(0, COT_LINE_MAX_CHARS)}…`;
+  // inlineCode uses single-backtick delimiters with no inner backticks, so an
+  // odd backtick count means the cut landed inside a span — close it.
+  if ((capped.match(/`/g) ?? []).length % 2 === 1) capped = `${capped}\``;
+  return capped;
+}
+
+/**
+ * The in-progress body for the live reply: the latest reasoning as a live
+ * headline in the body, with the full chain-of-thought so far folded into a
+ * collapsed "Thinking…" section beneath it. Posted with the first thought and
+ * edited as more arrive; once the run settles, buildCommentReplyBody replaces
+ * the headline with the answer and relabels the section "Chain of thought".
+ */
+export function buildThinkingReplyBody(
+  cotLines: string[],
+  currentThought?: string,
+): string {
   const cot = cotLines.length
     ? cotLines.map((line) => `- ${line}`).join("\n")
     : "…";
-  return collapsibleSection("Thinking…", cot);
+  const section = collapsibleSection("Thinking…", cot);
+  const headline = currentThought?.trim();
+  return headline ? `${headline}\n\n${section}` : section;
 }
 
 /**
