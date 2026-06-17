@@ -55,7 +55,6 @@ if (
 }
 
 const options: LinearbotOptions = {
-  activeExecutionTtlMs: optionalNumberEnv("LINEARBOT_ACTIVE_EXECUTION_TTL_MS"),
   apiUrl,
   apiKey: optionalEnv("LINEARBOT_API_KEY") ?? optionalEnv("CENTAUR_API_KEY"),
   defaultHarnessType: optionalEnv("LINEARBOT_DEFAULT_HARNESS"),
@@ -66,8 +65,6 @@ const options: LinearbotOptions = {
   linearMode: linearMode as LinearbotOptions["linearMode"],
   linearWebhookSecret,
   maxDurationMs: optionalNumberEnv("SESSION_MAX_DURATION_MS"),
-  narratorMaxActivities: optionalNumberEnv("LINEARBOT_NARRATOR_MAX_ACTIVITIES"),
-  narratorMinPostGapMs: optionalNumberEnv("LINEARBOT_NARRATOR_MIN_POST_GAP_MS"),
   postgresUrl,
   stateKeyPrefix: optionalEnv("LINEARBOT_STATE_KEY_PREFIX"),
   userName: stringEnv("LINEARBOT_USER_NAME", "centaur"),

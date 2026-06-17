@@ -87,13 +87,6 @@ export type LinearbotFetch = (
 ) => Promise<Response>;
 
 export type LinearbotOptions = {
-  /**
-   * Linear delta (adopted from discordbot): TTL after which a persisted
-   * `activeExecution` flag is treated as stale. Linear redelivers a failed
-   * webhook only a handful of times, so a crash between marking and clearing
-   * the flag could otherwise wedge the thread until manual intervention.
-   */
-  activeExecutionTtlMs?: number;
   apiKey?: string;
   apiUrl: string;
   /**
@@ -122,14 +115,7 @@ export type LinearbotOptions = {
   logger?: Logger;
   mapper?: CodexAppServerToChatStreamOptions;
   maxDurationMs?: number;
-  /** Linear delta: budget on thought/action activities posted per run. */
-  narratorMaxActivities?: number;
-  /** Linear delta: min gap between posted thought activities. */
-  narratorMinPostGapMs?: number;
   postgresUrl?: string;
-  recoverRenderObligationsOnStart?: boolean;
-  /** Per-thread deadline for one recovery attempt during the startup scan. */
-  renderRecoveryThreadTimeoutMs?: number;
   state?: StateAdapter;
   stateKeyPrefix?: string;
   userName?: string;
@@ -141,24 +127,10 @@ export type Linearbot = {
 };
 
 export type LinearbotThreadState = {
-  activeExecution?: boolean;
-  /**
-   * Linear delta (adopted from discordbot): epoch ms when `activeExecution`
-   * was last (re)confirmed; the flag is ignored once this is older than the
-   * active-execution TTL. Cleared (null) together with the flag.
-   */
-  activeExecutionStartedAt?: number | null;
-  executedMessageIds?: string[];
-  forwardedMessageIds?: string[];
+  /** Set once the thread's first turn has seeded the issue context. */
   historyForwarded?: boolean;
+  /** Highest session-event id seen, used as the replay watermark. */
   lastEventId?: number;
-  renderObligation?: LinearbotRenderObligation | null;
-  /**
-   * Linear delta: root comment id of the agent session's comment thread.
-   * Comment webhooks matching it (or replying under it) already arrive as
-   * `prompted` events and are skipped by the issue-comment forwarder.
-   */
-  sessionRootCommentId?: string;
   /**
    * Centaur-forward model: ids of comments this thread has already answered, so
    * a webhook redelivery never double-replies. Capped FIFO.
@@ -171,20 +143,12 @@ export type LinearbotThreadState = {
   lastAssignmentTrigger?: string;
 };
 
-export type LinearbotRenderObligation = {
-  afterEventId: number;
-  executionId: string;
-  message: LinearbotApiMessage;
-};
-
-export type LinearbotMessageMode = "append" | "execute";
-
 export type LinearbotRendererSource = RustSessionStreamEvent | JsonObject;
 
 export type LinearbotTrace = {
   includeContext: boolean;
   messageId: string;
-  mode: LinearbotMessageMode;
+  mode: "execute";
   openStream: boolean;
   startedAtMs: number;
   threadId: string;
