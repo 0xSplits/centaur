@@ -78,197 +78,197 @@ function createTestBot(overrides: Partial<LinearbotOptions> = {}): Linearbot {
   });
 }
 
-describe("linearbot chat-sdk pipeline", () => {
-  it("runs a created session end-to-end: stable thread key, context, ack, activities, response", async () => {
-    const sessionId = "sess-e2e";
-    const threadKey = `linear:${ISSUE_ID}:s:${sessionId}`;
-    const rootCommentId = linearApi.addUserComment({
-      body: "@centaur What is failing here?",
-    });
-    linearApi.addAgentSession({ id: sessionId, rootCommentId });
+describe("linearbot comment-thread pipeline", () => {
+  // Assertions filter by this thread's own key / parent comment id: a prior
+  // test's detached run can post into the shared mock servers after reset.
+  it("answers a comment @-mention with one comment (answer + collapsed CoT) on the comment-thread sandbox", async () => {
+    const threadKey = `linear:${ISSUE_ID}:c:comment-q`;
+    const res = await postWebhook(
+      commentCreatedPayload({
+        id: "comment-q",
+        body: "@centaur how long will this take?",
+      }),
+    );
+    expect(res.status).toBe(200);
 
-    const created = agentSessionCreatedPayload({
-      sessionId,
-      commentId: rootCommentId,
-      commentBody: "@centaur What is failing here?",
-      promptContext: "ENG-1: Something broke\n\nThe deploy fails on boot.",
-    });
-    const response = await postWebhook(created);
-    expect(response.status).toBe(200);
+    await waitFor(() =>
+      codexApi.executes.some((e) => e.threadKey === threadKey),
+    );
+    // Issue context is fetched and seeded on the thread's first turn.
+    const seeded = codexApi.appends
+      .filter((a) => a.threadKey === threadKey)
+      .flatMap((a) => sessionMessageTexts(a.body.messages));
+    expect(seeded.some((t) => t.includes("[Linear issue context]"))).toBe(true);
 
-    // create + append + execute land (execute runs inside the render stream).
-    await waitFor(() => codexApi.executes.length >= 1);
-    expect(codexApi.creates).toHaveLength(1);
-    expect(codexApi.creates[0]?.threadKey).toBe(threadKey);
-    expect(codexApi.creates[0]?.body.harness_type).toBe("codex");
+    codexApi.emitOutputLines(threadKey, sampleCodexOutputLines("About a day."));
 
-    // Initial context: synthetic issue-context message first (promptContext
-    // blob), then the triggering comment.
-    const texts = appendedTexts();
-    expect(texts[0]).toContain("[Linear issue context]");
-    expect(texts[0]).toContain("The deploy fails on boot.");
-    expect(texts).toContain("@centaur What is failing here?");
-    // Reply-format guidance is seeded so the agent leads its answer with a
-    // one-line summary (the answer is mirrored into the comment thread).
-    expect(texts.some((text) => text.includes("one-sentence summary"))).toBe(
-      true,
+    await waitFor(() =>
+      linearApi.botComments.some((c) => c.parentId === "comment-q"),
+    );
+    const reply = linearApi.botComments.find(
+      (c) => c.parentId === "comment-q",
+    )!;
+    expect(reply.issueId).toBe(ISSUE_ID);
+    expect(reply.body).toContain("About a day.");
+    expect(reply.body).toContain(">>> Chain of thought");
+    expect(reply.body).toContain("pnpm test");
+    // The vestigial session is never the surface: no session-keyed execution.
+    expect(codexApi.executes.some((e) => e.threadKey.includes(":s:"))).toBe(
+      false,
+    );
+  });
+
+  it("dedupes a redelivered mention comment", async () => {
+    const threadKey = `linear:${ISSUE_ID}:c:comment-d`;
+    await postWebhook(
+      commentCreatedPayload({ id: "comment-d", body: "@centaur ping" }),
+    );
+    await waitFor(() =>
+      codexApi.executes.some((e) => e.threadKey === threadKey),
+    );
+    codexApi.emitOutputLines(threadKey, sampleCodexOutputLines("Pong."));
+    await waitFor(() =>
+      linearApi.botComments.some((c) => c.parentId === "comment-d"),
     );
 
-    expect(codexApi.executes[0]?.threadKey).toBe(threadKey);
-    const inputLine = JSON.parse(
-      codexApi.executes[0]!.body.input_lines[0]!,
-    ) as { message: { content: Array<{ text?: string }> }; thread_key: string };
-    expect(inputLine.thread_key).toBe(threadKey);
-    expect(inputLine.message.content[0]?.text).toBe(
-      "@centaur What is failing here?",
+    await Bun.sleep(50);
+    await postWebhook(
+      commentCreatedPayload({ id: "comment-d", body: "@centaur ping" }),
     );
+    await Bun.sleep(100);
+    expect(
+      linearApi.botComments.filter((c) => c.parentId === "comment-d"),
+    ).toHaveLength(1);
+  });
 
-    // The working ack lands as an ephemeral thought before any session work
-    // completes (Linear's 10s acknowledgement requirement).
-    await waitFor(() => linearApi.activities.length >= 1);
-    const ack = linearApi.activities[0];
-    expect(ack?.agentSessionId).toBe(sessionId);
-    expect(ack?.content.type).toBe("thought");
-    expect(ack?.ephemeral).toBe(true);
+  it("ignores a comment that does not mention the bot", async () => {
+    await postWebhook(
+      commentCreatedPayload({ id: "comment-plain", body: "just a team note" }),
+    );
+    await Bun.sleep(100);
+    expect(
+      codexApi.executes.some(
+        (e) => e.threadKey === `linear:${ISSUE_ID}:c:comment-plain`,
+      ),
+    ).toBe(false);
+    expect(
+      linearApi.botComments.some((c) => c.parentId === "comment-plain"),
+    ).toBe(false);
+  });
 
-    // Drive the session event stream: reasoning + a command + the answer.
+  it("ignores bot-authored comments (loop guard)", async () => {
+    await postWebhook(
+      commentCreatedPayload({
+        id: "comment-self",
+        body: "@centaur loop",
+        user: null,
+      }),
+    );
+    await Bun.sleep(100);
+    expect(
+      codexApi.executes.some(
+        (e) => e.threadKey === `linear:${ISSUE_ID}:c:comment-self`,
+      ),
+    ).toBe(false);
+  });
+
+  it("runs an agent turn when the issue is assigned to the bot, posting a comment + applying status", async () => {
+    const threadKey = `linear:${ISSUE_ID}`;
+    const res = await postWebhook(
+      issueAssignmentPayload({ updatedAt: "2026-06-16T00:00:00.000Z" }),
+    );
+    expect(res.status).toBe(200);
+
+    await waitFor(() =>
+      codexApi.executes.some((e) => e.threadKey === threadKey),
+    );
+    // The synthetic "work this issue" instruction is the execute prompt.
+    const exec = codexApi.executes.find((e) => e.threadKey === threadKey)!;
+    const inputLine = JSON.parse(exec.body.input_lines[0]!) as {
+      message: { content: Array<{ text?: string }> };
+    };
+    expect(
+      inputLine.message.content.some((c) =>
+        (c.text ?? "").includes("work the task"),
+      ),
+    ).toBe(true);
+
     codexApi.emitOutputLines(
       threadKey,
-      sampleCodexOutputLines("All tests now pass."),
+      sampleCodexOutputLines("Shipped.\n\nLinear-Status: done"),
     );
+    await waitFor(() =>
+      linearApi.botComments.some((c) => c.issueId === ISSUE_ID && !c.parentId),
+    );
+    const reply = linearApi.botComments.find(
+      (c) => c.issueId === ISSUE_ID && !c.parentId,
+    )!;
+    expect(reply.body).toContain("Shipped.");
+    expect(reply.body).not.toContain("Linear-Status:");
+    // Terminal marker moves the assigned issue to Done.
+    await waitFor(() =>
+      linearApi.issueStateUpdates.some((u) => u.stateId === "st-done"),
+    );
+  });
 
+  it("dedupes a redelivered assignment webhook", async () => {
+    const threadKey = `linear:${ISSUE_ID}`;
+    await postWebhook(
+      issueAssignmentPayload({ updatedAt: "2026-06-16T01:00:00.000Z" }),
+    );
+    await waitFor(() =>
+      codexApi.executes.some((e) => e.threadKey === threadKey),
+    );
+    const before = codexApi.executes.filter(
+      (e) => e.threadKey === threadKey,
+    ).length;
+    await Bun.sleep(50);
+    await postWebhook(
+      issueAssignmentPayload({ updatedAt: "2026-06-16T01:00:00.000Z" }),
+    );
+    await Bun.sleep(100);
+    expect(
+      codexApi.executes.filter((e) => e.threadKey === threadKey).length,
+    ).toBe(before);
+  });
+
+  it("settles a vestigial agent session minimally (no widget render)", async () => {
+    const sessionId = "sess-settle";
+    linearApi.addAgentSession({ id: sessionId, rootCommentId: "comment-x" });
+    const res = await postWebhook(
+      agentSessionCreatedPayload({
+        sessionId,
+        commentId: "comment-x",
+        commentBody: "@centaur hi",
+        promptContext: "ENG-1: x",
+      }),
+    );
+    expect(res.status).toBe(200);
+
+    // A single terminal response activity settles the session — no run.
     await waitFor(() =>
       linearApi.activities.some((a) => a.content.type === "response"),
     );
-    const persisted = linearApi.activities.filter((a) => !a.ephemeral);
-    const thoughts = persisted.filter((a) => a.content.type === "thought");
-    expect(
-      thoughts.some(
-        (a) =>
-          a.content.type === "thought" &&
-          a.content.body.includes("Inspecting the event stream"),
-      ),
-    ).toBe(true);
-    const actions = persisted.filter((a) => a.content.type === "action");
-    expect(
-      actions.some(
-        (a) =>
-          a.content.type === "action" &&
-          a.content.action.includes("Command execution") &&
-          a.content.parameter.includes("pnpm test"),
-      ),
-    ).toBe(true);
-    const responses = persisted.filter((a) => a.content.type === "response");
+    const responses = linearApi.activities.filter(
+      (a) => a.content.type === "response",
+    );
     expect(responses).toHaveLength(1);
     expect(
       responses[0]?.content.type === "response"
         ? responses[0].content.body
         : "",
-    ).toBe("All tests now pass.");
-    // The response is the LAST persisted activity (thoughts flush first).
-    expect(persisted[persisted.length - 1]?.content.type).toBe("response");
-    expect(linearApi.activities.some((a) => a.content.type === "error")).toBe(
-      false,
-    );
-
-    // Linear delta: the answer is also mirrored into the comment thread as a
-    // real reply nested under the session's root comment. The response
-    // activity alone only surfaces in the detached agent-session widget; this
-    // is the copy humans read and reply to.
-    await waitFor(() => linearApi.botComments.length >= 1);
-    expect(linearApi.botComments[0]).toEqual({
-      issueId: ISSUE_ID,
-      body: "All tests now pass.",
-      parentId: rootCommentId,
-    });
-
-    // ---- prompted follow-up reuses the SAME session/thread key (patched
-    // adapter regression: upstream keyed each prompt to its own comment).
-    const prompted = agentSessionPromptedPayload({
-      sessionId,
-      rootCommentId,
-      sourceCommentId: "comment-followup",
-      body: "Now write a regression test",
-    });
-    const promptedResponse = await postWebhook(prompted);
-    expect(promptedResponse.status).toBe(200);
-
-    await waitFor(() => codexApi.executes.length >= 2);
-    expect(codexApi.executes[1]?.threadKey).toBe(threadKey);
-    expect(codexApi.creates.every((c) => c.threadKey === threadKey)).toBe(true);
-    // No second context blob: history is already forwarded.
-    const followupAppends = appendedTexts().filter((text) =>
-      text.includes("[Linear issue context]"),
-    );
-    expect(followupAppends).toHaveLength(1);
-    expect(appendedTexts()).toContain("Now write a regression test");
-
-    codexApi.emitOutputLines(
-      threadKey,
-      sampleCodexOutputLines("Regression test added."),
-    );
-    await waitFor(
-      () =>
-        linearApi.activities.filter((a) => a.content.type === "response")
-          .length >= 2,
-    );
-
-    // The follow-up answer is mirrored into the same comment thread too.
-    await waitFor(() => linearApi.botComments.length >= 2);
-    expect(linearApi.botComments[1]).toEqual({
-      issueId: ISSUE_ID,
-      body: "Regression test added.",
-      parentId: rootCommentId,
-    });
-
-    // Mention sessions never move issue status: the issue is not delegated
-    // to the agent, so it has no ownership of it.
-    expect(linearApi.issueStateUpdates).toHaveLength(0);
-  });
-
-  it("renders a failed execution as a terminal error activity, not a response", async () => {
-    const sessionId = "sess-fail";
-    const threadKey = `linear:${ISSUE_ID}:s:${sessionId}`;
-    const rootCommentId = linearApi.addUserComment({
-      body: "@centaur do the thing",
-    });
-    linearApi.addAgentSession({ id: sessionId, rootCommentId });
-
-    const response = await postWebhook(
-      agentSessionCreatedPayload({
-        sessionId,
-        commentId: rootCommentId,
-        commentBody: "@centaur do the thing",
-        promptContext: "ENG-2: A thing",
-      }),
-    );
-    expect(response.status).toBe(200);
-    await waitFor(() => codexApi.executes.length >= 1);
-
-    codexApi.emitSessionEvent(threadKey, "session.execution_failed", {
-      error: "sandbox exploded",
-    });
-
-    await waitFor(() =>
-      linearApi.activities.some((a) => a.content.type === "error"),
-    );
-    const errorActivity = linearApi.activities.find(
-      (a) => a.content.type === "error",
-    );
+    ).toContain("comment thread");
     expect(
-      errorActivity?.content.type === "error" ? errorActivity.content.body : "",
-    ).toContain("sandbox exploded");
-    expect(
-      linearApi.activities.some((a) => a.content.type === "response"),
+      codexApi.executes.some(
+        (e) => e.threadKey === `linear:${ISSUE_ID}:s:${sessionId}`,
+      ),
     ).toBe(false);
   });
 
-  it("rejects webhooks with an invalid signature without touching the session API", async () => {
-    const payload = agentSessionCreatedPayload({
-      sessionId: "sess-forged",
-      commentId: "comment-forged",
-      commentBody: "@centaur forged",
-      promptContext: "forged",
+  it("rejects webhooks with an invalid signature", async () => {
+    const payload = commentCreatedPayload({
+      id: "comment-forged",
+      body: "@centaur forged",
     });
     const body = JSON.stringify(payload);
     const response = await bot.app.request("/api/webhooks/linear", {
@@ -283,231 +283,7 @@ describe("linearbot chat-sdk pipeline", () => {
     });
     expect(response.status).toBeGreaterThanOrEqual(400);
     await Bun.sleep(50);
-    // Session-API silence is the load-bearing assertion; a prior test's
-    // detached render can still post late activities after the reset, so the
-    // activity log is not asserted here.
-    expect(codexApi.creates).toHaveLength(0);
-  });
-
-  it("ignores agent sessions created for another app user", async () => {
-    const response = await postWebhook(
-      agentSessionCreatedPayload({
-        sessionId: "sess-other-bot",
-        commentId: "comment-other",
-        commentBody: "@otherbot hi",
-        promptContext: "x",
-        appUserId: "someone-else",
-      }),
-    );
-    expect(response.status).toBe(200);
-    await Bun.sleep(50);
-    expect(codexApi.creates).toHaveLength(0);
-  });
-
-  it("ignores agent sessions created by the bot itself (loop guard)", async () => {
-    const response = await postWebhook(
-      agentSessionCreatedPayload({
-        sessionId: "sess-self",
-        commentId: "comment-self",
-        commentBody: "do the thing",
-        promptContext: "x",
-        creatorId: BOT_USER_ID,
-      }),
-    );
-    expect(response.status).toBe(200);
-    await Bun.sleep(50);
-    expect(codexApi.creates).toHaveLength(0);
-  });
-
-  // Upstream slackbotv2 #522: the recovery sweep raced live renders — the
-  // obligation is indexed before the live render starts, and a sweep pass
-  // landing mid-render claimed it and posted the same answer twice. Live
-  // renders now hold the per-thread recovery lease, so the sweep lease-skips.
-  it("does not duplicate the live render when a recovery sweep scans mid-stream", async () => {
-    const sharedState = createMemoryState();
-    await sharedState.connect();
-    bot = createTestBot({ state: sharedState });
-
-    const sessionId = "sess-sweep-race";
-    const threadKey = `linear:${ISSUE_ID}:s:${sessionId}`;
-    const rootCommentId = linearApi.addUserComment({
-      body: "@centaur race the sweep",
-    });
-    linearApi.addAgentSession({ id: sessionId, rootCommentId });
-
-    const response = await postWebhook(
-      agentSessionCreatedPayload({
-        sessionId,
-        commentId: rootCommentId,
-        commentBody: "@centaur race the sweep",
-        promptContext: "ENG-7: Sweep race",
-      }),
-    );
-    expect(response.status).toBe(200);
-    await waitFor(() => codexApi.executes.length >= 1);
-
-    // Hold the live render in-flight: everything except the terminal line.
-    const outputLines = sampleCodexOutputLines(
-      "Single answer despite the sweep.",
-    );
-    codexApi.emitOutputLines(threadKey, outputLines.slice(0, -1));
-    // The events request implies commitExecutionStarted ran: the obligation
-    // is indexed and the live render holds the lease.
-    await waitFor(() => codexApi.eventRequests.length === 1);
-
-    // A second instance's startup sweep scans the live obligation; it must
-    // lease-skip instead of opening a second renderer.
-    createTestBot({
-      recoverRenderObligationsOnStart: true,
-      state: sharedState,
-    });
-    await Bun.sleep(300);
-
-    codexApi.emitOutputLines(threadKey, outputLines.slice(-1));
-    await waitFor(() =>
-      linearApi.activities.some((a) => a.content.type === "response"),
-    );
-    await Bun.sleep(100);
-
-    expect(
-      codexApi.eventRequests.filter(
-        (request) => request.threadKey === threadKey,
-      ),
-    ).toHaveLength(1);
-    const responses = linearApi.activities.filter(
-      (a) => a.content.type === "response",
-    );
-    expect(responses).toHaveLength(1);
-  });
-
-  // A comment-less, creator-less created event is what a bare delegation (or
-  // a description mention / triage automation) produces. Upstream dropped the
-  // event entirely (missing comment) or attributed it to the bot itself
-  // (missing creator → skipped as a self-message) — both adapter patches
-  // under test here. The empty prompt synthesizes the work instruction, the
-  // delegated issue moves to In Progress on kickoff, and the agent's terminal
-  // `Linear-Status:` marker is stripped from the answer and applied.
-  it("runs a bare delegation end-to-end: instruction, kickoff status, terminal marker", async () => {
-    const sessionId = "sess-delegated";
-    const threadKey = `linear:${ISSUE_ID}:s:${sessionId}`;
-    linearApi.addAgentSession({ id: sessionId });
-    linearApi.setIssueDelegate(BOT_USER_ID);
-
-    const response = await postWebhook(
-      agentSessionCreatedPayload({
-        sessionId,
-        creatorId: null,
-        promptContext: "ENG-9: Weekly report\n\nCompile the weekly report.",
-      }),
-    );
-    expect(response.status).toBe(200);
-
-    await waitFor(() => codexApi.executes.length >= 1);
-    const inputLine = JSON.parse(
-      codexApi.executes[0]!.body.input_lines[0]!,
-    ) as { message: { content: Array<{ text?: string }> } };
-    expect(inputLine.message.content[0]?.text).toContain(
-      "work the task to the best of your ability",
-    );
-    expect(inputLine.message.content[0]?.text).toContain("Linear-Status:");
-    const contextTexts = appendedTexts();
-    expect(contextTexts[0]).toContain("[Linear issue context]");
-    expect(contextTexts[0]).toContain("Compile the weekly report.");
-
-    // The working ack still lands without a root comment.
-    await waitFor(() => linearApi.activities.length >= 1);
-    expect(linearApi.activities[0]?.content.type).toBe("thought");
-
-    // Kickoff moves the delegated issue Todo -> In Progress.
-    await waitFor(() => linearApi.issueStateUpdates.length >= 1);
-    expect(linearApi.issueStateUpdates[0]).toEqual({
-      issueId: ISSUE_ID,
-      stateId: "st-progress",
-    });
-
-    // Terminal marker is stripped from the response and applied as Done.
-    codexApi.emitOutputLines(
-      threadKey,
-      sampleCodexOutputLines("Report compiled.\n\nLinear-Status: done"),
-    );
-    await waitFor(() =>
-      linearApi.activities.some((a) => a.content.type === "response"),
-    );
-    const responseActivity = linearApi.activities.find(
-      (a) => a.content.type === "response",
-    );
-    expect(
-      responseActivity?.content.type === "response"
-        ? responseActivity.content.body
-        : "",
-    ).toBe("Report compiled.");
-
-    // No comment thread exists (bare delegation, synthetic root): the answer
-    // posts top-level on the issue, un-nested.
-    await waitFor(() => linearApi.botComments.length >= 1);
-    expect(linearApi.botComments[0]?.issueId).toBe(ISSUE_ID);
-    expect(linearApi.botComments[0]?.body).toBe("Report compiled.");
-    expect(linearApi.botComments[0]?.parentId).toBeUndefined();
-
-    await waitFor(() => linearApi.issueStateUpdates.length >= 2);
-    expect(linearApi.issueStateUpdates[1]).toEqual({
-      issueId: ISSUE_ID,
-      stateId: "st-done",
-    });
-  });
-
-  it("forwards plain issue comments into the session as context, skipping session-thread replies", async () => {
-    const sessionId = "sess-comments";
-    const rootCommentId = linearApi.addUserComment({
-      body: "@centaur investigate",
-    });
-    linearApi.addAgentSession({ id: sessionId, rootCommentId });
-
-    const created = await postWebhook(
-      agentSessionCreatedPayload({
-        sessionId,
-        commentId: rootCommentId,
-        commentBody: "@centaur investigate",
-        promptContext: "ENG-5: Investigate",
-      }),
-    );
-    expect(created.status).toBe(200);
-    await waitFor(() => codexApi.executes.length >= 1);
-    const executesBefore = codexApi.executes.length;
-
-    // A plain comment elsewhere on the issue lands in the session as
-    // append-only context (no execution).
-    const outOfBand = await postWebhook(
-      commentCreatedPayload({ id: "comment-oob", body: "actually, hold off" }),
-    );
-    expect(outOfBand.status).toBe(200);
-    await waitFor(() => appendedTexts().includes("actually, hold off"));
-    expect(codexApi.executes.length).toBe(executesBefore);
-
-    // Replies inside the session's own comment thread arrive as prompted
-    // events; the comment path must not forward them again.
-    const inThread = await postWebhook(
-      commentCreatedPayload({
-        id: "comment-inthread",
-        body: "in-thread reply",
-        parentId: rootCommentId,
-      }),
-    );
-    expect(inThread.status).toBe(200);
-    await Bun.sleep(100);
-    expect(appendedTexts()).not.toContain("in-thread reply");
-
-    // Bot/agent comments (no user) are never forwarded.
-    const botComment = await postWebhook(
-      commentCreatedPayload({
-        id: "comment-bot",
-        body: "agent response echo",
-        user: null,
-      }),
-    );
-    expect(botComment.status).toBe(200);
-    await Bun.sleep(100);
-    expect(appendedTexts()).not.toContain("agent response echo");
+    expect(codexApi.executes).toHaveLength(0);
   });
 });
 
@@ -624,6 +400,25 @@ function agentSessionPromptedPayload(input: {
         url: "https://linear.app/acme/profiles/ada",
         avatarUrl: null,
       },
+    },
+  };
+}
+
+function issueAssignmentPayload(input: {
+  updatedAt: string;
+  assigneeId?: string;
+}) {
+  return {
+    action: "update",
+    type: "Issue",
+    createdAt: new Date().toISOString(),
+    organizationId: ORG_ID,
+    webhookTimestamp: Date.now(),
+    webhookId: "wh-issue",
+    data: {
+      id: ISSUE_ID,
+      assigneeId: input.assigneeId ?? BOT_USER_ID,
+      updatedAt: input.updatedAt,
     },
   };
 }
@@ -889,6 +684,17 @@ function startFakeLinearApi(): FakeLinearApi {
             ? { id: currentState.id, type: currentState.type }
             : null,
           team: { states: { nodes: WORKFLOW_STATES } },
+        },
+      };
+    }
+    if (query.includes("LinearbotIssueContext")) {
+      return {
+        issue: {
+          identifier: "ENG-1",
+          title: "Something broke",
+          description: "The deploy fails on boot.",
+          url: "https://linear.app/acme/issue/ENG-1",
+          state: { name: "Todo" },
         },
       };
     }

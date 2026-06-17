@@ -1,6 +1,6 @@
 import type { Logger, Message as ChatMessage } from "chat";
 import { parseLinearThreadKey } from "./linear-threading";
-import type { LinearbotApiMessage } from "./types";
+import type { LinearbotApiMessage, LinearRawRequestClient } from "./types";
 import { errorMessage, isJsonObject, stringValue } from "./utils";
 
 // Linear delta (no slackbotv2 analog; closest relative is discord-starter's
@@ -150,6 +150,71 @@ export function buildLinearReplyGuidanceMessage(
     threadId: message.threadId,
     timestamp: message.metadata.dateSent.toISOString(),
   };
+}
+
+const ISSUE_CONTEXT_QUERY = `
+  query LinearbotIssueContext($issueId: String!) {
+    issue(id: $issueId) {
+      identifier
+      title
+      description
+      url
+      state { name }
+    }
+  }
+`;
+
+type IssueContextData = {
+  issue?: {
+    identifier?: unknown;
+    title?: unknown;
+    description?: unknown;
+    url?: unknown;
+    state?: { name?: unknown } | null;
+  } | null;
+};
+
+/**
+ * Centaur-forward model: a Comment/Issue webhook carries no `promptContext`
+ * blob, so the bot fetches the issue itself to seed a thread's first turn with
+ * what it's working on. Returns null on any failure (never fail the turn).
+ */
+export async function fetchIssueContextText(
+  client: LinearRawRequestClient,
+  issueId: string,
+  logger: Logger,
+): Promise<string | null> {
+  if (!client.client?.rawRequest) return null;
+  let issue: IssueContextData["issue"];
+  try {
+    const response = await client.client.rawRequest<IssueContextData>(
+      ISSUE_CONTEXT_QUERY,
+      { issueId },
+    );
+    issue = response.data?.issue;
+  } catch (error) {
+    logger.warn("linearbot_issue_context_failed", {
+      error: errorMessage(error),
+    });
+    return null;
+  }
+  if (!issue) return null;
+  const header = [stringValue(issue.identifier), stringValue(issue.title)]
+    .filter(Boolean)
+    .join(": ");
+  const facts = [
+    issue.state?.name ? `Status: ${stringValue(issue.state.name)}` : undefined,
+    issue.url ? `URL: ${stringValue(issue.url)}` : undefined,
+  ].filter(Boolean);
+  const description = stringValue(issue.description);
+  const sections = [
+    "[Linear issue context]",
+    header,
+    facts.join("\n"),
+    description ? `Description:\n${description}` : undefined,
+  ].filter(Boolean);
+  if (sections.length <= 1) return null;
+  return truncateContext(sections.join("\n\n"));
 }
 
 function truncateContext(text: string): string {

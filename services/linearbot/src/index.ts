@@ -20,13 +20,21 @@ import pg from "pg";
 import {
   issueSessionsKey,
   isSessionThreadComment,
+  parseIssueAssignmentWebhook,
   parseIssueCommentWebhook,
+  type IssueAssignmentEvent,
   type IssueCommentEvent,
 } from "./issue-comments";
+import {
+  buildCommentReplyBody,
+  commentMentionsBot,
+  CommentReplyCollector,
+} from "./comment-bot";
 import {
   buildLinearContextMessage,
   buildLinearReplyGuidanceMessage,
   EMPTY_PROMPT_INSTRUCTION,
+  fetchIssueContextText,
 } from "./linear-context";
 import { ackWorking, LinearNarrator } from "./linear-narrator";
 import { postIssueReply } from "./linear-reply";
@@ -212,10 +220,15 @@ export function createLinearbot(options: LinearbotOptions): Linearbot {
     logger,
   });
 
-  chat.onNewMention(async (thread, message) => {
-    // Defense-in-depth (the chat SDK already drops isMe at intake): the
-    // agent can create comments and delegate issues itself via the sandbox
-    // linear tool, and its own activity must never start an execution.
+  // Centaur-forward model: the agent session an @-mention creates is vestigial.
+  // Both session handlers just settle it (so it never shows "did not respond");
+  // the real answer is posted in the comment thread by handleCommentMention,
+  // driven by the Comment webhook. (Defense-in-depth: never act on isMe — the
+  // agent creates comments/delegates issues itself via the sandbox linear tool.)
+  const settleSession = async (
+    thread: Thread<LinearbotThreadState>,
+    message: ChatMessage,
+  ): Promise<void> => {
     if (message.author.isMe) {
       traceLog(options, "linearbot_self_message_skipped", undefined, {
         message_id: message.id,
@@ -223,40 +236,32 @@ export function createLinearbot(options: LinearbotOptions): Linearbot {
       });
       return;
     }
-    // Linear requires a thought within 10s of the session starting; fire the
-    // ephemeral working ack before any session-api work.
-    ackWorking(thread, logger);
-    await thread.subscribe();
-    await recordSessionThread(state, thread, message, options);
-    await syncThreadMessageToSession(thread, message, {
-      mode: "execute",
-      options,
-      state,
-    });
-  });
+    await settleVestigialSession(thread, options);
+  };
+  chat.onNewMention(settleSession);
+  chat.onSubscribedMessage(settleSession);
 
-  chat.onSubscribedMessage(async (thread, message) => {
-    if (message.author.isMe) {
-      traceLog(options, "linearbot_self_message_skipped", undefined, {
-        message_id: message.id,
-        thread_id: thread.id,
+  // The Linear adapter resolves the bot's user id during chat.initialize();
+  // assignment (an Issue webhook the adapter doesn't otherwise touch) needs it.
+  // Init once, lazily, on the first webhook — idempotent and best-effort.
+  let chatInitialized = false;
+  const ensureChatInitialized = async (): Promise<void> => {
+    if (chatInitialized) return;
+    try {
+      await chat.initialize();
+    } catch (error) {
+      logger.warn("linearbot_chat_initialize_failed", {
+        error: errorMessage(error),
       });
-      return;
     }
-    const mode = message.isMention === true ? "execute" : "append";
-    if (mode === "execute") ackWorking(thread, logger);
-    await recordSessionThread(state, thread, message, options);
-    await syncThreadMessageToSession(thread, message, {
-      mode,
-      options,
-      state,
-    });
-  });
+    chatInitialized = true;
+  };
 
   const app = new Hono();
   app.get("/health", (c) => c.json({ ok: true, service: "linearbot" }));
   const handleLinearWebhook = async (c: Context) => {
     const rawBody = await c.req.raw.clone().text();
+    await ensureChatInitialized();
     const awaitHandoff = shouldAwaitLinearHandoff(rawBody);
     const handoffTasks: Promise<unknown>[] = [];
     const context: LinearbotRequestContext = {
@@ -275,16 +280,30 @@ export function createLinearbot(options: LinearbotOptions): Linearbot {
       });
     });
     if (awaitHandoff && response.ok) {
-      // Linear delta: plain issue comments (outside any session thread) are
-      // invisible to agent sessions — the adapter ignores Comment webhooks in
-      // agent-sessions mode. Route them into the issue's known session
-      // threads as append-only context. Runs inside the request context so a
-      // retryable session-api failure 503s for redelivery, and only after the
-      // adapter accepted the delivery (signature verified).
-      const commentForward = requestContext.run(context, () =>
-        forwardIssueCommentToSessions(rawBody, { chat, options, state }),
-      );
-      if (commentForward) handoffTasks.push(commentForward);
+      // Centaur-forward model: respond to mentions (Comment webhook) and
+      // assignments (Issue webhook) — thread = sandbox. The bot's user id is
+      // read here, after chat.webhooks.linear initialized the adapter.
+      let botUserId: string | undefined;
+      try {
+        botUserId = (linear as unknown as LinearSessionCapableAdapter)
+          .botUserId;
+      } catch {
+        botUserId = undefined;
+      }
+      const handlerInput: ThreadHandlerInput = {
+        botUserId,
+        chat,
+        options,
+        state,
+      };
+      const handled =
+        requestContext.run(context, () =>
+          handleCommentMention(rawBody, handlerInput),
+        ) ??
+        requestContext.run(context, () =>
+          handleIssueAssignment(rawBody, handlerInput),
+        );
+      if (handled) handoffTasks.push(handled);
       try {
         await Promise.all(handoffTasks);
       } catch (error) {
@@ -874,6 +893,368 @@ function issueCommentMessage(
     text: event.body,
     threadId,
   } as unknown as ChatMessage;
+}
+
+const THREAD_TURN_MAX_RETRIES = 3;
+
+type ThreadHandlerInput = {
+  botUserId: string | undefined;
+  chat: Chat<Record<string, Adapter>, LinearbotThreadState>;
+  options: LinearbotOptions;
+  state: StateAdapter;
+};
+
+/**
+ * Centaur-forward model: the Linear agent session an @-mention creates is
+ * vestigial — the real answer is posted in the comment thread
+ * (handleCommentMention). This just acks and posts a one-line terminal response
+ * so the session never shows "did not respond". Once agent-session events are
+ * turned off on the webhook, this stops firing. Best-effort.
+ */
+async function settleVestigialSession(
+  thread: Thread<LinearbotThreadState>,
+  options: LinearbotOptions,
+): Promise<void> {
+  const logger = options.logger ?? noopLogger;
+  ackWorking(thread, logger);
+  try {
+    await thread.post("On it — I'll reply in the comment thread.");
+  } catch (error) {
+    logger.debug("linearbot_session_settle_failed", {
+      error: errorMessage(error),
+    });
+  }
+}
+
+/**
+ * Comment-thread responder (primary). A comment that @-mentions the bot is
+ * answered as one visible comment in its thread — the answer with the
+ * chain-of-thought in a collapsed section — running on the thread's sandbox
+ * (1 thread === 1 context stack). Returns null when the webhook is not a
+ * bot-mention comment. Fires whether or not a session was also created, so it
+ * works before and after agent-session events are turned off.
+ */
+function handleCommentMention(
+  rawBody: string,
+  input: ThreadHandlerInput,
+): Promise<void> | null {
+  const event = parseIssueCommentWebhook(rawBody);
+  if (!event) return null;
+  const names = [input.options.userName ?? "centaur"];
+  if (!commentMentionsBot(event.body, names, input.botUserId)) return null;
+  const { chat, options } = input;
+  const rootCommentId = event.parentId ?? event.commentId;
+  const threadKey = `linear:${event.issueId}:c:${rootCommentId}`;
+  const trace: LinearbotTrace = {
+    includeContext: false,
+    messageId: event.commentId,
+    mode: "execute",
+    openStream: true,
+    startedAtMs: nowMs(),
+    threadId: threadKey,
+  };
+  return (async () => {
+    const thread = chat.thread(threadKey);
+    const threadState = (await thread.state) ?? {};
+    if ((threadState.repliedCommentIds ?? []).includes(event.commentId)) {
+      traceLog(options, "linearbot_comment_duplicate_skipped", trace, {
+        comment_id: event.commentId,
+      });
+      return;
+    }
+    // Claim before the background run so a redelivery never double-replies.
+    await thread.setState({
+      repliedCommentIds: [
+        ...(threadState.repliedCommentIds ?? []),
+        event.commentId,
+      ].slice(-200),
+    });
+    const client = (thread.adapter as unknown as LinearSessionCapableAdapter)
+      .linearClient;
+    const serialized = await serializeMessage(
+      issueCommentMessage(event, threadKey),
+    );
+    const overrides = extractMessageOverrides(serialized.text);
+    serialized.text = overrides.cleanedText;
+    backgroundWaitUntil(
+      runThreadTurn({
+        applyStatus: false,
+        client,
+        executeMessage: serialized,
+        issueId: event.issueId,
+        options,
+        overrides: {
+          harnessType: overrides.harnessType,
+          model: overrides.model,
+        },
+        parentCommentId: rootCommentId,
+        thread,
+        threadKey,
+        trace,
+      }),
+    );
+  })();
+}
+
+/**
+ * Assignment turn. When an issue is assigned/delegated to the bot, run a turn
+ * on the issue's sandbox and post the result as a comment. Uses the Issue
+ * webhook (not an AgentSessionEvent) so it survives agent sessions being off.
+ */
+function handleIssueAssignment(
+  rawBody: string,
+  input: ThreadHandlerInput,
+): Promise<void> | null {
+  if (!input.botUserId) return null;
+  const event = parseIssueAssignmentWebhook(rawBody, input.botUserId);
+  if (!event) return null;
+  const { chat, options } = input;
+  const threadKey = `linear:${event.issueId}`;
+  const trace: LinearbotTrace = {
+    includeContext: false,
+    messageId: `assign-${event.issueId}-${event.updatedAt}`,
+    mode: "execute",
+    openStream: true,
+    startedAtMs: nowMs(),
+    threadId: threadKey,
+  };
+  return (async () => {
+    const thread = chat.thread(threadKey);
+    const threadState = (await thread.state) ?? {};
+    if (
+      event.updatedAt &&
+      threadState.lastAssignmentTrigger === event.updatedAt
+    ) {
+      traceLog(options, "linearbot_assignment_duplicate_skipped", trace, {
+        issue_id: event.issueId,
+      });
+      return;
+    }
+    await thread.setState({ lastAssignmentTrigger: event.updatedAt });
+    const client = (thread.adapter as unknown as LinearSessionCapableAdapter)
+      .linearClient;
+    backgroundWaitUntil(
+      runThreadTurn({
+        applyStatus: true,
+        client,
+        executeMessage: assignmentInstructionMessage(event, threadKey),
+        issueId: event.issueId,
+        options,
+        overrides: {},
+        thread,
+        threadKey,
+        trace,
+      }),
+    );
+  })();
+}
+
+/**
+ * Runs one agent turn on a thread's sandbox and posts the result as a single
+ * comment (answer + collapsed chain-of-thought). Seeds the issue context on the
+ * thread's first turn. Best-effort with a bounded retry on transient
+ * (cold-start) failures; a hard failure posts an error comment.
+ */
+async function runThreadTurn(input: {
+  applyStatus: boolean;
+  client: LinearSessionCapableAdapter["linearClient"];
+  executeMessage: LinearbotApiMessage;
+  issueId: string;
+  options: LinearbotOptions;
+  overrides: { harnessType?: string; model?: string };
+  parentCommentId?: string;
+  thread: Thread<LinearbotThreadState>;
+  threadKey: string;
+  trace: LinearbotTrace;
+}): Promise<void> {
+  const {
+    applyStatus,
+    client,
+    executeMessage,
+    issueId,
+    options,
+    overrides,
+    parentCommentId,
+    thread,
+    threadKey,
+    trace,
+  } = input;
+  const logger = options.logger ?? noopLogger;
+  const threadState = (await thread.state) ?? {};
+  const contextMessages: LinearbotApiMessage[] = [];
+  if (!threadState.historyForwarded && client) {
+    const contextText = await fetchIssueContextText(client, issueId, logger);
+    if (contextText) {
+      contextMessages.push(
+        issueContextMessage(contextText, threadKey, executeMessage.timestamp),
+      );
+    }
+  }
+  let lastEventId = threadState.lastEventId ?? 0;
+  const forwardInput: ForwardSessionInput = {
+    afterEventId: lastEventId,
+    executeMessage,
+    harnessType: overrides.harnessType,
+    messages: contextMessages,
+    model: overrides.model,
+    onEventId: (eventId) => {
+      lastEventId = Math.max(lastEventId, eventId);
+    },
+    openStream: false,
+    threadId: threadKey,
+    trace,
+  };
+  let body: string | undefined;
+  let marker: LinearStatusMarker | undefined;
+  for (let attempt = 0; attempt <= THREAD_TURN_MAX_RETRIES; attempt++) {
+    try {
+      // create + append context (idempotent), then execute + stream.
+      await forwardToSessionApi(
+        options,
+        { ...forwardInput, executeMessage: undefined, openStream: false },
+        {},
+      );
+      const collector = new CommentReplyCollector();
+      const fallback = new LinearRenderFallback();
+      for await (const chunk of codexAppServerToChatSdkStream(
+        fallback.collectSource(
+          streamSessionAfterHandoff(options, forwardInput),
+        ),
+        rendererOptions(options),
+      )) {
+        collector.update(chunk);
+      }
+      await thread.setState({ historyForwarded: true });
+      if (collector.failed) {
+        body = buildCommentReplyBody({
+          answer: `⚠️ I ran into an error before finishing:\n\n${collector.errorText || "unknown error"}`,
+          cotLines: collector.cotLines,
+        });
+      } else {
+        const extracted = extractStatusMarker(
+          collector.answer || fallback.text(),
+        );
+        marker = extracted.marker;
+        body = buildCommentReplyBody({
+          answer: extracted.text,
+          cotLines: collector.cotLines,
+          fallback: fallback.text(),
+        });
+      }
+      break;
+    } catch (error) {
+      if (
+        isRetryableSessionApiError(error) &&
+        attempt < THREAD_TURN_MAX_RETRIES
+      ) {
+        traceLog(options, "linearbot_thread_turn_retry", trace, {
+          retry_attempt: attempt + 1,
+        });
+        await sleep(renderRetryDelayMs(attempt));
+        continue;
+      }
+      logger.warn("linearbot_thread_turn_failed", {
+        error: errorMessage(error),
+      });
+      body = `⚠️ I ran into an error before finishing: ${errorMessage(error)}`;
+      break;
+    }
+  }
+  if (client && body !== undefined) {
+    try {
+      await postIssueReply(client, { body, issueId, parentCommentId });
+    } catch (error) {
+      logger.warn("linearbot_thread_reply_failed", {
+        error: errorMessage(error),
+      });
+    }
+    if (applyStatus && marker) {
+      backgroundWaitUntil(
+        applyAssignmentStatusMarker(client, issueId, marker, options, trace),
+      );
+    }
+  }
+  traceLog(options, "linearbot_thread_turn_complete", trace, {
+    chars: body?.length ?? 0,
+  });
+}
+
+/** Synthetic issue-context message seeding a thread's first turn. */
+function issueContextMessage(
+  text: string,
+  threadKey: string,
+  timestamp: string,
+): LinearbotApiMessage {
+  return {
+    attachments: [],
+    author: {
+      fullName: "Linear",
+      isBot: true,
+      isMe: false,
+      userId: "linear",
+      userName: "linear",
+    },
+    id: `linear-context-${threadKey}`,
+    isMention: false,
+    raw: { linearbotSyntheticContext: true },
+    text,
+    threadId: threadKey,
+    timestamp,
+  };
+}
+
+/** Synthetic "work this assigned issue" prompt for an assignment turn. */
+function assignmentInstructionMessage(
+  event: IssueAssignmentEvent,
+  threadKey: string,
+): LinearbotApiMessage {
+  return {
+    attachments: [],
+    author: {
+      fullName: "Linear",
+      isBot: false,
+      isMe: false,
+      userId: "linear-assignment",
+      userName: "linear-assignment",
+    },
+    id: `assign-${event.issueId}-${event.updatedAt}`,
+    isMention: true,
+    raw: { linearbotAssignment: true },
+    text: EMPTY_PROMPT_INSTRUCTION,
+    threadId: threadKey,
+    timestamp: new Date().toISOString(),
+  };
+}
+
+/**
+ * Applies the agent's terminal `Linear-Status:` marker to an assigned issue
+ * (the bot owns issues delegated to it). Best-effort; never throws.
+ */
+async function applyAssignmentStatusMarker(
+  client: LinearSessionCapableAdapter["linearClient"],
+  issueId: string,
+  marker: LinearStatusMarker,
+  options: LinearbotOptions,
+  trace: LinearbotTrace,
+): Promise<void> {
+  if (!client) return;
+  try {
+    const status = await fetchIssueStatus(client, issueId);
+    if (!status) return;
+    const target = markerTargetState(status, marker);
+    if (!target) return;
+    await updateIssueState(client, issueId, target.id);
+    traceLog(
+      options,
+      "linearbot_assignment_status_applied",
+      trace,
+      statusTraceFields(issueId, target),
+    );
+  } catch (error) {
+    (options.logger ?? noopLogger).warn("linearbot_assignment_status_failed", {
+      error: errorMessage(error),
+    });
+  }
 }
 
 /**
@@ -1729,7 +2110,8 @@ function shouldAwaitLinearHandoff(rawBody: string): boolean {
   try {
     const payload = JSON.parse(rawBody) as { action?: unknown; type?: unknown };
     if (payload.type === "AgentSessionEvent") return true;
-    return payload.type === "Comment" && payload.action === "create";
+    if (payload.type === "Comment" && payload.action === "create") return true;
+    return payload.type === "Issue" && payload.action === "update";
   } catch {
     return false;
   }

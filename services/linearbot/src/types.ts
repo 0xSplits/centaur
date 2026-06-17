@@ -153,6 +153,16 @@ export type LinearbotThreadState = {
    * `prompted` events and are skipped by the issue-comment forwarder.
    */
   sessionRootCommentId?: string;
+  /**
+   * Centaur-forward model: ids of comments this thread has already answered, so
+   * a webhook redelivery never double-replies. Capped FIFO.
+   */
+  repliedCommentIds?: string[];
+  /**
+   * Centaur-forward model: the last assignment trigger (issue `updatedAt`) the
+   * bot ran a turn for, so a redelivered Issue webhook doesn't re-run.
+   */
+  lastAssignmentTrigger?: string;
 };
 
 export type LinearbotRenderObligation = {

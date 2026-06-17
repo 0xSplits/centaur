@@ -63,6 +63,45 @@ export function issueSessionsKey(issueId: string): string {
   return `linearbot:issue-sessions:${issueId}`;
 }
 
+/** An issue assigned to the bot, reduced to what the assignment turn needs. */
+export type IssueAssignmentEvent = {
+  issueId: string;
+  assigneeId: string;
+  /** Issue `updatedAt`; dedupes a redelivered webhook for the same change. */
+  updatedAt: string;
+};
+
+/**
+ * Parses an `Issue`/`update` webhook into an IssueAssignmentEvent when the
+ * issue's assignee is now `botUserId` (the bot was assigned/delegated the
+ * issue). Returns null otherwise. The Centaur-forward model uses this instead
+ * of an AgentSessionEvent so assignment turns survive agent sessions being off.
+ */
+export function parseIssueAssignmentWebhook(
+  rawBody: string,
+  botUserId: string,
+): IssueAssignmentEvent | null {
+  let payload: unknown;
+  try {
+    payload = JSON.parse(rawBody);
+  } catch {
+    return null;
+  }
+  if (!isJsonObject(payload)) return null;
+  if (payload.type !== "Issue" || payload.action !== "update") return null;
+  const data = payload.data;
+  if (!isJsonObject(data)) return null;
+  const issueId = stringValue(data.id);
+  const assigneeId = stringValue(data.assigneeId);
+  if (!issueId || !assigneeId || assigneeId !== botUserId) return null;
+  return {
+    issueId,
+    assigneeId,
+    updatedAt:
+      stringValue(data.updatedAt) ?? stringValue(payload.updatedAt) ?? "",
+  };
+}
+
 /**
  * True when the comment belongs to the session's own comment thread (the
  * root comment itself, or a reply under it) — those arrive as `prompted`
