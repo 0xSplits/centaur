@@ -108,6 +108,11 @@ describe("linearbot chat-sdk pipeline", () => {
     expect(texts[0]).toContain("[Linear issue context]");
     expect(texts[0]).toContain("The deploy fails on boot.");
     expect(texts).toContain("@centaur What is failing here?");
+    // Reply-format guidance is seeded so the agent leads its answer with a
+    // one-line summary (the answer is mirrored into the comment thread).
+    expect(texts.some((text) => text.includes("one-sentence summary"))).toBe(
+      true,
+    );
 
     expect(codexApi.executes[0]?.threadKey).toBe(threadKey);
     const inputLine = JSON.parse(
@@ -504,99 +509,6 @@ describe("linearbot chat-sdk pipeline", () => {
     await Bun.sleep(100);
     expect(appendedTexts()).not.toContain("agent response echo");
   });
-
-  // These assertions filter by this comment's own thread key / parent id: a
-  // prior test's detached render can still post into the shared mock servers
-  // after the per-test reset (see the activity-log caveat above).
-  it("comment-bot: answers a comment @-mention as one visible comment (answer + collapsed CoT), no session", async () => {
-    bot = createTestBot({ commentBot: true });
-    const commentThreadKey = `linear:${ISSUE_ID}:c:comment-q`;
-    const repliesToComment = () =>
-      linearApi.botComments.filter((c) => c.parentId === "comment-q");
-
-    const response = await postWebhook(
-      commentCreatedPayload({
-        id: "comment-q",
-        body: "@centaur how long will this take?",
-      }),
-    );
-    expect(response.status).toBe(200);
-
-    // No agent session: the run executes on the comment-thread key.
-    await waitFor(() =>
-      codexApi.executes.some((e) => e.threadKey === commentThreadKey),
-    );
-    // A Comment webhook has no promptContext blob, so issue context is fetched
-    // and seeded on the first turn of this comment thread.
-    const seeded = codexApi.appends
-      .filter((a) => a.threadKey === commentThreadKey)
-      .flatMap((a) => sessionMessageTexts(a.body.messages));
-    expect(seeded.some((text) => text.includes("[Linear issue context]"))).toBe(
-      true,
-    );
-
-    codexApi.emitOutputLines(
-      commentThreadKey,
-      sampleCodexOutputLines("About a day."),
-    );
-
-    await waitFor(() => repliesToComment().length >= 1);
-    const reply = repliesToComment()[0]!;
-    expect(reply.issueId).toBe(ISSUE_ID);
-    expect(reply.body).toContain("About a day.");
-    // Chain-of-thought folded into a collapsed section.
-    expect(reply.body).toContain(">>> Chain of thought");
-    expect(reply.body).toContain("pnpm test");
-
-    // A redelivery of the same comment never double-replies.
-    await Bun.sleep(50);
-    const redelivered = await postWebhook(
-      commentCreatedPayload({
-        id: "comment-q",
-        body: "@centaur how long will this take?",
-      }),
-    );
-    expect(redelivered.status).toBe(200);
-    await Bun.sleep(100);
-    expect(repliesToComment()).toHaveLength(1);
-  });
-
-  it("comment-bot: a comment that does not mention the bot is not answered", async () => {
-    bot = createTestBot({ commentBot: true });
-    const response = await postWebhook(
-      commentCreatedPayload({
-        id: "comment-plain",
-        body: "just a note for the team",
-      }),
-    );
-    expect(response.status).toBe(200);
-    await Bun.sleep(100);
-    expect(
-      codexApi.executes.some(
-        (e) => e.threadKey === `linear:${ISSUE_ID}:c:comment-plain`,
-      ),
-    ).toBe(false);
-    expect(
-      linearApi.botComments.some((c) => c.parentId === "comment-plain"),
-    ).toBe(false);
-  });
-
-  it("comment-bot stays dormant unless the flag is set (mention falls through to forwarding)", async () => {
-    // Default bot has commentBot off; a mention comment must not be answered.
-    const response = await postWebhook(
-      commentCreatedPayload({ id: "comment-off", body: "@centaur hello" }),
-    );
-    expect(response.status).toBe(200);
-    await Bun.sleep(100);
-    expect(
-      codexApi.executes.some(
-        (e) => e.threadKey === `linear:${ISSUE_ID}:c:comment-off`,
-      ),
-    ).toBe(false);
-    expect(
-      linearApi.botComments.some((c) => c.parentId === "comment-off"),
-    ).toBe(false);
-  });
 });
 
 // ---------------------------------------------------------------------------
@@ -977,17 +889,6 @@ function startFakeLinearApi(): FakeLinearApi {
             ? { id: currentState.id, type: currentState.type }
             : null,
           team: { states: { nodes: WORKFLOW_STATES } },
-        },
-      };
-    }
-    if (query.includes("LinearbotIssueContext")) {
-      return {
-        issue: {
-          identifier: "ENG-1",
-          title: "Something broke",
-          description: "The deploy fails on boot.",
-          url: "https://linear.app/acme/issue/ENG-1",
-          state: { name: "Todo" },
         },
       };
     }

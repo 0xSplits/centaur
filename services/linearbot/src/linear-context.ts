@@ -1,6 +1,6 @@
 import type { Logger, Message as ChatMessage } from "chat";
 import { parseLinearThreadKey } from "./linear-threading";
-import type { LinearbotApiMessage, LinearRawRequestClient } from "./types";
+import type { LinearbotApiMessage } from "./types";
 import { errorMessage, isJsonObject, stringValue } from "./utils";
 
 // Linear delta (no slackbotv2 analog; closest relative is discord-starter's
@@ -114,70 +114,42 @@ async function subjectText(
   return sections.join("\n\n");
 }
 
-const ISSUE_CONTEXT_QUERY = `
-  query LinearbotIssueContext($issueId: String!) {
-    issue(id: $issueId) {
-      identifier
-      title
-      description
-      url
-      state { name }
-    }
-  }
-`;
-
-type IssueContextData = {
-  issue?: {
-    identifier?: unknown;
-    title?: unknown;
-    description?: unknown;
-    url?: unknown;
-    state?: { name?: unknown } | null;
-  } | null;
-};
+// Linear delta: the agent's final reply is surfaced in two places — the agent
+// session widget AND, via the answer mirror (index.ts postAnswerAsThreadReply),
+// as a comment in the issue thread. A teammate reading the thread sees the
+// comment, so the reply should lead with a one-line summary then the full
+// answer. This guidance rides in as a synthetic context message on the first
+// turn; the session retains it for follow-ups.
+export const LINEAR_REPLY_GUIDANCE = [
+  "When you post your final reply on this Linear issue, begin with a one-sentence summary of your conclusion, then give the full answer.",
+  "Your reply is shown both in the Linear agent session and as a comment in the issue thread — write it for a teammate reading the thread.",
+].join("\n");
 
 /**
- * Linear delta (comment-bot): a plain Comment webhook carries no `promptContext`
- * blob (unlike AgentSessionEvent), so the comment-bot fetches the issue itself
- * to seed the run with what the agent is replying about. Returns null on any
- * failure (context enrichment must never fail the turn).
+ * Synthetic message carrying the reply-format guidance (LINEAR_REPLY_GUIDANCE),
+ * prepended to the session's initial context alongside the issue context.
  */
-export async function fetchIssueContextText(
-  client: LinearRawRequestClient,
-  issueId: string,
-  logger: Logger,
-): Promise<string | null> {
-  if (!client.client?.rawRequest) return null;
-  let issue: IssueContextData["issue"];
-  try {
-    const response = await client.client.rawRequest<IssueContextData>(
-      ISSUE_CONTEXT_QUERY,
-      { issueId },
-    );
-    issue = response.data?.issue;
-  } catch (error) {
-    logger.warn("linearbot_commentbot_context_failed", {
-      error: errorMessage(error),
-    });
-    return null;
-  }
-  if (!issue) return null;
-  const header = [stringValue(issue.identifier), stringValue(issue.title)]
-    .filter(Boolean)
-    .join(": ");
-  const facts = [
-    issue.state?.name ? `Status: ${stringValue(issue.state.name)}` : undefined,
-    issue.url ? `URL: ${stringValue(issue.url)}` : undefined,
-  ].filter(Boolean);
-  const description = stringValue(issue.description);
-  const sections = [
-    "[Linear issue context]",
-    header,
-    facts.join("\n"),
-    description ? `Description:\n${description}` : undefined,
-  ].filter(Boolean);
-  if (sections.length <= 1) return null;
-  return truncateContext(sections.join("\n\n"));
+export function buildLinearReplyGuidanceMessage(
+  message: ChatMessage,
+): LinearbotApiMessage {
+  const { issueId, agentSessionId } = parseLinearThreadKey(message.threadId);
+  return {
+    attachments: [],
+    author: {
+      fullName: "Linear",
+      isBot: true,
+      isMe: false,
+      userId: "linear",
+      userName: "linear",
+    },
+    // Stable per thread so forwardedMessageIds dedupes re-syncs.
+    id: `linear-reply-guidance-${agentSessionId ?? issueId ?? message.threadId}`,
+    isMention: false,
+    raw: { linearbotSyntheticContext: true },
+    text: LINEAR_REPLY_GUIDANCE,
+    threadId: message.threadId,
+    timestamp: message.metadata.dateSent.toISOString(),
+  };
 }
 
 function truncateContext(text: string): string {
