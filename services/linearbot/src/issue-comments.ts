@@ -63,27 +63,29 @@ export function issueSessionsKey(issueId: string): string {
   return `linearbot:issue-sessions:${issueId}`;
 }
 
-/** An issue assigned to the bot, reduced to what the assignment turn needs. */
+/** An issue handed to the bot, reduced to what the assignment turn needs. */
 export type IssueAssignmentEvent = {
   issueId: string;
-  assigneeId: string;
+  /** True when the bot is the issue's delegate (vs. plain assignee). */
+  delegated: boolean;
   /** Issue `updatedAt`; dedupes a redelivered webhook for the same change. */
   updatedAt: string;
 };
 
 /**
- * Parses an `Issue`/`update` webhook into an IssueAssignmentEvent when the issue
- * was just (re)assigned TO `botUserId` — not on every later edit to an issue the
- * bot already owns. Returns null otherwise. The Centaur-forward model uses this
- * instead of an AgentSessionEvent so assignment turns survive agent sessions
- * being off.
+ * Parses an `Issue` webhook into an IssueAssignmentEvent when the issue was just
+ * handed to `botUserId` — assigned OR delegated — and should be worked. Returns
+ * null otherwise. The Centaur-forward model uses this (not an AgentSessionEvent)
+ * so handoff turns survive agent sessions being off.
  *
- * Linear's update webhook lists the prior values of changed fields in
- * `updatedFrom`; so when it's present without `assigneeId`, the assignee did NOT
- * change and we must not re-run the agent (otherwise a label/description edit —
- * or the bot's own end-of-turn status change, itself an Issue update — would
- * trigger a fresh turn). When `updatedFrom` is absent we fall back to the
- * assignee check alone, to stay robust if a payload omits it.
+ * - `create`: fires whenever the new issue's assignee/delegate is the bot — the
+ *   handoff is inherent to creation, and there's no `updatedFrom` to gate on.
+ * - `update`: fires only when the field pointing at the bot actually CHANGED in
+ *   this update. Linear lists the prior values of changed fields in
+ *   `updatedFrom`; if it's present but lacks the relevant field, this was an
+ *   unrelated edit (a label, a description, or the bot's own status write
+ *   bouncing back) and must not re-run the agent. When `updatedFrom` is absent
+ *   we fall back to the membership check alone, to stay robust.
  */
 export function parseIssueAssignmentWebhook(
   rawBody: string,
@@ -96,21 +98,31 @@ export function parseIssueAssignmentWebhook(
     return null;
   }
   if (!isJsonObject(payload)) return null;
-  if (payload.type !== "Issue" || payload.action !== "update") return null;
+  if (payload.type !== "Issue") return null;
+  const action = payload.action;
+  if (action !== "create" && action !== "update") return null;
   const data = payload.data;
   if (!isJsonObject(data)) return null;
   const issueId = stringValue(data.id);
-  const assigneeId = stringValue(data.assigneeId);
-  if (!issueId || !assigneeId || assigneeId !== botUserId) return null;
-  const updatedFrom = isJsonObject(payload.updatedFrom)
-    ? payload.updatedFrom
-    : isJsonObject(data.updatedFrom)
-      ? data.updatedFrom
-      : undefined;
-  if (updatedFrom && !("assigneeId" in updatedFrom)) return null;
+  if (!issueId) return null;
+  const assignedToBot = stringValue(data.assigneeId) === botUserId;
+  const delegatedToBot = stringValue(data.delegateId) === botUserId;
+  if (!assignedToBot && !delegatedToBot) return null;
+  if (action === "update") {
+    const updatedFrom = isJsonObject(payload.updatedFrom)
+      ? payload.updatedFrom
+      : isJsonObject(data.updatedFrom)
+        ? data.updatedFrom
+        : undefined;
+    if (updatedFrom) {
+      const assigneeChanged = assignedToBot && "assigneeId" in updatedFrom;
+      const delegateChanged = delegatedToBot && "delegateId" in updatedFrom;
+      if (!assigneeChanged && !delegateChanged) return null;
+    }
+  }
   return {
     issueId,
-    assigneeId,
+    delegated: delegatedToBot,
     updatedAt:
       stringValue(data.updatedAt) ?? stringValue(payload.updatedAt) ?? "",
   };

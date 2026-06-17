@@ -15,21 +15,28 @@ import { errorMessage, isJsonObject, stringValue } from "./utils";
 
 const CONTEXT_MAX_CHARS = 100_000;
 
-// Linear delta: a pure delegation (or a description mention) starts a session
-// with NO user-written prompt — the trigger comment body is empty. Without
-// this, the empty execute message degrades to "" in the stored session and
-// the literal "continue" on the codex input path. Synthesize an explicit
-// instruction instead: the prepended issue context plus the overlay's system
-// prompt are assumed sufficient to execute in some capacity. The instruction
-// also makes the delegated-ownership contract explicit (status via the
-// sandbox `linear` tool, with the `Linear-Status:` marker as the backstop the
-// bot applies — see linear-status.ts).
+// Linear delta: an assignment/delegation turn starts with NO user-written
+// prompt. Without this, the empty execute message degrades to "" in the stored
+// session and the literal "continue" on the codex input path. Synthesize an
+// explicit instruction instead: the prepended issue context plus the overlay's
+// system prompt are assumed sufficient to execute in some capacity. The
+// ownership contract itself rides in OWNERSHIP_CONTEXT (injected into the
+// context whenever the issue is owned), so it applies to comment turns on owned
+// issues too — not just this empty-prompt case.
 export const EMPTY_PROMPT_INSTRUCTION = [
-  "You have been delegated this Linear issue without additional instructions.",
+  "You have been handed this Linear issue with no additional instructions.",
   "Review the issue context above and work the task to the best of your ability.",
-  "",
-  "You own this issue while it is delegated to you:",
-  '- The issue is moved to "In Progress" automatically when you start. When you finish, use the `linear` CLI tool (if available) to move it to "Done" if the work is complete, or back to "Todo" if you could not make progress.',
+].join("\n");
+
+// Injected into the context whenever the issue is assigned or delegated to the
+// bot — on assignment turns AND on comment turns where the delegate is the bot —
+// so the agent knows it owns the work and may need to carry it forward, not just
+// answer. The bot applies the terminal `Linear-Status:` marker as a backstop
+// (see linear-status.ts); kickoff moves it to In Progress when work starts.
+export const OWNERSHIP_CONTEXT = [
+  "You own this Linear issue — it is assigned or delegated to you. Beyond answering this thread, carry the work forward and complete it if you can.",
+  '- The issue is moved to "In Progress" automatically when you start work.',
+  '- When you finish, use the `linear` CLI tool (if available) to move it to "Done" if the work is complete, or back to "Todo" if you could not make progress.',
   "- If you cannot update the issue with the tool, end your final answer with the line `Linear-Status: done`, `Linear-Status: todo`, or `Linear-Status: in_progress` and it will be applied for you.",
   "- If this looks like a recurring task, previous instances likely exist as other Linear issues; look them up with the `linear` tool for context and continuity.",
   "- Never delegate issues to yourself or mention yourself in comments.",
@@ -160,6 +167,7 @@ const ISSUE_CONTEXT_QUERY = `
       description
       url
       state { name }
+      delegate { id }
     }
   }
 `;
@@ -171,6 +179,7 @@ type IssueContextData = {
     description?: unknown;
     url?: unknown;
     state?: { name?: unknown } | null;
+    delegate?: { id?: unknown } | null;
   } | null;
 };
 
@@ -183,6 +192,8 @@ export type LinearIssueContext = {
   description?: string;
   url?: string;
   status?: string;
+  /** App-user id the issue is delegated to, when any — used for ownership. */
+  delegateId?: string;
 };
 
 /**
@@ -221,6 +232,7 @@ export async function fetchLinearIssueContext(
     description: stringValue(issue.description),
     url: stringValue(issue.url),
     status: issue.state?.name ? stringValue(issue.state.name) : undefined,
+    delegateId: stringValue(issue.delegate?.id),
   };
   // Without an identifier or title there's nothing that tells the agent which
   // task this is — the whole point of the context.

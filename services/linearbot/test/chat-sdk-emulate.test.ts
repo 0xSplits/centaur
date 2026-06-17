@@ -104,6 +104,10 @@ describe("linearbot comment-thread pipeline", () => {
     expect(execTexts.some((t) => t.includes("The deploy fails on boot."))).toBe(
       true,
     );
+    // Not delegated to the bot → no ownership contract injected.
+    expect(execTexts.some((t) => t.includes("You own this Linear issue"))).toBe(
+      false,
+    );
 
     codexApi.emitOutputLines(threadKey, sampleCodexOutputLines("About a day."));
 
@@ -552,6 +556,69 @@ describe("linearbot comment-thread pipeline", () => {
     ).toBe(false);
   });
 
+  it("runs a turn when an issue is created already assigned to the bot", async () => {
+    const threadKey = `linear:${ISSUE_ID}`;
+    await postWebhook(
+      issueAssignmentPayload({
+        action: "create",
+        updatedAt: "2026-06-16T06:00:00.000Z",
+      }),
+    );
+    await waitFor(() =>
+      codexApi.executes.some((e) => e.threadKey === threadKey),
+    );
+    codexApi.emitOutputLines(
+      threadKey,
+      sampleCodexOutputLines("Created work."),
+    );
+    await waitFor(() =>
+      linearApi.botComments.some(
+        (c) =>
+          c.issueId === ISSUE_ID &&
+          !c.parentId &&
+          c.body.includes("Created work."),
+      ),
+    );
+  });
+
+  it("treats a comment on a delegated issue as owned work (status + ownership context)", async () => {
+    linearApi.setIssueDelegate(BOT_USER_ID);
+    const threadKey = `linear:${ISSUE_ID}:c:comment-deleg`;
+    await postWebhook(
+      commentCreatedPayload({
+        id: "comment-deleg",
+        body: "@centaur what's next",
+      }),
+    );
+    await waitFor(() =>
+      codexApi.executes.some((e) => e.threadKey === threadKey),
+    );
+    // The agent is told it owns the delegated issue and should carry the work.
+    expect(
+      executeInputTexts(threadKey).some((t) =>
+        t.includes("You own this Linear issue"),
+      ),
+    ).toBe(true);
+
+    codexApi.emitOutputLines(
+      threadKey,
+      sampleCodexOutputLines("Handled.\n\nLinear-Status: done"),
+    );
+    await waitFor(() =>
+      linearApi.botComments.some(
+        (c) => c.parentId === "comment-deleg" && c.body.includes("Handled."),
+      ),
+    );
+    // Ownership behaviors fire on a comment turn for a delegated issue: kickoff
+    // to In Progress, then the terminal marker to Done.
+    await waitFor(() =>
+      linearApi.issueStateUpdates.some((u) => u.stateId === "st-done"),
+    );
+    expect(
+      linearApi.issueStateUpdates.some((u) => u.stateId === "st-progress"),
+    ).toBe(true);
+  });
+
   it("dedupes a redelivered assignment webhook", async () => {
     const threadKey = `linear:${ISSUE_ID}`;
     await postWebhook(
@@ -747,11 +814,13 @@ function agentSessionPromptedPayload(input: {
 
 function issueAssignmentPayload(input: {
   updatedAt: string;
-  assigneeId?: string;
+  action?: "create" | "update";
+  assigneeId?: string | null;
+  delegateId?: string | null;
   updatedFrom?: Record<string, unknown>;
 }) {
   return {
-    action: "update",
+    action: input.action ?? "update",
     type: "Issue",
     createdAt: new Date().toISOString(),
     organizationId: ORG_ID,
@@ -760,7 +829,11 @@ function issueAssignmentPayload(input: {
     ...(input.updatedFrom ? { updatedFrom: input.updatedFrom } : {}),
     data: {
       id: ISSUE_ID,
-      assigneeId: input.assigneeId ?? BOT_USER_ID,
+      assigneeId:
+        input.assigneeId === undefined ? BOT_USER_ID : input.assigneeId,
+      ...(input.delegateId !== undefined
+        ? { delegateId: input.delegateId }
+        : {}),
       updatedAt: input.updatedAt,
     },
   };
@@ -1117,6 +1190,7 @@ function startFakeLinearApi(): FakeLinearApi {
           description: "The deploy fails on boot.",
           url: "https://linear.app/acme/issue/ENG-1",
           state: { name: "Todo" },
+          delegate: issueDelegateId ? { id: issueDelegateId } : null,
         },
       };
     }

@@ -33,6 +33,7 @@ import {
   fetchLinearIssueContext,
   formatIssueContext,
   formatIssueContextHeader,
+  OWNERSHIP_CONTEXT,
 } from "./linear-context";
 import { ackWorking } from "./linear-narrator";
 import {
@@ -534,6 +535,7 @@ function handleCommentMention(
     backgroundWaitUntil(
       runThreadTurn({
         applyStatus: false,
+        botUserId: input.botUserId,
         client,
         executeMessage: serialized,
         issueId: event.issueId,
@@ -708,6 +710,7 @@ function handleIssueAssignment(
       runThreadTurn({
         announceStart: true,
         applyStatus: true,
+        botUserId: input.botUserId,
         client,
         executeMessage: assignmentInstructionMessage(event, threadKey),
         issueId: event.issueId,
@@ -738,6 +741,8 @@ async function runThreadTurn(input: {
    */
   announceStart?: boolean;
   applyStatus: boolean;
+  /** Bot's app-user id; used to detect whether the issue is delegated to it. */
+  botUserId?: string;
   client: LinearSessionCapableAdapter["linearClient"];
   executeMessage: LinearbotApiMessage;
   issueId: string;
@@ -753,6 +758,7 @@ async function runThreadTurn(input: {
   const {
     announceStart,
     applyStatus,
+    botUserId,
     client,
     executeMessage,
     issueId,
@@ -780,37 +786,50 @@ async function runThreadTurn(input: {
       });
     }
   }
-  // Delegation is ownership: move the issue to In Progress the moment work
-  // starts (the agent signals the terminal status itself at the end). Gated on
-  // applyStatus, so mention turns never touch status. Best-effort; backgrounded
-  // — and since the assignment trigger now requires the assignee to actually
-  // change, this status write won't bounce back as a fresh assignment turn.
-  if (applyStatus && client) {
+  const threadState = (await thread.state) ?? {};
+  // Resolve the issue context up front — including whether it's delegated to us.
+  // The context rides inline in the execute (contextPreamble lands directly in
+  // the prompt's input lines) rather than as a one-time appended session
+  // message, so a recycled sandbox or a single failed fetch never leaves the
+  // agent guessing what "this task" is. Full context (with description) on the
+  // thread's first turn; a compact id/title header thereafter.
+  const issueContext = client
+    ? await fetchLinearIssueContext(client, issueId, logger)
+    : null;
+  // "Owned" = handed to the bot via the assignment turn (applyStatus) OR the
+  // issue is delegated to the bot (true on a comment turn too, e.g. a question
+  // on a delegated issue). Ownership turns on the status plumbing and tells the
+  // agent to carry the work forward, not just answer.
+  const delegatedToBot = Boolean(
+    botUserId && issueContext?.delegateId === botUserId,
+  );
+  const owns = applyStatus || delegatedToBot;
+  // Move the issue to In Progress the moment work starts (the agent signals the
+  // terminal status itself at the end). Best-effort; backgrounded — and since
+  // the handoff trigger requires the assignee/delegate to actually change, this
+  // status write won't bounce back as a fresh turn.
+  if (owns && client) {
     backgroundWaitUntil(applyKickoffStatus(client, issueId, options, trace));
   }
-  const threadState = (await thread.state) ?? {};
-  // Tell the agent what task it's on by riding the issue context inline in the
-  // execute (contextPreamble lands directly in the prompt's input lines) rather
-  // than as a one-time appended session message — so a recycled sandbox or a
-  // single failed fetch never leaves the agent guessing what "this task" is.
-  // Full context (with description) on the thread's first turn; a compact
-  // id/title header thereafter, when the session already carries the rest.
-  let contextPreamble: string | undefined;
   let seededFullContext = false;
-  if (client) {
-    const issueContext = await fetchLinearIssueContext(client, issueId, logger);
-    if (issueContext) {
-      if (threadState.contextSeeded) {
-        contextPreamble = formatIssueContextHeader(issueContext);
-      } else {
-        contextPreamble = formatIssueContext(
-          issueContext,
-          ISSUE_CONTEXT_PREAMBLE_MAX_CHARS,
-        );
-        seededFullContext = true;
-      }
+  const contextParts: string[] = [];
+  if (issueContext) {
+    if (threadState.contextSeeded) {
+      contextParts.push(formatIssueContextHeader(issueContext));
+    } else {
+      contextParts.push(
+        formatIssueContext(issueContext, ISSUE_CONTEXT_PREAMBLE_MAX_CHARS),
+      );
+      seededFullContext = true;
     }
   }
+  // Inject the ownership contract on owned turns so the agent knows to continue
+  // the work (and how to signal status) — including comment turns on delegated
+  // issues, where the assignment instruction never runs.
+  if (owns) contextParts.push(OWNERSHIP_CONTEXT);
+  const contextPreamble = contextParts.length
+    ? contextParts.join("\n\n")
+    : undefined;
   let lastEventId = threadState.lastEventId ?? 0;
   const forwardInput: ForwardSessionInput = {
     afterEventId: lastEventId,
@@ -966,7 +985,7 @@ async function runThreadTurn(input: {
         error: errorMessage(error),
       });
     }
-    if (applyStatus && marker) {
+    if (owns && marker) {
       backgroundWaitUntil(
         applyAssignmentStatusMarker(client, issueId, marker, options, trace),
       );
@@ -1209,7 +1228,10 @@ function shouldAwaitLinearHandoff(rawBody: string): boolean {
     const payload = JSON.parse(rawBody) as { action?: unknown; type?: unknown };
     if (payload.type === "AgentSessionEvent") return true;
     if (payload.type === "Comment" && payload.action === "create") return true;
-    return payload.type === "Issue" && payload.action === "update";
+    return (
+      payload.type === "Issue" &&
+      (payload.action === "update" || payload.action === "create")
+    );
   } catch {
     return false;
   }

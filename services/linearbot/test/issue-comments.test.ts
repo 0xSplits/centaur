@@ -102,7 +102,7 @@ describe("parseIssueAssignmentWebhook", () => {
       BOT_USER_ID,
     );
     expect(event?.issueId).toBe("issue-1");
-    expect(event?.assigneeId).toBe(BOT_USER_ID);
+    expect(event?.delegated).toBe(false);
   });
 
   it("fires when assigned from unassigned (null) to the bot", () => {
@@ -114,6 +114,38 @@ describe("parseIssueAssignmentWebhook", () => {
     ).not.toBeNull();
   });
 
+  it("fires when the issue is just delegated to the bot", () => {
+    const event = parseIssueAssignmentWebhook(
+      assignmentPayload(
+        { updatedFrom: { delegateId: "user-9" } },
+        { assigneeId: null, delegateId: BOT_USER_ID },
+      ),
+      BOT_USER_ID,
+    );
+    expect(event?.issueId).toBe("issue-1");
+    expect(event?.delegated).toBe(true);
+  });
+
+  it("fires when an issue is CREATED already assigned to the bot (no updatedFrom)", () => {
+    expect(
+      parseIssueAssignmentWebhook(
+        assignmentPayload({ action: "create" }),
+        BOT_USER_ID,
+      ),
+    ).not.toBeNull();
+  });
+
+  it("fires when an issue is CREATED already delegated to the bot", () => {
+    const event = parseIssueAssignmentWebhook(
+      assignmentPayload(
+        { action: "create" },
+        { assigneeId: null, delegateId: BOT_USER_ID },
+      ),
+      BOT_USER_ID,
+    );
+    expect(event?.delegated).toBe(true);
+  });
+
   it("does NOT fire on an edit to an issue the bot already owns", () => {
     expect(
       parseIssueAssignmentWebhook(
@@ -123,7 +155,7 @@ describe("parseIssueAssignmentWebhook", () => {
     ).toBeNull();
   });
 
-  it("does NOT fire on the bot's own status change (updatedFrom lacks assigneeId)", () => {
+  it("does NOT fire on the bot's own status change (updatedFrom lacks assignee/delegate)", () => {
     expect(
       parseIssueAssignmentWebhook(
         assignmentPayload({ updatedFrom: { stateId: "st-old" } }),
@@ -132,13 +164,13 @@ describe("parseIssueAssignmentWebhook", () => {
     ).toBeNull();
   });
 
-  it("falls back to the assignee check when updatedFrom is absent", () => {
+  it("falls back to the membership check when updatedFrom is absent", () => {
     expect(
       parseIssueAssignmentWebhook(assignmentPayload(), BOT_USER_ID),
     ).not.toBeNull();
   });
 
-  it("ignores updates whose current assignee is not the bot", () => {
+  it("ignores updates where neither assignee nor delegate is the bot", () => {
     expect(
       parseIssueAssignmentWebhook(
         assignmentPayload(
