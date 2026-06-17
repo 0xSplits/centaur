@@ -226,11 +226,14 @@ export function createLinearbot(options: LinearbotOptions): Linearbot {
   // first webhook — idempotent and best-effort.
   let chatInitialized = false;
   let botProfileHandle: string | undefined;
+  let botDisplayName: string | undefined;
   const ensureChatInitialized = async (): Promise<void> => {
     if (chatInitialized) return;
     try {
       await chat.initialize();
-      botProfileHandle = await resolveBotProfileHandle(linear, logger);
+      const identity = await resolveBotIdentity(linear, logger);
+      botProfileHandle = identity.profileHandle;
+      botDisplayName = identity.displayName;
     } catch (error) {
       logger.warn("linearbot_chat_initialize_failed", {
         error: errorMessage(error),
@@ -276,6 +279,7 @@ export function createLinearbot(options: LinearbotOptions): Linearbot {
         botUserId = undefined;
       }
       const handlerInput: ThreadHandlerInput = {
+        botDisplayName,
         botProfileHandle,
         botUserId,
         chat,
@@ -422,6 +426,7 @@ const WORK_START_HEADLINE = "On it — working on this issue.";
 const PROFILE_HANDLE_PATTERN = /\/profiles\/([^/?#]+)/;
 
 type ThreadHandlerInput = {
+  botDisplayName: string | undefined;
   botProfileHandle: string | undefined;
   botUserId: string | undefined;
   chat: Chat<Record<string, Adapter>, LinearbotThreadState>;
@@ -429,31 +434,46 @@ type ThreadHandlerInput = {
   state: StateAdapter;
 };
 
+type BotIdentity = {
+  /** The `{handle}` in the bot's linear.app/.../profiles/{handle} URL. */
+  profileHandle?: string;
+  /** The bot's Linear displayName, used to match a typed `@name` mention. */
+  displayName?: string;
+};
+
 /**
- * Resolves the bot's profile handle (the `{handle}` in its
- * linear.app/.../profiles/{handle} URL) so commentMentionsBot can match the
- * mention Linear renders into the comment body. Best-effort; returns undefined
- * on failure (detection falls back to user id / @name).
+ * Resolves the bot's own identity from the single `viewer` query that already
+ * runs at init: the profile handle commentMentionsBot matches against the URL
+ * Linear renders for a mention, AND the displayName it matches against a typed
+ * `@name` — so neither the handle nor the name has to be hand-configured (the
+ * bot derives "who am I" from its own token, alongside the user id the adapter
+ * already exposes). Best-effort; returns {} on failure (detection falls back to
+ * the configured userName / bot user id).
  */
-async function resolveBotProfileHandle(
+async function resolveBotIdentity(
   linear: unknown,
   logger: Logger,
-): Promise<string | undefined> {
+): Promise<BotIdentity> {
   const client = (linear as LinearSessionCapableAdapter).linearClient;
-  if (!client?.client?.rawRequest) return undefined;
+  if (!client?.client?.rawRequest) return {};
   try {
     const response = await client.client.rawRequest<{
-      viewer?: { url?: unknown };
-    }>("query LinearbotBotProfile { viewer { id url } }");
-    const url = stringValue(response.data?.viewer?.url);
-    return url
-      ? (PROFILE_HANDLE_PATTERN.exec(url)?.[1] ?? undefined)
-      : undefined;
+      viewer?: { url?: unknown; displayName?: unknown; name?: unknown };
+    }>("query LinearbotBotProfile { viewer { id url displayName name } }");
+    const viewer = response.data?.viewer;
+    const url = stringValue(viewer?.url);
+    return {
+      profileHandle: url
+        ? (PROFILE_HANDLE_PATTERN.exec(url)?.[1] ?? undefined)
+        : undefined,
+      displayName:
+        stringValue(viewer?.displayName) ?? stringValue(viewer?.name),
+    };
   } catch (error) {
     logger.debug("linearbot_bot_profile_resolve_failed", {
       error: errorMessage(error),
     });
-    return undefined;
+    return {};
   }
 }
 
@@ -493,7 +513,11 @@ function handleCommentMention(
 ): Promise<void> | null {
   const event = parseIssueCommentWebhook(rawBody);
   if (!event) return null;
-  const names = [input.options.userName ?? "centaur"];
+  // Derive the @-mention name from the bot's own Linear displayName (resolved
+  // from its token), with the configured userName kept as an optional override.
+  const names = [input.botDisplayName, input.options.userName].filter(
+    (name): name is string => Boolean(name),
+  );
   if (
     !commentMentionsBot(event.body, names, {
       botUserId: input.botUserId,
@@ -574,7 +598,11 @@ function handleThreadFollowup(
   const event = parseIssueCommentWebhook(rawBody);
   if (!event) return null;
   // Mentions are answered by handleCommentMention; only ingest the rest here.
-  const names = [input.options.userName ?? "centaur"];
+  // Derive the @-mention name from the bot's own Linear displayName (resolved
+  // from its token), with the configured userName kept as an optional override.
+  const names = [input.botDisplayName, input.options.userName].filter(
+    (name): name is string => Boolean(name),
+  );
   if (
     commentMentionsBot(event.body, names, {
       botUserId: input.botUserId,
