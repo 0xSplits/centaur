@@ -474,9 +474,11 @@ Sandbox Pods never see real API keys. The firewall (`services/firewall/addon.py`
 |-------------|--------|--------|
 | `api.anthropic.com` | `x-api-key` | raw |
 | `api.openai.com` | `authorization` | bearer |
+| `openrouter.ai` | `authorization` | bearer |
 | `ampcode.com` | `authorization` | bearer |
 | `api.github.com` | `authorization` | token |
 | `github.com` | `authorization` | basic auth |
+| `bedrock-mantle.<region>.api.aws` | `authorization` + `x-amz-*` | AWS SigV4 re-sign (opt-in, codex `amazon-bedrock`) |
 
 ### Session Persistence
 

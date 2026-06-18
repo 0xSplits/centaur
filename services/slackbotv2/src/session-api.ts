@@ -213,7 +213,8 @@ export async function forwardToSessionApi(
       input.model,
       input.executeContextMessages,
       input.contextPreamble,
-      input.reasoning
+      input.reasoning,
+      input.provider
     )
   )
   traceLog(options, 'slackbotv2_session_execute_complete', input.trace, {
@@ -821,7 +822,8 @@ async function executeSession(
   model?: string,
   contextMessages?: SlackbotV2ApiMessage[],
   contextPreamble?: string,
-  reasoning?: string
+  reasoning?: string,
+  provider?: string
 ): Promise<SlackbotV2ExecuteSessionResponse> {
   const fetchFn = options.fetch ?? fetch
   const requesterIdentity = await resolveRequesterIdentity(options, message)
@@ -835,7 +837,8 @@ async function executeSession(
       requesterIdentity,
       contextMessages,
       contextPreamble,
-      reasoning
+      reasoning,
+      provider
     ),
     ...(options.idleTimeoutMs === undefined ? {} : { idle_timeout_ms: options.idleTimeoutMs }),
     ...(options.maxDurationMs === undefined ? {} : { max_duration_ms: options.maxDurationMs })
@@ -987,7 +990,8 @@ function toCodexInputLines(
   requesterIdentity?: RequesterIdentity,
   contextMessages?: SlackbotV2ApiMessage[],
   contextPreamble?: string,
-  reasoning?: string
+  reasoning?: string,
+  provider?: string
 ): string[] {
   const staged = new Map<SlackbotV2ApiAttachment, string>()
   const lines: string[] = []
@@ -1001,7 +1005,8 @@ function toCodexInputLines(
       requesterIdentity,
       contextMessages,
       contextPreamble,
-      reasoning
+      reasoning,
+      provider
     )
     if (
       inlineLine.length <= MAX_CODEX_INPUT_LINE_CHARS
@@ -1022,7 +1027,8 @@ function toCodexInputLines(
       requesterIdentity,
       contextMessages,
       contextPreamble,
-      reasoning
+      reasoning,
+      provider
     )
   )
   return lines
@@ -1049,13 +1055,15 @@ function toCodexInputLineWithStaged(
   requesterIdentity?: RequesterIdentity,
   contextMessages?: SlackbotV2ApiMessage[],
   contextPreamble?: string,
-  reasoning?: string
+  reasoning?: string,
+  provider?: string
 ): string {
   return JSON.stringify({
     type: 'user',
     thread_key: threadId,
     trace_metadata: sessionMetadata(message, { action: 'execute' }, requesterIdentity),
     ...(model ? { model } : {}),
+    ...(provider ? { provider } : {}),
     ...(reasoning ? { reasoning } : {}),
     message: {
       role: 'user',

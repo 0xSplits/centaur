@@ -16,7 +16,7 @@ use centaur_iron_control::{
     IdentityInput, IronControlClient, RoleSpec, SessionRegistrar, register_role,
 };
 use centaur_iron_proxy::{
-    ProxyFragment, SourceKind, SourcePolicy, harness_auth_fragment, infra_fragment,
+    ProxyFragment, SourceKind, SourcePolicy, bedrock_enabled, harness_auth_fragment, infra_fragment,
 };
 use centaur_sandbox_agent_k8s::{
     AgentSandboxBackend, AgentSandboxConfig, GitHubTokenRef, IronControlSettings, IronProxyConfig,
@@ -923,6 +923,15 @@ impl SandboxArgs {
                 "OPENROUTER_API_KEY".to_owned(),
             ));
         }
+        // When Bedrock is enabled, codex's `amazon-bedrock` provider signs with
+        // these placeholder AWS credentials and iron-proxy re-signs (SigV4) with
+        // the real IAM keys. `aws_auth` is not a `secrets` transform, so the
+        // placeholders are injected here rather than via sandbox_placeholder_env.
+        for (name, value) in centaur_iron_proxy::bedrock_sandbox_env() {
+            if !envs.iter().any(|(existing, _)| existing == &name) {
+                envs.push((name, value));
+            }
+        }
 
         // OTLP trace wiring rides from this process into every sandbox (the
         // same hardcoded set the Python control plane forwarded). The harness
@@ -1651,6 +1660,14 @@ impl IronProxyHarnessArgs {
             }
         }
         if let Some(fragment) = harness_auth_fragment("openrouter", "api_key")? {
+            fragments.push(fragment);
+        }
+        // Bedrock is opt-in (not the default codex provider): only register its
+        // SigV4 re-signing fragment when the operator has set CODEX_BEDROCK_REGION,
+        // since the fragment expects AWS keys in the secrets backend.
+        if bedrock_enabled()
+            && let Some(fragment) = harness_auth_fragment("amazon-bedrock", "api_key")?
+        {
             fragments.push(fragment);
         }
         Ok(fragments)

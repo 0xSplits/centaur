@@ -31,11 +31,17 @@ impl CodexHarnessServer {
             .filter(|model| !model.is_empty())
     }
 
-    fn model_provider_for(&self, model: Option<&str>) -> String {
-        env::var("CODEX_MODEL_PROVIDER")
-            .ok()
-            .map(|provider| provider.trim().to_owned())
+    fn model_provider_for(&self, provider_override: Option<&str>, model: Option<&str>) -> String {
+        provider_override
+            .map(str::trim)
             .filter(|provider| !provider.is_empty())
+            .map(str::to_owned)
+            .or_else(|| {
+                env::var("CODEX_MODEL_PROVIDER")
+                    .ok()
+                    .map(|provider| provider.trim().to_owned())
+                    .filter(|provider| !provider.is_empty())
+            })
             .or_else(|| {
                 model
                     .map(str::trim)
@@ -140,6 +146,7 @@ pub(crate) fn run_codex_blocks_server(config: CodexHarnessServer) -> Result<()> 
                 input,
                 client_user_message_id,
                 model,
+                provider,
                 reasoning,
             }) => {
                 if let Err(error) = run_codex_user_turn(
@@ -151,7 +158,8 @@ pub(crate) fn run_codex_blocks_server(config: CodexHarnessServer) -> Result<()> 
                     client_user_message_id,
                     {
                         let model = model.or_else(|| config.default_model());
-                        let model_provider = config.model_provider_for(model.as_deref());
+                        let model_provider =
+                            config.model_provider_for(provider.as_deref(), model.as_deref());
                         (model, model_provider)
                     },
                     reasoning,
@@ -504,4 +512,36 @@ fn codex_supports_stdio_listen(bin: &str) -> bool {
     let stdout = String::from_utf8_lossy(&output.stdout);
     let stderr = String::from_utf8_lossy(&output.stderr);
     stdout.contains("--listen") || stderr.contains("--listen")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // A non-empty explicit provider override (the `--bedrock` blocks `provider`
+    // field) short-circuits before any env/model heuristic, so these assertions
+    // are deterministic regardless of CODEX_MODEL_PROVIDER / OPENROUTER_MODEL.
+    #[test]
+    fn explicit_provider_override_wins_over_model_heuristic() {
+        let codex = CodexHarnessServer::codex();
+        assert_eq!(
+            codex.model_provider_for(Some("amazon-bedrock"), None),
+            "amazon-bedrock"
+        );
+        assert_eq!(
+            codex.model_provider_for(Some("amazon-bedrock"), Some("anthropic/claude-fable-5")),
+            "amazon-bedrock"
+        );
+    }
+
+    #[test]
+    fn blank_provider_override_is_ignored() {
+        // A blank override falls through to the model `/`-slug heuristic, which
+        // selects openrouter — i.e. the override does not pin an empty provider.
+        let codex = CodexHarnessServer::codex();
+        assert_eq!(
+            codex.model_provider_for(Some("   "), Some("vendor/model")),
+            "openrouter"
+        );
+    }
 }
