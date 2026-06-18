@@ -14,6 +14,7 @@ import type {
   SlackbotV2RendererSource,
   SlackbotV2SessionMessage
 } from './types'
+import { observeSeconds, slackbotMetrics } from './metrics'
 import { elapsedMs, isJsonObject, nowMs, stringValue, toAsyncIterable, traceLog } from './utils'
 
 export class SessionApiError extends Error {
@@ -47,6 +48,26 @@ export function isRetryableSessionApiError(error: unknown): boolean {
   if (error instanceof SessionApiError) return error.retryable
   if (!(error instanceof Error)) return false
   return error.name === 'AbortError' || error.name === 'TypeError'
+}
+
+async function recordSessionApiOperation<T>(
+  operation: string,
+  fn: () => Promise<T>
+): Promise<T> {
+  const startedAtMs = nowMs()
+  let outcome = 'success'
+  try {
+    return await fn()
+  } catch (error) {
+    outcome = isRetryableSessionApiError(error) ? 'retryable_error' : 'error'
+    throw error
+  } finally {
+    slackbotMetrics.sessionApiOperations.inc({ operation, outcome })
+    slackbotMetrics.sessionApiOperationDuration.observe(
+      { operation, outcome },
+      observeSeconds(startedAtMs)
+    )
+  }
 }
 
 type ForwardSessionApiCallbacks = {
@@ -150,11 +171,13 @@ export async function forwardToSessionApi(
   callbacks: ForwardSessionApiCallbacks = {}
 ): Promise<AsyncIterable<SlackbotV2RendererSource> | null> {
   const createStartedAtMs = nowMs()
-  const created = await createSession(
-    options,
-    input.threadId,
-    input.harnessType,
-    sessionRequesterMessage(input)
+  const created = await recordSessionApiOperation('create_session', () =>
+    createSession(
+      options,
+      input.threadId,
+      input.harnessType,
+      sessionRequesterMessage(input)
+    )
   )
   traceLog(options, 'slackbotv2_session_create_complete', input.trace, {
     harness_switched: created.harnessSwitched,
@@ -165,7 +188,9 @@ export async function forwardToSessionApi(
   }
   if (input.messages.length > 0) {
     const appendStartedAtMs = nowMs()
-    await appendSessionMessages(options, input.threadId, input.messages, !input.executeMessage)
+    await recordSessionApiOperation('append_messages', () =>
+      appendSessionMessages(options, input.threadId, input.messages, !input.executeMessage)
+    )
     traceLog(options, 'slackbotv2_session_append_complete', input.trace, {
       message_count: input.messages.length,
       phase_ms: elapsedMs(appendStartedAtMs)
@@ -177,15 +202,19 @@ export async function forwardToSessionApi(
     })
   }
   if (!input.executeMessage) return null
+  const executeMessage = input.executeMessage
 
   const executeStartedAtMs = nowMs()
-  const execution = await executeSession(
-    options,
-    input.threadId,
-    input.executeMessage,
-    input.model,
-    input.executeContextMessages,
-    input.contextPreamble
+  const execution = await recordSessionApiOperation('execute_session', () =>
+    executeSession(
+      options,
+      input.threadId,
+      executeMessage,
+      input.model,
+      input.executeContextMessages,
+      input.contextPreamble,
+      input.reasoning
+    )
   )
   traceLog(options, 'slackbotv2_session_execute_complete', input.trace, {
     execution_id: execution.execution_id,
@@ -202,12 +231,14 @@ export async function openSessionEventStream(
   input: Pick<ForwardSessionInput, 'afterEventId' | 'executionId' | 'onEventId' | 'threadId' | 'trace'>
 ): Promise<AsyncIterable<SlackbotV2RendererSource>> {
   const streamStartedAtMs = nowMs()
-  const stream = await streamSessionNotifications(
-    options,
-    input.threadId,
-    input.afterEventId,
-    input.executionId,
-    input.onEventId
+  const stream = await recordSessionApiOperation('open_event_stream', () =>
+    streamSessionNotifications(
+      options,
+      input.threadId,
+      input.afterEventId,
+      input.executionId,
+      input.onEventId
+    )
   )
   traceLog(options, 'slackbotv2_session_events_opened', input.trace, {
     after_event_id: input.afterEventId,
@@ -789,7 +820,8 @@ async function executeSession(
   message: SlackbotV2ApiMessage,
   model?: string,
   contextMessages?: SlackbotV2ApiMessage[],
-  contextPreamble?: string
+  contextPreamble?: string,
+  reasoning?: string
 ): Promise<SlackbotV2ExecuteSessionResponse> {
   const fetchFn = options.fetch ?? fetch
   const requesterIdentity = await resolveRequesterIdentity(options, message)
@@ -802,7 +834,8 @@ async function executeSession(
       model,
       requesterIdentity,
       contextMessages,
-      contextPreamble
+      contextPreamble,
+      reasoning
     ),
     ...(options.idleTimeoutMs === undefined ? {} : { idle_timeout_ms: options.idleTimeoutMs }),
     ...(options.maxDurationMs === undefined ? {} : { max_duration_ms: options.maxDurationMs })
@@ -874,7 +907,7 @@ function ensureTrailingSlash(value: string): string {
 }
 
 function apiHeaders(options: SlackbotV2Options, jsonBody = true): HeadersInit {
-  const apiKey = options.apiKey ?? process.env.SLACKBOT_API_KEY ?? process.env.CENTAUR_API_KEY
+  const apiKey = options.apiKey ?? process.env.SLACKBOT_API_KEY
   return {
     ...(jsonBody ? { 'content-type': 'application/json' } : {}),
     ...(apiKey ? { authorization: `Bearer ${apiKey}` } : {})
@@ -953,7 +986,8 @@ function toCodexInputLines(
   model?: string,
   requesterIdentity?: RequesterIdentity,
   contextMessages?: SlackbotV2ApiMessage[],
-  contextPreamble?: string
+  contextPreamble?: string,
+  reasoning?: string
 ): string[] {
   const staged = new Map<SlackbotV2ApiAttachment, string>()
   const lines: string[] = []
@@ -966,7 +1000,8 @@ function toCodexInputLines(
       model,
       requesterIdentity,
       contextMessages,
-      contextPreamble
+      contextPreamble,
+      reasoning
     )
     if (
       inlineLine.length <= MAX_CODEX_INPUT_LINE_CHARS
@@ -986,7 +1021,8 @@ function toCodexInputLines(
       model,
       requesterIdentity,
       contextMessages,
-      contextPreamble
+      contextPreamble,
+      reasoning
     )
   )
   return lines
@@ -1012,13 +1048,15 @@ function toCodexInputLineWithStaged(
   model?: string,
   requesterIdentity?: RequesterIdentity,
   contextMessages?: SlackbotV2ApiMessage[],
-  contextPreamble?: string
+  contextPreamble?: string,
+  reasoning?: string
 ): string {
   return JSON.stringify({
     type: 'user',
     thread_key: threadId,
     trace_metadata: sessionMetadata(message, { action: 'execute' }, requesterIdentity),
     ...(model ? { model } : {}),
+    ...(reasoning ? { reasoning } : {}),
     message: {
       role: 'user',
       content: codexInputContent(

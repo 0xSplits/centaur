@@ -227,7 +227,7 @@ repoCache:
   # tool server is enabled.
   repositories: []
   repositoryRefs: {}
-  syncIntervalSeconds: 300
+  syncIntervalSeconds: 30
   image:
     repository: ""
     tag: ""
@@ -278,7 +278,7 @@ apiRs:
   sandboxBackend: agent-k8s
   sandboxWorkload: codex-app-server
   sandboxReadyTimeoutSecs: 90
-  sandboxWarmPoolSize: 0
+  sandboxWarmPoolSize: 3
   sandboxWarmPoolReplenishIntervalSecs: 5
   # Reaper: stop sandboxes idle-paused longer than the idle TTL or older than
   # the max lifetime. 0 disables that sweep. Interval must be >= 1.
@@ -327,6 +327,12 @@ slackbotv2:
   assistantStatus: ""
   externalOrgAllowlist: ""
   triggerBotAllowlist: ""
+  metrics:
+    # slackbotv2 serves Prometheus text metrics at /metrics. This flag only
+    # controls scrape annotations for Prometheus/VictoriaMetrics-style discovery.
+    scrapeAnnotations: true
+    path: /metrics
+    annotations: {}
   extraEnv: {}
   resources: {}
 

@@ -32,7 +32,7 @@ class PgDsnSecretTest < ActiveSupport::TestCase
     assert_includes secret.errors[:dsn_source], "can't be blank"
   end
 
-  test "requires a foreign_id (it is the proxy's binding key)" do
+  test "requires a foreign_id (it derives the sandbox env var)" do
     secret = with_dsn(PgDsnSecret.new(base_attrs(foreign_id: nil)))
     assert_not secret.valid?
     assert_includes secret.errors[:foreign_id], "can't be blank"
