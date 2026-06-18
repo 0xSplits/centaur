@@ -90,7 +90,7 @@ events** subscription are only for native agent sessions, which this bot keeps o
 
 ## Patched adapter
 
-`patches/@chat-adapter__linear@4.30.0.patch` (registered in `pnpm-workspace.yaml`) carries three
+`patches/@chat-adapter__linear@4.31.0.patch` (registered in `pnpm-workspace.yaml`) carries three
 fixes to the agent-session path. They are still applied but matter only if agent sessions are ever
 enabled (they are off today, see above):
 
