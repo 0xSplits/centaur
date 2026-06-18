@@ -179,12 +179,12 @@ export function createLinearbot(options: LinearbotOptions): Linearbot {
       const identity = await resolveBotIdentity(linear, logger);
       botProfileHandle = identity.profileHandle;
       botDisplayName = identity.displayName;
+      chatInitialized = true;
     } catch (error) {
       logger.warn("linearbot_chat_initialize_failed", {
         error: errorMessage(error),
       });
     }
-    chatInitialized = true;
   };
 
   const app = new Hono();
