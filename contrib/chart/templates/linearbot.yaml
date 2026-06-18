@@ -63,10 +63,6 @@ spec:
                   key: {{ printf "%sDATABASE_URL" .Values.secretManager.envPrefix }}
             - name: LINEARBOT_USER_NAME
               value: {{ .Values.linearbot.userName | quote }}
-{{- if .Values.linearbot.mode }}
-            - name: LINEARBOT_MODE
-              value: {{ .Values.linearbot.mode | quote }}
-{{- end }}
 {{- range $name, $value := .Values.linearbot.extraEnv }}
             - name: {{ $name }}
               value: {{ $value | quote }}

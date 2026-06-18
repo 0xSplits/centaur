@@ -349,8 +349,6 @@ linearbot:
     tag: latest
     pullPolicy: Always
   userName: centaur
-  # "agent-sessions" (default) or "comments" (degraded, personal API key).
-  mode: ""
   extraEnv: {}
   resources: {}
 

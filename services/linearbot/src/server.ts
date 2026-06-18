@@ -6,8 +6,8 @@ const apiUrl = stringEnv("CENTAUR_API_URL", "http://127.0.0.1:8080");
 // linearbot is a separate Linear webhook (different URL → different signing
 // secret), so it gets its own key to avoid clobbering the workflow's.
 const linearWebhookSecret = requiredEnv("LINEARBOT_WEBHOOK_SECRET");
-// actor=app OAuth token for agent sessions; a personal API key only supports
-// the degraded comments mode.
+// actor=app OAuth token (the bot runs as an app); a personal API key runs the
+// same comment-thread model as a regular user, without an OAuth install.
 const linearAccessToken = optionalEnv("LINEAR_ACCESS_TOKEN");
 const linearApiKey = optionalEnv("LINEAR_API_KEY");
 if (!linearAccessToken && !linearApiKey) {
@@ -45,15 +45,6 @@ if (!postgresUrl) {
   );
 }
 
-const linearMode = optionalEnv("LINEARBOT_MODE");
-if (
-  linearMode &&
-  linearMode !== "agent-sessions" &&
-  linearMode !== "comments"
-) {
-  throw new Error("LINEARBOT_MODE must be 'agent-sessions' or 'comments'");
-}
-
 const options: LinearbotOptions = {
   apiUrl,
   apiKey: optionalEnv("LINEARBOT_API_KEY") ?? optionalEnv("CENTAUR_API_KEY"),
@@ -62,7 +53,6 @@ const options: LinearbotOptions = {
   linearAccessToken,
   linearApiKey,
   linearApiUrl: optionalEnv("LINEAR_API_URL"),
-  linearMode: linearMode as LinearbotOptions["linearMode"],
   linearWebhookSecret,
   maxDurationMs: optionalNumberEnv("SESSION_MAX_DURATION_MS"),
   postgresUrl,
@@ -77,7 +67,6 @@ const server = Bun.serve({ port, fetch: app.fetch });
 log("info", "linearbot_started", {
   port: server.port,
   api_url: apiUrl,
-  mode: linearMode ?? "agent-sessions",
 });
 
 const shutdown = async (signal: string): Promise<void> => {

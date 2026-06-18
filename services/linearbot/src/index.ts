@@ -123,7 +123,11 @@ export function createLinearbot(options: LinearbotOptions): Linearbot {
         ? { apiKey: options.linearApiKey }
         : {}),
     ...(options.linearApiUrl ? { apiUrl: options.linearApiUrl } : {}),
-    mode: options.linearMode ?? "agent-sessions",
+    // The chat SDK runs the adapter in agent-sessions mode: it settles the
+    // (vestigial) agent session an @-mention opens and ignores Comment webhooks,
+    // leaving those for linearbot's own comment-thread handlers. There is no
+    // configurable mode — the comment-thread model is the only model.
+    mode: "agent-sessions",
     userName,
     webhookSecret: options.linearWebhookSecret,
     logger,

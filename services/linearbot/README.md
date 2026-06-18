@@ -68,11 +68,12 @@ webhook deadline. Multiple replicas are fine.
 ## Auth
 
 A Linear token is required: an **OAuth `actor=app` install** (`LINEAR_ACCESS_TOKEN`) or a personal
-**`LINEAR_API_KEY`** — set at least one. Either can read issues and post comments/reactions for the
-comment-thread model; the bot must be a Linear identity you can `@`-mention and assign/delegate
-issues to. Webhook subscriptions needed: **Comments** and **Issues**. (Linear's agent capability —
-`app:assignable` + `app:mentionable`, actor=app — and the **Agent session events** subscription are
-only for native agent sessions, which this bot keeps off; see above.)
+**`LINEAR_API_KEY`** — set at least one. The access token runs the bot as an app; the API key runs
+the same comment-thread model as a regular Linear user, without an OAuth install. Either can read
+issues and post comments/reactions; the bot must be a Linear identity you can `@`-mention and
+assign/delegate issues to. Webhook subscriptions needed: **Comments** and **Issues**. (Linear's
+agent capability — `app:assignable` + `app:mentionable`, actor=app — and the **Agent session
+events** subscription are only for native agent sessions, which this bot keeps off; see above.)
 
 ## Environment
 
@@ -83,7 +84,6 @@ only for native agent sessions, which this bot keeps off; see above.)
 | `LINEARBOT_DATABASE_URL` | ✅ | Postgres for chat-SDK state (falls back to `DATABASE_URL`). |
 | `CENTAUR_API_URL` | — | api-rs control plane, default `http://127.0.0.1:8080`. |
 | `LINEARBOT_API_KEY` | — | Bearer sent to api-rs (falls back to `CENTAUR_API_KEY`). |
-| `LINEARBOT_MODE` | — | Adapter mode, `agent-sessions` (default) or `comments`. Only affects the vestigial agent-session path; the comment/issue webhook handlers run regardless. |
 | `LINEARBOT_USER_NAME` | — | Bot display name for mention parsing, default `centaur` (the bot also derives its real handle/name from its own token). |
 | `LINEARBOT_LOG_LEVEL` | — | `debug`/`info`/`warn`/`error`, default `info`. |
 | `SESSION_IDLE_TIMEOUT_MS` / `SESSION_MAX_DURATION_MS` | — | Forwarded to api-rs executes. |

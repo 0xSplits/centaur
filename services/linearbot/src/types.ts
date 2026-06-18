@@ -102,14 +102,15 @@ export type LinearbotOptions = {
   defaultHarnessType?: string;
   fetch?: LinearbotFetch;
   idleTimeoutMs?: number;
-  /** OAuth access token from an actor=app install (agent-sessions mode). */
+  /** OAuth access token from an actor=app install (the bot runs as an app). */
   linearAccessToken?: string;
-  /** Personal API key fallback (comments mode only; no agent sessions). */
+  /**
+   * Personal API key fallback: runs the same comment-thread model as a regular
+   * Linear user instead of an app (no OAuth install required).
+   */
   linearApiKey?: string;
   /** Override the Linear GraphQL API base URL (tests/emulation). */
   linearApiUrl?: string;
-  /** Webhook handling mode. Defaults to 'agent-sessions'. */
-  linearMode?: "agent-sessions" | "comments";
   /** Webhook signing secret from the Linear webhook settings page. */
   linearWebhookSecret: string;
   logger?: Logger;

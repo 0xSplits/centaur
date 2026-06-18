@@ -9,8 +9,9 @@ import { errorMessage, stringValue } from "./utils";
 // for agents natively: every AgentSessionEvent webhook carries a
 // `promptContext` blob — pre-formatted issue details + comments, curated by
 // Linear — which the adapter exposes on the raw message. Prefer that; fall
-// back to the message subject (one issue fetch) when it is absent (comments
-// mode, or replayed/fetched history messages).
+// back to the message subject (one issue fetch) when it is absent (the
+// Comment/Issue webhooks the comment-thread model runs on carry no
+// promptContext, as do replayed/fetched history messages).
 
 const CONTEXT_MAX_CHARS = 100_000;
 
