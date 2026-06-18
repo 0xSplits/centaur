@@ -67,13 +67,29 @@ webhook deadline. Multiple replicas are fine.
 
 ## Auth
 
-A Linear token is required: an **OAuth `actor=app` install** (`LINEAR_ACCESS_TOKEN`) or a personal
-**`LINEAR_API_KEY`** — set at least one. The access token runs the bot as an app; the API key runs
-the same comment-thread model as a regular Linear user, without an OAuth install. Either can read
-issues and post comments/reactions; the bot must be a Linear identity you can `@`-mention and
-assign/delegate issues to. Webhook subscriptions needed: **Comments** and **Issues**. (Linear's
-agent capability — `app:assignable` + `app:mentionable`, actor=app — and the **Agent session
-events** subscription are only for native agent sessions, which this bot keeps off; see above.)
+A Linear token is required — set exactly one of two paths. Either way the token's identity must be
+one you can `@`-mention and assign/delegate issues to, and it does the same work: read issues, post
+and live-edit comments, add reactions, and move workflow status on owned issues.
+
+- **Personal `LINEAR_API_KEY`** (simplest) — runs the comment-thread model as a regular Linear user,
+  no OAuth install. There are no scopes to configure: a normal user is natively mentionable and
+  assignable, and the key inherits that user's read/write permissions.
+- **OAuth `actor=app` install** (`LINEAR_ACCESS_TOKEN`) — runs the bot as an app. Install with the
+  `actor=app` authorization parameter (requires workspace admin) and request these scopes:
+
+  | Scope | Why it's needed |
+  |-------|-----------------|
+  | `read` | always present; reads issues, comments, reactions, the bot's own `viewer`, and team workflow states |
+  | `write` | live-edits comments, adds reactions, and moves issue status — none of these are covered by the granular `comments:create` / `issues:create` scopes, so broad `write` is required |
+  | `app:mentionable` | puts the bot in the `@`-mention autocomplete — without it the bot can't be mentioned at all, and mentioning is the primary trigger |
+  | `app:assignable` | lets an issue be assigned/delegated to the bot (it becomes the issue *delegate*, not assignee) — the ownership/assignment trigger |
+
+Webhook subscriptions needed: **Comments** and **Issues**. Do **not** subscribe to **Agent session
+events** — `app:mentionable` / `app:assignable` make Linear auto-create a native agent session on
+every mention/delegate (this can't be turned off), but we never subscribe to those events and drive
+work off the plain Comment/Issue webhooks instead; any session that does open is settled as
+vestigial (see above). The `app:` scopes are required regardless — they are what make the bot
+mentionable and assignable in the first place, not an agent-session add-on.
 
 ## Environment
 
