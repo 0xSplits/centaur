@@ -1,7 +1,6 @@
-import type { Logger, Message as ChatMessage } from "chat";
-import { parseLinearThreadKey } from "./linear-threading";
-import type { LinearbotApiMessage, LinearRawRequestClient } from "./types";
-import { errorMessage, isJsonObject, stringValue } from "./utils";
+import type { Logger } from "chat";
+import type { LinearRawRequestClient } from "./types";
+import { errorMessage, stringValue } from "./utils";
 
 // Linear delta (no slackbotv2 analog; closest relative is discord-starter's
 // thread-starter prepend): the thread history for an agent session is just the
@@ -41,123 +40,6 @@ export const OWNERSHIP_CONTEXT = [
   "- If this looks like a recurring task, previous instances likely exist as other Linear issues; look them up with the `linear` tool for context and continuity.",
   "- Never delegate issues to yourself or mention yourself in comments.",
 ].join("\n");
-
-/**
- * Builds the synthetic "issue context" message prepended to the initial
- * session context. Returns null when no context could be derived; never
- * throws (context enrichment must not fail the turn).
- */
-export async function buildLinearContextMessage(
-  message: ChatMessage,
-  logger: Logger,
-): Promise<LinearbotApiMessage | null> {
-  const text =
-    promptContextText(message.raw) ?? (await subjectText(message, logger));
-  if (!text) return null;
-  const { issueId, agentSessionId } = parseLinearThreadKey(message.threadId);
-  return {
-    attachments: [],
-    author: {
-      fullName: "Linear",
-      isBot: true,
-      isMe: false,
-      userId: "linear",
-      userName: "linear",
-    },
-    // Stable per thread so forwardedMessageIds dedupes re-syncs.
-    id: `linear-context-${agentSessionId ?? issueId ?? message.threadId}`,
-    isMention: false,
-    raw: { linearbotSyntheticContext: true },
-    text: truncateContext(text),
-    threadId: message.threadId,
-    timestamp: message.metadata.dateSent.toISOString(),
-  };
-}
-
-/**
- * Linear's own context blob from the AgentSessionEvent webhook, when present.
- */
-function promptContextText(raw: unknown): string | undefined {
-  if (!isJsonObject(raw)) return undefined;
-  if (raw.kind !== "agent_session_comment") return undefined;
-  const promptContext = stringValue(raw.agentSessionPromptContext);
-  if (!promptContext) return undefined;
-  return `[Linear issue context]\n\n${promptContext}`;
-}
-
-/**
- * Fallback context from the message subject (the Linear issue): identifier,
- * title, state, assignee, labels, url, and description.
- */
-async function subjectText(
-  message: ChatMessage,
-  logger: Logger,
-): Promise<string | undefined> {
-  let subject: Awaited<ChatMessage["subject"]>;
-  try {
-    subject = await message.subject;
-  } catch (error) {
-    logger.warn("linearbot_context_subject_failed", {
-      error: errorMessage(error),
-    });
-    return undefined;
-  }
-  if (!subject) return undefined;
-  const header = [subject.id, subject.title].filter(Boolean).join(": ");
-  const facts = [
-    subject.status ? `Status: ${subject.status}` : undefined,
-    subject.assignee?.name ? `Assignee: ${subject.assignee.name}` : undefined,
-    subject.labels?.length ? `Labels: ${subject.labels.join(", ")}` : undefined,
-    subject.url ? `URL: ${subject.url}` : undefined,
-  ].filter(Boolean);
-  const description = stringValue(subject.description);
-  const sections = [
-    `[Linear issue context]`,
-    header,
-    facts.join("\n"),
-    description ? `Description:\n${description}` : undefined,
-  ].filter(Boolean);
-  if (sections.length <= 1) return undefined;
-  return sections.join("\n\n");
-}
-
-// Linear delta: the agent's final reply is surfaced in two places — the agent
-// session widget AND, via the answer mirror (index.ts postAnswerAsThreadReply),
-// as a comment in the issue thread. A teammate reading the thread sees the
-// comment, so the reply should lead with a one-line summary then the full
-// answer. This guidance rides in as a synthetic context message on the first
-// turn; the session retains it for follow-ups.
-export const LINEAR_REPLY_GUIDANCE = [
-  "When you post your final reply on this Linear issue, begin with a one-sentence summary of your conclusion, then give the full answer.",
-  "Your reply is shown both in the Linear agent session and as a comment in the issue thread — write it for a teammate reading the thread.",
-].join("\n");
-
-/**
- * Synthetic message carrying the reply-format guidance (LINEAR_REPLY_GUIDANCE),
- * prepended to the session's initial context alongside the issue context.
- */
-export function buildLinearReplyGuidanceMessage(
-  message: ChatMessage,
-): LinearbotApiMessage {
-  const { issueId, agentSessionId } = parseLinearThreadKey(message.threadId);
-  return {
-    attachments: [],
-    author: {
-      fullName: "Linear",
-      isBot: true,
-      isMe: false,
-      userId: "linear",
-      userName: "linear",
-    },
-    // Stable per thread so forwardedMessageIds dedupes re-syncs.
-    id: `linear-reply-guidance-${agentSessionId ?? issueId ?? message.threadId}`,
-    isMention: false,
-    raw: { linearbotSyntheticContext: true },
-    text: LINEAR_REPLY_GUIDANCE,
-    threadId: message.threadId,
-    timestamp: message.metadata.dateSent.toISOString(),
-  };
-}
 
 const ISSUE_CONTEXT_QUERY = `
   query LinearbotIssueContext($issueId: String!) {

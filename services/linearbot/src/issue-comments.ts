@@ -58,11 +58,6 @@ export function parseIssueCommentWebhook(
   };
 }
 
-/** State key holding the agent-session thread ids known for an issue. */
-export function issueSessionsKey(issueId: string): string {
-  return `linearbot:issue-sessions:${issueId}`;
-}
-
 /** An issue handed to the bot, reduced to what the assignment turn needs. */
 export type IssueAssignmentEvent = {
   issueId: string;
@@ -126,20 +121,4 @@ export function parseIssueAssignmentWebhook(
     updatedAt:
       stringValue(data.updatedAt) ?? stringValue(payload.updatedAt) ?? "",
   };
-}
-
-/**
- * True when the comment belongs to the session's own comment thread (the
- * root comment itself, or a reply under it) — those arrive as `prompted`
- * AgentSessionEvents and must not be forwarded twice.
- */
-export function isSessionThreadComment(
-  event: Pick<IssueCommentEvent, "commentId" | "parentId">,
-  sessionRootCommentId: string | undefined,
-): boolean {
-  if (!sessionRootCommentId) return false;
-  return (
-    event.commentId === sessionRootCommentId ||
-    event.parentId === sessionRootCommentId
-  );
 }

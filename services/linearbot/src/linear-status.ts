@@ -1,6 +1,5 @@
-import type { Logger } from "chat";
 import type { JsonObject, LinearRawRequestClient } from "./types";
-import { errorMessage, isJsonObject, stringValue } from "./utils";
+import { isJsonObject, stringValue } from "./utils";
 
 // Linear delta (no slackbotv2 analog): workflow-status plumbing for DELEGATED
 // issues. Delegation gives the agent "ownership" of an issue, so the issue's
@@ -195,17 +194,4 @@ export function statusTraceFields(
   state: LinearWorkflowState,
 ): JsonObject {
   return { issue_id: issueId, state_id: state.id, state_name: state.name };
-}
-
-/** Logs and swallows: status mutation is cosmetic, like narration. */
-export async function bestEffort(
-  logger: Logger,
-  event: string,
-  task: Promise<void>,
-): Promise<void> {
-  try {
-    await task;
-  } catch (error) {
-    logger.warn(event, { error: errorMessage(error) });
-  }
 }

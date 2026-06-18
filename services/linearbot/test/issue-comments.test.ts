@@ -1,7 +1,5 @@
 import { describe, expect, it } from "bun:test";
 import {
-  isSessionThreadComment,
-  issueSessionsKey,
   parseIssueAssignmentWebhook,
   parseIssueCommentWebhook,
 } from "../src/issue-comments";
@@ -180,45 +178,5 @@ describe("parseIssueAssignmentWebhook", () => {
         BOT_USER_ID,
       ),
     ).toBeNull();
-  });
-});
-
-describe("isSessionThreadComment", () => {
-  it("matches the session root comment and replies under it", () => {
-    expect(
-      isSessionThreadComment(
-        { commentId: "comment-root", parentId: undefined },
-        "comment-root",
-      ),
-    ).toBe(true);
-    expect(
-      isSessionThreadComment(
-        { commentId: "comment-9", parentId: "comment-root" },
-        "comment-root",
-      ),
-    ).toBe(true);
-  });
-
-  it("does not match foreign comments or unknown roots", () => {
-    expect(
-      isSessionThreadComment(
-        { commentId: "comment-9", parentId: undefined },
-        "comment-root",
-      ),
-    ).toBe(false);
-    expect(
-      isSessionThreadComment(
-        { commentId: "comment-9", parentId: undefined },
-        undefined,
-      ),
-    ).toBe(false);
-  });
-});
-
-describe("issueSessionsKey", () => {
-  it("is namespaced per issue", () => {
-    expect(issueSessionsKey("issue-1")).toBe(
-      "linearbot:issue-sessions:issue-1",
-    );
   });
 });

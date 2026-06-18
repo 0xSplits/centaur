@@ -581,7 +581,7 @@ describe("linearbot comment-thread pipeline", () => {
     );
   });
 
-  it("treats a comment on a delegated issue as owned work (status + ownership context)", async () => {
+  it("treats a comment on a delegated issue as owned work (ownership context, not status)", async () => {
     linearApi.setIssueDelegate(BOT_USER_ID);
     const threadKey = `linear:${ISSUE_ID}:c:comment-deleg`;
     await postWebhook(
@@ -600,6 +600,7 @@ describe("linearbot comment-thread pipeline", () => {
       ),
     ).toBe(true);
 
+    const statusUpdatesBefore = linearApi.issueStateUpdates.length;
     codexApi.emitOutputLines(
       threadKey,
       sampleCodexOutputLines("Handled.\n\nLinear-Status: done"),
@@ -609,14 +610,17 @@ describe("linearbot comment-thread pipeline", () => {
         (c) => c.parentId === "comment-deleg" && c.body.includes("Handled."),
       ),
     );
-    // Ownership behaviors fire on a comment turn for a delegated issue: kickoff
-    // to In Progress, then the terminal marker to Done.
-    await waitFor(() =>
-      linearApi.issueStateUpdates.some((u) => u.stateId === "st-done"),
-    );
-    expect(
-      linearApi.issueStateUpdates.some((u) => u.stateId === "st-progress"),
-    ).toBe(true);
+    // A comment turn answers and carries the ownership contract, but never
+    // writes issue status: kickoff and the terminal marker belong to the
+    // assignment thread (linear:{issueId}), so a delegate-plus-mention can't
+    // double-drive status and a commenter can't force a transition. The marker
+    // is still stripped from the visible reply.
+    const reply = linearApi.botComments.find(
+      (c) => c.parentId === "comment-deleg",
+    )!;
+    expect(reply.body).not.toContain("Linear-Status:");
+    await Bun.sleep(100);
+    expect(linearApi.issueStateUpdates.length).toBe(statusUpdatesBefore);
   });
 
   it("dedupes a redelivered assignment webhook", async () => {

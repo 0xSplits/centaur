@@ -53,7 +53,6 @@ import {
   updateIssueState,
   type LinearStatusMarker,
 } from "./linear-status";
-import { parseLinearThreadKey } from "./linear-threading";
 import { extractMessageOverrides } from "./overrides";
 import {
   executeSessionTurn,
@@ -113,59 +112,6 @@ const RENDER_RETRY_INITIAL_DELAY_MS = 250;
 const RENDER_RETRY_MAX_DELAY_MS = 5_000;
 const POSTGRES_CONNECT_INITIAL_DELAY_MS = 250;
 const POSTGRES_CONNECT_MAX_DELAY_MS = 10_000;
-
-// The resolved issue name becomes the session principal's display name in
-// iron-control (see api-rs derive_principal). api-rs re-upserts the principal on
-// every create, so the name must ride every create to stay stable — cache the
-// per-issue lookup (mirrors slackbotv2's channel-name cache). Misses expire
-// sooner so a transient subject-fetch failure self-heals.
-const CONVERSATION_NAME_CACHE_SUCCESS_TTL_MS = 6 * 60 * 60 * 1000;
-const CONVERSATION_NAME_CACHE_MISS_TTL_MS = 10 * 60 * 1000;
-type ConversationNameCacheEntry = {
-  expiresAtMs: number;
-  name: string | undefined;
-};
-const conversationNameCache = new Map<string, ConversationNameCacheEntry>();
-
-export function clearConversationNameCacheForTests(): void {
-  conversationNameCache.clear();
-}
-
-/**
- * Resolve a human-readable name for a Linear issue thread (the issue identifier,
- * e.g. "ENG-123", falling back to the title) to name the session principal.
- * Cached per issue and never throws — the name is cosmetic, so a fetch failure
- * just falls back to the synthetic id-based principal name in api-rs.
- */
-export async function resolveLinearConversationName(
-  message: ChatMessage,
-  logger: Logger,
-): Promise<string | undefined> {
-  const { issueId } = parseLinearThreadKey(message.threadId);
-  const cacheKey = issueId ?? message.threadId;
-  const cached = conversationNameCache.get(cacheKey);
-  if (cached && cached.expiresAtMs > Date.now()) return cached.name;
-
-  let name: string | undefined;
-  try {
-    const subject = await message.subject;
-    name = subject?.id ?? subject?.title ?? undefined;
-  } catch (error) {
-    logger.warn("linearbot_conversation_name_failed", {
-      error: errorMessage(error),
-    });
-    name = undefined;
-  }
-  conversationNameCache.set(cacheKey, {
-    expiresAtMs:
-      Date.now() +
-      (name
-        ? CONVERSATION_NAME_CACHE_SUCCESS_TTL_MS
-        : CONVERSATION_NAME_CACHE_MISS_TTL_MS),
-    name,
-  });
-  return name;
-}
 
 export function createLinearbot(options: LinearbotOptions): Linearbot {
   const userName = options.userName ?? "centaur";
@@ -826,17 +772,22 @@ async function runThreadTurn(input: {
     : null;
   // "Owned" = handed to the bot via the assignment turn (applyStatus) OR the
   // issue is delegated to the bot (true on a comment turn too, e.g. a question
-  // on a delegated issue). Ownership turns on the status plumbing and tells the
-  // agent to carry the work forward, not just answer.
+  // on a delegated issue). Ownership injects the work-it-forward contract
+  // (OWNERSHIP_CONTEXT) below; issue-status writes are gated on applyStatus only.
   const delegatedToBot = Boolean(
     botUserId && issueContext?.delegateId === botUserId,
   );
   const owns = applyStatus || delegatedToBot;
+  // Only the assignment/delegation turn (the issue-level thread) drives issue
+  // status. Comment turns never write status, even on an owned issue: that keeps
+  // a delegate-plus-mention from spawning two threads that both move the issue,
+  // and stops a commenter from forcing a status change via the terminal marker.
+  // The agent can still set status deliberately with the `linear` tool.
   // Move the issue to In Progress the moment work starts (the agent signals the
   // terminal status itself at the end). Best-effort; backgrounded — and since
   // the handoff trigger requires the assignee/delegate to actually change, this
   // status write won't bounce back as a fresh turn.
-  if (owns && client) {
+  if (applyStatus && client) {
     backgroundWaitUntil(applyKickoffStatus(client, issueId, options, trace));
   }
   let seededFullContext = false;
@@ -858,16 +809,26 @@ async function runThreadTurn(input: {
   const contextPreamble = contextParts.length
     ? contextParts.join("\n\n")
     : undefined;
+  // Name the iron-control session principal after the issue (identifier, else
+  // title). api-rs re-upserts the principal on every create and ignores an
+  // absent name, so sourcing it from the per-turn issue fetch keeps it stable.
+  const conversationName = issueContext
+    ? (issueContext.identifier ?? issueContext.title)
+    : undefined;
   let lastEventId = threadState.lastEventId ?? 0;
   const forwardInput: ForwardSessionInput = {
     afterEventId: lastEventId,
     contextPreamble,
+    conversationName,
     executeMessage,
     harnessType: overrides.harnessType,
     messages: [],
     model: overrides.model,
     onEventId: (eventId) => {
       lastEventId = Math.max(lastEventId, eventId);
+      // Keep afterEventId in sync so a mid-stream retry resumes after the last
+      // event seen instead of replaying the turn from the original watermark.
+      forwardInput.afterEventId = lastEventId;
     },
     openStream: false,
     threadId: threadKey,
@@ -958,6 +919,9 @@ async function runThreadTurn(input: {
       }
       await thread.setState({
         historyForwarded: true,
+        // Persist the replay watermark so the next turn resumes after the last
+        // event instead of re-reading the stream from the seed watermark.
+        lastEventId,
         // Only mark seeded once the full context actually rode a turn, so a
         // failed first fetch re-seeds (not just the compact header) next time.
         ...(seededFullContext ? { contextSeeded: true } : {}),
@@ -1013,7 +977,7 @@ async function runThreadTurn(input: {
         error: errorMessage(error),
       });
     }
-    if (owns && marker) {
+    if (applyStatus && marker) {
       backgroundWaitUntil(
         applyAssignmentStatusMarker(client, issueId, marker, options, trace),
       );
