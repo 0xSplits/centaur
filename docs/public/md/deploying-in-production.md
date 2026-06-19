@@ -128,12 +128,13 @@ To enable it:
    session token, also store `AWS_SESSION_TOKEN` and set
    `CODEX_BEDROCK_SESSION_TOKEN=1` (via `sandbox.extraEnv`).
 2. Set `CODEX_BEDROCK_REGION` (via `sandbox.extraEnv`) to your Bedrock region.
-   This opts the provider in: it registers the SigV4 re-signing credential and
-   injects the placeholder AWS env into sandboxes. Defaults to `us-east-1` when
-   unset. For a non-`us-east-1` region you must also point codex's
-   `amazon-bedrock` provider at that region — supply an
-   `[model_providers.amazon-bedrock.aws] region = "<region>"` fragment through
-   `CODEX_CONFIG_OVERLAY` — and confirm codex's endpoint follows.
+   This single setting opts the provider in and is the one source of truth for
+   the region: it registers the SigV4 re-signing credential (scoped to that
+   region), injects the placeholder AWS env into sandboxes, and pins codex's
+   `amazon-bedrock` provider to the same region at sandbox boot — so the
+   in-sandbox client and the proxy can never disagree. Defaults to `us-east-1`
+   when unset. (You can still layer further codex provider config via
+   `CODEX_CONFIG_OVERLAY`, which is applied on top.)
 3. If you have locked egress down (it is open by default), allowlist
    `bedrock-mantle.<region>.api.aws`.
 
@@ -141,7 +142,10 @@ Select it per thread with the `--bedrock` Slack flag (it implies the codex
 harness), and pick the Bedrock model with `--model <bedrock-model-id>` (for
 example `--model anthropic.claude-sonnet-4-...` or `--model openai.gpt-oss-120b`)
 or by setting a default `CODEX_MODEL`. The provider is fixed when the codex
-thread starts, so `--bedrock` selects Bedrock for a new thread.
+thread starts. `--bedrock` on a thread pinned to another harness restarts it onto
+codex+Bedrock; to move an existing codex thread between providers, start a new
+thread (a mid-thread provider switch is logged and ignored rather than applied
+silently).
 
 ### Codex Auth Modes
 

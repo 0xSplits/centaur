@@ -79,12 +79,14 @@ fn bedrock_uses_session_token() -> bool {
 /// credentials that iron-proxy then re-signs with the real IAM keys. The
 /// access-key/secret/session-token values are placeholders the `aws_auth`
 /// transform swaps; `AWS_REGION` is the real region (not a secret) so the client
-/// signs for the same region iron-proxy is scoped to. Empty when Bedrock is
-/// disabled. The session-token placeholder is included only when the fragment
-/// declares it, so the two never disagree (a bogus `X-Amz-Security-Token` would
-/// break the signature). Mirrors the `OPENAI_API_KEY`/`OPENROUTER_API_KEY`
-/// placeholder injection, but `aws_auth` is not a `secrets` transform so
-/// [`placeholder_env`] does not cover it.
+/// signs for the same region iron-proxy is scoped to. `CODEX_BEDROCK_REGION` is
+/// passed through so the sandbox entrypoint can pin codex's `amazon-bedrock`
+/// provider to the same region (one source of truth — see entrypoint.sh). Empty
+/// when Bedrock is disabled. The session-token placeholder is included only when
+/// the fragment declares it, so the two never disagree (a bogus
+/// `X-Amz-Security-Token` would break the signature). Mirrors the
+/// `OPENAI_API_KEY`/`OPENROUTER_API_KEY` placeholder injection, but `aws_auth` is
+/// not a `secrets` transform so [`placeholder_env`] does not cover it.
 pub fn bedrock_sandbox_env() -> Vec<(String, String)> {
     if !bedrock_enabled() {
         return Vec::new();
@@ -105,6 +107,7 @@ fn bedrock_sandbox_env_for(region: &str, uses_session_token: bool) -> Vec<(Strin
             "AWS_SECRET_ACCESS_KEY".to_owned(),
         ),
         ("AWS_REGION".to_owned(), region.to_owned()),
+        ("CODEX_BEDROCK_REGION".to_owned(), region.to_owned()),
     ];
     if uses_session_token {
         env.push((
@@ -314,6 +317,11 @@ mod bedrock_tests {
             "AWS_SECRET_ACCESS_KEY".to_owned()
         )));
         assert!(env.contains(&("AWS_REGION".to_owned(), "us-east-1".to_owned())));
+        // Passed through so the sandbox entrypoint can pin codex's provider region.
+        assert!(env.contains(&(
+            "CODEX_BEDROCK_REGION".to_owned(),
+            "us-east-1".to_owned()
+        )));
         assert!(!env.iter().any(|(name, _)| name == "AWS_SESSION_TOKEN"));
     }
 
