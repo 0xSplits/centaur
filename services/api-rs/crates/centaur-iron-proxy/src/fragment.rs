@@ -137,6 +137,10 @@ fn bedrock_aws_auth_fragment_yaml(region: &str, uses_session_token: bool) -> Str
     } else {
         ""
     };
+    // codex's amazon-bedrock provider signs requests to the mantle endpoint with
+    // SigV4 service `bedrock-mantle` (not the classic `bedrock`). iron-proxy's
+    // aws_auth transform rejects (403 service_not_allowed, before reaching AWS)
+    // any scope.service not in this list, so both forms are allowed.
     format!(
         r#"
 transforms:
@@ -144,7 +148,7 @@ transforms:
     config:
       access_key_id: {{ placeholder: AWS_ACCESS_KEY_ID }}
       secret_access_key: {{ placeholder: AWS_SECRET_ACCESS_KEY }}
-{session_token_line}      allowed_services: [bedrock]
+{session_token_line}      allowed_services: [bedrock, bedrock-mantle]
       allowed_regions: [{region}]
       rules:
         - {{ host: bedrock-mantle.{region}.api.aws }}
@@ -285,7 +289,7 @@ mod bedrock_tests {
     fn bedrock_fragment_long_term_keys_scopes_region_and_omits_session_token() {
         let yaml = bedrock_aws_auth_fragment_yaml("us-east-1", false);
         assert!(yaml.contains("bedrock-mantle.us-east-1.api.aws"));
-        assert!(yaml.contains("allowed_services: [bedrock]"));
+        assert!(yaml.contains("allowed_services: [bedrock, bedrock-mantle]"));
         assert!(yaml.contains("allowed_regions: [us-east-1]"));
         assert!(!yaml.contains("session_token"));
 
