@@ -11,8 +11,54 @@ use crate::server::{BlocksCommand, BlocksState, parse_blocks_line_with_state, wr
 use crate::util::write_value;
 use crate::{AppServerRuntime, HarnessServerError, Result};
 
-#[derive(Debug, Default)]
-pub struct CodexHarnessServer;
+#[derive(Debug, Clone, Copy)]
+pub struct CodexHarnessServer {
+    fallback_model_provider: &'static str,
+}
+
+impl CodexHarnessServer {
+    pub fn codex() -> Self {
+        Self {
+            fallback_model_provider: "openai",
+        }
+    }
+
+    fn default_model(&self) -> Option<String> {
+        env::var("CODEX_MODEL")
+            .ok()
+            .or_else(|| env::var("OPENROUTER_MODEL").ok())
+            .map(|model| model.trim().to_owned())
+            .filter(|model| !model.is_empty())
+    }
+
+    fn model_provider_for(&self, provider_override: Option<&str>, model: Option<&str>) -> String {
+        provider_override
+            .map(str::trim)
+            .filter(|provider| !provider.is_empty())
+            .map(str::to_owned)
+            .or_else(|| {
+                env::var("CODEX_MODEL_PROVIDER")
+                    .ok()
+                    .map(|provider| provider.trim().to_owned())
+                    .filter(|provider| !provider.is_empty())
+            })
+            .or_else(|| {
+                model
+                    .map(str::trim)
+                    .filter(|model| !model.is_empty())
+                    .filter(|model| model.contains('/'))
+                    .map(|_| "openrouter".to_string())
+            })
+            .or_else(|| {
+                env::var("OPENROUTER_MODEL")
+                    .ok()
+                    .map(|model| model.trim().to_owned())
+                    .filter(|model| !model.is_empty())
+                    .map(|_| "openrouter".to_string())
+            })
+            .unwrap_or_else(|| self.fallback_model_provider.to_string())
+    }
+}
 
 impl AppServerRuntime for CodexHarnessServer {
     fn run_stdio(&self) -> Result<()> {
@@ -65,11 +111,15 @@ impl AppServerRuntime for CodexHarnessServer {
     }
 }
 
-pub(crate) fn run_codex_blocks_server() -> Result<()> {
+pub(crate) fn run_codex_blocks_server(config: CodexHarnessServer) -> Result<()> {
     let mut codex = CodexJsonRpcChild::spawn()?;
     let mut stdout = io::stdout().lock();
     let mut request_id = 1_i64;
     let mut thread_id: Option<String> = None;
+    // The provider the thread was started/resumed on. codex pins the provider at
+    // thread start (the app-server protocol has no per-turn provider), so this
+    // lets a later conflicting override be surfaced rather than silently dropped.
+    let mut thread_provider: Option<String> = None;
     let mut blocks_state = BlocksState::default();
 
     let initialize_id = next_request_id(&mut request_id);
@@ -100,15 +150,23 @@ pub(crate) fn run_codex_blocks_server() -> Result<()> {
                 input,
                 client_user_message_id,
                 model,
+                provider,
+                reasoning,
             }) => {
+                let model = model.or_else(|| config.default_model());
+                let model_provider =
+                    config.model_provider_for(provider.as_deref(), model.as_deref());
                 if let Err(error) = run_codex_user_turn(
                     &mut codex,
                     &mut stdout,
                     &mut request_id,
                     &mut thread_id,
+                    &mut thread_provider,
                     input,
                     client_user_message_id,
-                    model,
+                    (model, model_provider),
+                    provider,
+                    reasoning,
                 ) {
                     let fallback_thread_id = thread_id.as_deref().unwrap_or("codex");
                     eprintln!("Codex blocks turn failed: {error:#}");
@@ -141,12 +199,36 @@ fn run_codex_user_turn<W: Write>(
     stdout: &mut W,
     request_id: &mut i64,
     thread_id: &mut Option<String>,
+    thread_provider: &mut Option<String>,
     input: Vec<UserInput>,
     client_user_message_id: Option<String>,
-    model: Option<String>,
+    model_and_provider: (Option<String>, String),
+    requested_provider: Option<String>,
+    reasoning: Option<String>,
 ) -> Result<()> {
+    let (model, model_provider) = model_and_provider;
     if thread_id.is_none() {
-        *thread_id = Some(start_or_resume_thread(codex, stdout, request_id)?);
+        *thread_id = Some(start_or_resume_thread(
+            codex,
+            stdout,
+            request_id,
+            &model_provider,
+        )?);
+        *thread_provider = Some(model_provider.clone());
+    } else if let (Some(requested), Some(pinned)) =
+        (requested_provider.as_deref(), thread_provider.as_deref())
+        && requested != pinned
+    {
+        // codex pins the provider at thread start, so an explicit mid-thread
+        // override (e.g. a later `--bedrock`) cannot take effect. Surface it
+        // rather than silently staying on the pinned provider; switching
+        // providers requires a new thread (a harness flag like `--bedrock`
+        // already restarts across harnesses, but a codex->codex provider switch
+        // does not).
+        eprintln!(
+            "Codex provider `{requested}` ignored: this thread is pinned to `{pinned}` \
+             (provider is fixed at thread start; start a new thread to switch providers)"
+        );
     }
     let current_thread_id = thread_id
         .as_ref()
@@ -162,6 +244,12 @@ fn run_codex_user_turn<W: Write>(
     }
     if let Some(model) = model {
         params["model"] = Value::String(model);
+    }
+    // Per-turn reasoning effort (codex `turn/start.effort`), parsed from the
+    // `-rsn` message flag. Values match codex's ReasoningEffort enum
+    // (none|minimal|low|medium|high|xhigh); validation happens upstream.
+    if let Some(reasoning) = reasoning {
+        params["effort"] = Value::String(reasoning);
     }
 
     let turn_request_id = next_request_id(request_id);
@@ -181,6 +269,7 @@ fn start_or_resume_thread<W: Write>(
     codex: &mut CodexJsonRpcChild,
     stdout: &mut W,
     request_id: &mut i64,
+    model_provider: &str,
 ) -> Result<String> {
     let cwd = env::current_dir()?.display().to_string();
     let resume = env::var("CODEX_CONTINUE_THREAD_ID")
@@ -194,6 +283,7 @@ fn start_or_resume_thread<W: Write>(
                 "approvalPolicy": "never",
                 "approvalsReviewer": "user",
                 "sandbox": "danger-full-access",
+                "modelProvider": model_provider,
             }),
         )
     } else {
@@ -205,6 +295,7 @@ fn start_or_resume_thread<W: Write>(
                 "approvalPolicy": "never",
                 "approvalsReviewer": "user",
                 "sandbox": "danger-full-access",
+                "modelProvider": model_provider,
                 "excludeTurns": false,
             }),
         )
@@ -442,4 +533,36 @@ fn codex_supports_stdio_listen(bin: &str) -> bool {
     let stdout = String::from_utf8_lossy(&output.stdout);
     let stderr = String::from_utf8_lossy(&output.stderr);
     stdout.contains("--listen") || stderr.contains("--listen")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // A non-empty explicit provider override (the `--bedrock` blocks `provider`
+    // field) short-circuits before any env/model heuristic, so these assertions
+    // are deterministic regardless of CODEX_MODEL_PROVIDER / OPENROUTER_MODEL.
+    #[test]
+    fn explicit_provider_override_wins_over_model_heuristic() {
+        let codex = CodexHarnessServer::codex();
+        assert_eq!(
+            codex.model_provider_for(Some("amazon-bedrock"), None),
+            "amazon-bedrock"
+        );
+        assert_eq!(
+            codex.model_provider_for(Some("amazon-bedrock"), Some("anthropic/claude-fable-5")),
+            "amazon-bedrock"
+        );
+    }
+
+    #[test]
+    fn blank_provider_override_is_ignored() {
+        // A blank override falls through to the model `/`-slug heuristic, which
+        // selects openrouter — i.e. the override does not pin an empty provider.
+        let codex = CodexHarnessServer::codex();
+        assert_eq!(
+            codex.model_provider_for(Some("   "), Some("vendor/model")),
+            "openrouter"
+        );
+    }
 }

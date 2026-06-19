@@ -16,7 +16,7 @@ use centaur_iron_control::{
     IdentityInput, IronControlClient, RoleSpec, SessionRegistrar, register_role,
 };
 use centaur_iron_proxy::{
-    ProxyFragment, SourceKind, SourcePolicy, harness_auth_fragment, infra_fragment,
+    ProxyFragment, SourceKind, SourcePolicy, bedrock_enabled, harness_auth_fragment, infra_fragment,
 };
 use centaur_sandbox_agent_k8s::{
     AgentSandboxBackend, AgentSandboxConfig, GitHubTokenRef, IronControlSettings, IronProxyConfig,
@@ -874,7 +874,6 @@ impl SandboxArgs {
     }
 
     fn codex_app_server_env_template(&self) -> Result<Vec<(String, String)>, ServerError> {
-        let tool_fragment = self.discover_tool_proxy_fragment()?;
         let mut envs = vec![(
             "CENTAUR_API_URL".to_owned(),
             self.centaur_api_url_override
@@ -898,15 +897,12 @@ impl SandboxArgs {
             envs.push(("CLAUDE_CODE_AUTH_MODE".to_owned(), mode));
         }
 
-        // Inject the proxy fragments' placeholder credentials so env-based
+        // Inject the infra/harness placeholder credentials so env-based
         // consumers send the proxy_value iron-proxy replaces with the real
         // secret: codex's OPENAI_API_KEY (api_key mode → codex logs in and
         // hits api.openai.com instead of falling back to the ChatGPT
-        // auth.json), git's GITHUB_TOKEN, and the rest of the infra/tool set.
-        for (name, value) in self
-            .iron_proxy
-            .sandbox_placeholder_env(tool_fragment.as_ref())?
-        {
+        // auth.json), git's GITHUB_TOKEN, and the rest of the infra set.
+        for (name, value) in self.iron_proxy.sandbox_placeholder_env()? {
             if !envs.iter().any(|(existing, _)| existing == &name) {
                 envs.push((name, value));
             }
@@ -917,6 +913,24 @@ impl SandboxArgs {
                 .any(|(existing, _)| existing == "OPENAI_API_KEY")
         {
             envs.push(("OPENAI_API_KEY".to_owned(), "OPENAI_API_KEY".to_owned()));
+        }
+        if !envs
+            .iter()
+            .any(|(existing, _)| existing == "OPENROUTER_API_KEY")
+        {
+            envs.push((
+                "OPENROUTER_API_KEY".to_owned(),
+                "OPENROUTER_API_KEY".to_owned(),
+            ));
+        }
+        // When Bedrock is enabled, codex's `amazon-bedrock` provider signs with
+        // these placeholder AWS credentials and iron-proxy re-signs (SigV4) with
+        // the real IAM keys. `aws_auth` is not a `secrets` transform, so the
+        // placeholders are injected here rather than via sandbox_placeholder_env.
+        for (name, value) in centaur_iron_proxy::bedrock_sandbox_env() {
+            if !envs.iter().any(|(existing, _)| existing == &name) {
+                envs.push((name, value));
+            }
         }
 
         // OTLP trace wiring rides from this process into every sandbox (the
@@ -1050,13 +1064,9 @@ impl SandboxArgs {
     }
 
     fn workflow_host_env_template(&self) -> Result<Vec<(String, String)>, ServerError> {
-        let tool_fragment = self.discover_tool_proxy_fragment()?;
         let mut envs = Vec::new();
 
-        for (name, value) in self
-            .iron_proxy
-            .sandbox_placeholder_env(tool_fragment.as_ref())?
-        {
+        for (name, value) in self.iron_proxy.sandbox_placeholder_env()? {
             envs.push((name, value));
         }
 
@@ -1202,10 +1212,9 @@ impl TryFrom<&SandboxArgs> for AgentSandboxConfig {
         config.ready_timeout = Duration::from_secs(args.ready_timeout_secs);
         config.iron_proxy = args.iron_proxy.to_config()?;
         if let Some(proxy) = config.iron_proxy.as_mut() {
-            // The k8s backend derives the static sandbox PG DSN catalog from
-            // these fragments (see `pg_sandbox_dsns`); `to_config` only ships
-            // the harness fragment, so add the infra fragment and the
-            // discovered tool fragment (where `pg_dsn` secrets are declared).
+            // `to_config` only ships the harness fragment, so add infra and
+            // discovered tool fragments for any static proxy placeholder
+            // metadata the backend needs.
             let mut fragments = vec![args.iron_proxy.infra_fragment()?];
             if let Some(tool_fragment) = args.discover_tool_proxy_fragment()? {
                 fragments.push(tool_fragment.fragment);
@@ -1473,20 +1482,16 @@ impl IronProxyArgs {
         Ok(infra)
     }
 
-    /// Placeholder env (`PLACEHOLDER=PLACEHOLDER`) for every secret the proxy
-    /// fragments declare — infra, harness, and tools — so env-based consumers
-    /// in the sandbox send the proxy_value iron-proxy replaces with the real
-    /// credential (codex's `OPENAI_API_KEY`, git's `GITHUB_TOKEN`, …). Mirrors
-    /// the full fragment set registered as iron-control roles.
-    fn sandbox_placeholder_env(
-        &self,
-        tool_fragment: Option<&DiscoveredToolProxyFragment>,
-    ) -> Result<BTreeMap<String, String>, ServerError> {
-        let mut fragments = vec![self.infra_fragment()?];
-        if let Some(tool_fragment) = tool_fragment {
-            fragments.push(tool_fragment.fragment.clone());
-        }
-        Ok(centaur_iron_proxy::placeholder_env(&fragments))
+    /// Placeholder env (`PLACEHOLDER=PLACEHOLDER`) for the infra/harness
+    /// secrets, whose consumers read credentials straight from the environment
+    /// (codex's `OPENAI_API_KEY`, git's `GITHUB_TOKEN`, …). Discovered tool
+    /// secrets contribute nothing here: tools read credentials through the SDK,
+    /// whose `StubBackend` already returns the key name iron-proxy matches on,
+    /// and the cloudwatch tool embeds its own throwaway SigV4 credentials.
+    fn sandbox_placeholder_env(&self) -> Result<BTreeMap<String, String>, ServerError> {
+        Ok(centaur_iron_proxy::placeholder_env(&[
+            self.infra_fragment()?
+        ]))
     }
 
     fn env_from_secret_names(&self) -> Vec<String> {
@@ -1653,6 +1658,17 @@ impl IronProxyHarnessArgs {
             {
                 fragments.push(fragment);
             }
+        }
+        if let Some(fragment) = harness_auth_fragment("openrouter", "api_key")? {
+            fragments.push(fragment);
+        }
+        // Bedrock is opt-in (not the default codex provider): only register its
+        // SigV4 re-signing fragment when the operator has set CODEX_BEDROCK_REGION,
+        // since the fragment expects AWS keys in the secrets backend.
+        if bedrock_enabled()
+            && let Some(fragment) = harness_auth_fragment("amazon-bedrock", "api_key")?
+        {
+            fragments.push(fragment);
         }
         Ok(fragments)
     }
@@ -2134,6 +2150,10 @@ mod tests {
         assert!(
             env.iter()
                 .any(|(name, value)| name == "OPENAI_API_KEY" && value == "OPENAI_API_KEY")
+        );
+        assert!(
+            env.iter()
+                .any(|(name, value)| name == "OPENROUTER_API_KEY" && value == "OPENROUTER_API_KEY")
         );
     }
 

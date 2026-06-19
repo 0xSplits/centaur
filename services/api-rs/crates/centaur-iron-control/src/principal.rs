@@ -1,8 +1,9 @@
 //! Derive the iron-control principal a session's proxy should act as.
 //!
 //! A principal is the identity that holds roles and owns proxies. For Centaur
-//! the principal is the conversation: a Linear **issue** (every agent session
-//! on it shares one principal), or — for Slack — a **user** for a 1:1 DM and a
+//! the principal is the conversation: a Linear **issue** (every agent session on
+//! it shares one principal), a Discord **channel** (every thread in it shares one
+//! principal), or — for Slack — a **user** for a 1:1 DM and a
 //! **channel** for a multi-party channel/group thread. The Slack thread key is
 //! ``<source>:[<team_id>:]<conversation_id>[:<thread_ts>]`` — segments are
 //! identified by their Slack prefix rather than position, because the optional
@@ -83,6 +84,27 @@ pub fn derive_principal(
         };
     }
 
+    // Discord sessions key on the channel so every thread in a channel shares
+    // one principal (mirrors the Slack channel model). The thread key is
+    // ``discord:<guild_id>:<channel_id>[:<thread_id>]``; the guild id is folded
+    // into the key so the same channel id in two guilds never collides.
+    if let Some((guild_id, channel_id)) = parse_discord_segments(thread_key) {
+        let mut labels = BTreeMap::new();
+        labels.insert("discord_guild_id".to_owned(), guild_id.to_owned());
+        let scope = format!("{}-", slugify(guild_id));
+        let key_id = channel_id.unwrap_or(guild_id);
+        if let Some(channel) = channel_id {
+            labels.insert("discord_channel_id".to_owned(), channel.to_owned());
+        }
+        return PrincipalRef {
+            foreign_id: format!("discord-channel-{scope}{}", slugify(key_id)),
+            name: display_name
+                .map(|name| format!("Discord Channel #{name}"))
+                .unwrap_or_else(|| format!("Discord Channel {key_id} (guild {guild_id})")),
+            labels,
+        };
+    }
+
     let (team_id, conversation_id) = parse_slack_segments(thread_key);
     let mut labels = BTreeMap::new();
     if let Some(team) = team_id {
@@ -157,6 +179,18 @@ fn parse_linear_issue(thread_key: &str) -> Option<&str> {
         .next()
         .map(str::trim)
         .filter(|issue| !issue.is_empty())
+}
+
+/// The guild and (optional) channel segments of a ``discord:<guild>:<channel>``
+/// thread key, or ``None`` when the key is not a Discord thread. The discordbot
+/// encodes session threads as ``discord:<guild_id>:<channel_id>[:<thread_id>]``,
+/// so keying on the channel groups every thread in a channel onto one principal.
+fn parse_discord_segments(thread_key: &str) -> Option<(&str, Option<&str>)> {
+    let rest = thread_key.strip_prefix("discord:")?;
+    let mut segments = rest.split(':').map(str::trim);
+    let guild = segments.next().filter(|guild| !guild.is_empty())?;
+    let channel = segments.next().filter(|channel| !channel.is_empty());
+    Some((guild, channel))
 }
 
 /// Slack direct-message conversation ids start with ``D``.
@@ -269,6 +303,27 @@ mod tests {
     }
 
     #[test]
+    fn discord_sessions_key_on_the_channel() {
+        // Two threads in the same channel resolve to one principal.
+        let thread_a = derive_principal("discord:111:222:333", None, None);
+        let thread_b = derive_principal("discord:111:222:444", None, None);
+        assert_eq!(thread_a.foreign_id, "discord-channel-111-222");
+        assert_eq!(thread_a.foreign_id, thread_b.foreign_id);
+        assert_eq!(thread_a.name, "Discord Channel 222 (guild 111)");
+        assert_eq!(
+            thread_a
+                .labels
+                .get("discord_channel_id")
+                .map(String::as_str),
+            Some("222")
+        );
+        assert_eq!(
+            thread_a.labels.get("discord_guild_id").map(String::as_str),
+            Some("111")
+        );
+    }
+
+    #[test]
     fn linear_conversation_name_overrides_the_display_name_but_not_the_key() {
         let principal = derive_principal("linear:issue-1:s:sess-a", None, Some("ENG-123"));
         // Key stays derived from the issue id so a rename never splits it.
@@ -280,6 +335,14 @@ mod tests {
     fn linear_issue_level_thread_keys_on_the_issue() {
         let principal = derive_principal("linear:issue-1", None, None);
         assert_eq!(principal.foreign_id, "linear-issue-issue-1");
+    }
+
+    #[test]
+    fn discord_conversation_name_overrides_the_display_name_but_not_the_key() {
+        let principal = derive_principal("discord:111:222:333", None, Some("general"));
+        // Key stays derived from the ids so a channel rename never splits it.
+        assert_eq!(principal.foreign_id, "discord-channel-111-222");
+        assert_eq!(principal.name, "Discord Channel #general");
     }
 
     #[test]
