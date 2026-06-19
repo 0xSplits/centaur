@@ -318,10 +318,7 @@ mod bedrock_tests {
         )));
         assert!(env.contains(&("AWS_REGION".to_owned(), "us-east-1".to_owned())));
         // Passed through so the sandbox entrypoint can pin codex's provider region.
-        assert!(env.contains(&(
-            "CODEX_BEDROCK_REGION".to_owned(),
-            "us-east-1".to_owned()
-        )));
+        assert!(env.contains(&("CODEX_BEDROCK_REGION".to_owned(), "us-east-1".to_owned())));
         assert!(!env.iter().any(|(name, _)| name == "AWS_SESSION_TOKEN"));
     }
 
