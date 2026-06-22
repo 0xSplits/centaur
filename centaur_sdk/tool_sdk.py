@@ -125,6 +125,50 @@ def current_slack_thread() -> dict[str, str]:
     }
 
 
+def current_discord_thread() -> dict[str, str]:
+    """Return the current Discord destination.
+
+    ``{"guild_id": ..., "channel_id": ..., "thread_id": ...}`` (``thread_id`` is
+    omitted for a channel-root message). Raises if the current thread is not a
+    Discord thread.
+    """
+    context = current_session_context()
+    discord = context.get("discord")
+    if (
+        not isinstance(discord, dict)
+        or not discord.get("guild_id")
+        or not discord.get("channel_id")
+    ):
+        raise RuntimeError(f"current thread is not a Discord thread: {context.get('thread_key')!r}")
+    destination = {
+        "guild_id": str(discord["guild_id"]),
+        "channel_id": str(discord["channel_id"]),
+    }
+    if discord.get("thread_id"):
+        destination["thread_id"] = str(discord["thread_id"])
+    return destination
+
+
+def current_chat_destination() -> dict[str, str]:
+    """Return the current chat surface in a platform-agnostic shape.
+
+    Always includes ``platform`` (``"slack"`` / ``"discord"``) plus that
+    platform's destination ids (Slack: ``channel_id``/``thread_ts``; Discord:
+    ``guild_id``/``channel_id``/``thread_id``). Prefer this over the
+    platform-specific helpers when writing tooling that should work on any chat
+    surface. Raises if the current thread is not a recognized chat surface.
+    """
+    context = current_session_context()
+    platform = context.get("platform")
+    if platform == "slack":
+        return {"platform": "slack", **current_slack_thread()}
+    if platform == "discord":
+        return {"platform": "discord", **current_discord_thread()}
+    raise RuntimeError(
+        f"current thread is not a recognized chat surface: {context.get('thread_key')!r}"
+    )
+
+
 def save_attachment(
     *,
     name: str,

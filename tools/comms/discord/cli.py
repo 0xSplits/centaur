@@ -190,5 +190,62 @@ def post(
     console.print(f"[green]Sent[/] message {result.get('id')} to channel {result.get('channel_id')}")
 
 
+@app.command("upload")
+def upload(
+    channel: str = typer.Argument(..., help="Channel name or ID"),
+    file_path: str = typer.Argument(..., help="Path to the local file to upload"),
+    message: str = typer.Option("", "--message", "-m", help="Optional message text"),
+    reply_to: str = typer.Option(None, "--reply-to", "-r", help="Message ID to reply to"),
+    json_output: bool = typer.Option(False, "--json", help="Output as JSON"),
+):
+    """Upload a local file to a channel."""
+    result = _get_client().upload_file(
+        channel=channel,
+        file_path=file_path,
+        content=message,
+        reply_to_message_id=reply_to,
+    )
+    if _emit(result, json_output):
+        return
+    console.print(
+        f"[green]Uploaded[/] {file_path} as message {result.get('id')} "
+        f"to channel {result.get('channel_id')}"
+    )
+
+
+@app.command("download")
+def download(
+    channel: str = typer.Argument(
+        "", help="Channel name or ID of the message (omit when using --url)"
+    ),
+    message_id: str = typer.Argument("", help="Message ID whose attachments to download"),
+    url: str = typer.Option(None, "--url", help="Download a direct attachment/CDN URL instead"),
+    output: str = typer.Option(".", "--output", "-o", help="Output directory"),
+    json_output: bool = typer.Option(False, "--json", help="Output as JSON"),
+):
+    """Download attachments from a message, or a direct attachment URL."""
+    client = _get_client()
+    if url:
+        result = client.download_url(url=url, output_dir=output)
+        if _emit(result, json_output):
+            return
+        console.print(f"[green]Downloaded[/] {result.get('path')}")
+        return
+    if not channel or not message_id:
+        raise typer.BadParameter("Provide CHANNEL and MESSAGE_ID, or --url.")
+    results = client.download_message_attachments(
+        channel=channel,
+        message_id=message_id,
+        output_dir=output,
+    )
+    if _emit(results, json_output):
+        return
+    if not results:
+        console.print("[yellow]No attachments on that message.[/]")
+        return
+    for saved in results:
+        console.print(f"[green]Downloaded[/] {saved.get('path')}")
+
+
 if __name__ == "__main__":
     app()

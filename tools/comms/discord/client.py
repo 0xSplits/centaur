@@ -1,6 +1,7 @@
 """Discord self-token client."""
 
 import asyncio
+import os
 import re
 from typing import Any
 
@@ -200,6 +201,83 @@ class DiscordClient:
 
         return _run(self._with_client(action))
 
+    def upload_file(
+        self,
+        channel: str,
+        file_path: str,
+        content: str = "",
+        reply_to_message_id: str | None = None,
+    ) -> dict[str, Any]:
+        """Upload a local file to a channel by name or ID, with optional message text."""
+        if not os.path.isfile(file_path):
+            raise FileNotFoundError(f"File not found: {file_path}")
+
+        async def action(client):
+            resolved = self._find_channel(client, channel)
+            reference = None
+            if reply_to_message_id:
+                reference = await resolved.fetch_message(int(reply_to_message_id))
+            msg = await resolved.send(
+                content or None,
+                file=discord.File(file_path),
+                reference=reference,
+            )
+            return self._format_message(msg)
+
+        return _run(self._with_client(action))
+
+    def download_message_attachments(
+        self,
+        channel: str,
+        message_id: str,
+        output_dir: str = ".",
+    ) -> list[dict[str, Any]]:
+        """Download every attachment on a specific message into output_dir."""
+        os.makedirs(output_dir, exist_ok=True)
+
+        async def action(client):
+            resolved = self._find_channel(client, channel)
+            target = await resolved.fetch_message(int(message_id))
+            saved = []
+            for attachment in target.attachments:
+                dest = os.path.join(output_dir, attachment.filename)
+                await attachment.save(dest)
+                saved.append(
+                    {
+                        "filename": attachment.filename,
+                        "path": dest,
+                        "size": getattr(attachment, "size", None),
+                        "url": attachment.url,
+                    }
+                )
+            return saved
+
+        return _run(self._with_client(action))
+
+    def download_url(
+        self,
+        url: str,
+        output_dir: str = ".",
+        filename: str | None = None,
+    ) -> dict[str, Any]:
+        """Download a direct attachment/CDN URL into output_dir.
+
+        Useful when a message listing already surfaced an attachment ``url`` and a
+        gateway round-trip is unnecessary. Discord CDN links are pre-signed, so no
+        Authorization header is sent.
+        """
+        os.makedirs(output_dir, exist_ok=True)
+        with httpx.Client(timeout=self.timeout) as client:
+            response = client.get(url)
+        if response.status_code >= 400:
+            raise RuntimeError(f"Download failed ({response.status_code}) for {url}")
+        data = response.content
+        name = filename or url.split("?")[0].rsplit("/", 1)[-1] or "download"
+        dest = os.path.join(output_dir, name)
+        with open(dest, "wb") as handle:
+            handle.write(data)
+        return {"path": dest, "size": len(data), "url": url}
+
     def _find_guild(self, client, guild_str: str):
         if guild_str.isdigit():
             guild = client.get_guild(int(guild_str))
@@ -239,6 +317,16 @@ class DiscordClient:
             "timestamp": msg.created_at.isoformat(),
             "content": msg.content or "",
             "reply_to": str(msg.reference.message_id) if msg.reference else None,
+            "attachments": [
+                {
+                    "id": str(attachment.id),
+                    "filename": attachment.filename,
+                    "url": attachment.url,
+                    "size": getattr(attachment, "size", None),
+                    "content_type": getattr(attachment, "content_type", None),
+                }
+                for attachment in getattr(msg, "attachments", None) or []
+            ],
         }
 
 
