@@ -472,6 +472,9 @@ function handleCommentMention(
   ) {
     return null;
   }
+  // Loop guard: never answer the bot's own comments. (parseIssueCommentWebhook
+  // already drops botActor-authored comments; this covers app-user authorship.)
+  if (input.botUserId && event.authorId === input.botUserId) return null;
   const { chat, options } = input;
   const rootCommentId = event.parentId ?? event.commentId;
   const threadKey = `linear:${event.issueId}:c:${rootCommentId}`;

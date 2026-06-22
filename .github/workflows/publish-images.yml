@@ -46,7 +46,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        service: [api-rs, slackbotv2, discordbot, agent, iron-proxy, console]
+        service: [api-rs, slackbotv2, linearbot, discordbot, agent, iron-proxy, console]
         platform: ${{ github.event_name == 'push' && fromJSON('["linux/amd64", "linux/arm64"]') || fromJSON('["linux/amd64"]') }}
         include:
           - service: api-rs
@@ -160,6 +160,7 @@ jobs:
         include:
           - image: centaur-api-rs
           - image: centaur-slackbotv2
+          - image: centaur-linearbot
           - image: centaur-agent
           - image: centaur-iron-proxy
           - image: centaur-console
