@@ -258,6 +258,10 @@ export const slackbotMetrics = {
     labelNames: ['source'],
     name: 'slackbotv2_last_successful_render_timestamp_seconds'
   }),
+  renderAnswerDivergence: counter({
+    help: 'Live renders where the recomposed answer diverged from already-streamed text, so a delta was suppressed to avoid interleaving the message (once per render).',
+    name: 'slackbotv2_render_answer_divergence_total'
+  }),
   renderAttempts: counter({
     help: 'Slack render attempts by source and outcome.',
     labelNames: ['source', 'outcome'],
@@ -301,6 +305,11 @@ export const slackbotMetrics = {
     help: 'Per-thread render recovery events.',
     labelNames: ['event'],
     name: 'slackbotv2_render_recovery_thread_events_total'
+  }),
+  sessionDelivery: counter({
+    help: 'User-visible Slack delivery outcomes for AI session responses.',
+    labelNames: ['delivery_status'],
+    name: 'centaur_session_delivery_total'
   }),
   sessionApiOperationDuration: histogram({
     help: 'Session API operation duration from Slackbot, in seconds.',

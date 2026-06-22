@@ -96,6 +96,8 @@ export type SlackbotV2Options = {
   maxDurationMs?: number
   postgresUrl?: string
   recoverRenderObligationsOnStart?: boolean
+  /** Maximum Slack message age eligible for startup render recovery. */
+  renderRecoveryMaxObligationAgeMs?: number
   /** Per-thread deadline for one recovery attempt during the startup scan. */
   renderRecoveryThreadTimeoutMs?: number
   signingSecret: string
@@ -157,6 +159,8 @@ export type ForwardSessionInput = {
   messages: SlackbotV2ApiMessage[]
   /** Per-turn model override parsed from message flags (--model/--opus/...). */
   model?: string
+  /** Model provider override parsed from message flags (--bedrock); codex only. */
+  provider?: string
   /** Per-turn reasoning effort parsed from the `-rsn` flag (codex only). */
   reasoning?: string
   onEventId(eventId: number): void

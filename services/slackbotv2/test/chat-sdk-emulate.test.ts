@@ -13,6 +13,7 @@ import { createMemoryState } from '@chat-adapter/state-memory'
 import type { ServerNotification } from '@centaur/harness-events'
 import {
   createSlackbotV2,
+  normalizeSlackText,
   type SlackbotV2,
   type SlackbotV2AppendMessagesRequest,
   type SlackbotV2ApiMessage,
@@ -33,6 +34,14 @@ const TEAM_ID = 'T000000001'
 const CHANNEL_ID = 'C000000001'
 /** How real Slack renders a streamed message whose stream broke or was never stopped. */
 const BROKEN_STREAM_TEXT = ':warning: Something went wrong'
+
+describe('normalizeSlackText', () => {
+  it('preserves Slack channel IDs when rendering labeled channel mentions', () => {
+    expect(normalizeSlackText('<#C0AJ07U8Z1N|eng-centaur>')).toBe(
+      '#eng-centaur (C0AJ07U8Z1N)'
+    )
+  })
+})
 
 let emulator: Emulator
 let slackApi: PatchedSlackApi
@@ -1313,6 +1322,85 @@ describe('slackbotv2', () => {
     )
   })
 
+  it('swaps the streamed message for the durable final answer when the live answer diverges', async () => {
+    const sharedState = createMemoryState()
+    await sharedState.connect()
+    bot = createTestBot({ state: sharedState })
+    codexApi.autoRespond = false
+
+    const parent = await postUserMessage('Context before a diverging render.')
+    const mentionText = `<@${BOT_USER_ID}> answer with a late correction`
+    const mention = await postUserMessage(mentionText, parent.ts)
+    const key = threadKey(parent.ts)
+    const waits: Promise<unknown>[] = []
+    const response = await bot.app.request(
+      '/api/webhooks/slack',
+      signedSlackEvent({
+        event_id: 'Ev-slackbotv2-divergence-swap',
+        event: {
+          type: 'app_mention',
+          user: USER_ID,
+          channel: CHANNEL_ID,
+          team: TEAM_ID,
+          ts: mention.ts,
+          thread_ts: parent.ts,
+          text: mentionText
+        }
+      }),
+      {},
+      waitUntilContext(waits)
+    )
+    expect(response.status).toBe(200)
+    await waitFor(() => codexApi.executes.length === 1)
+    await waitFor(() => codexApi.streamCount === 1)
+
+    const draft = 'Draft answer from the live deltas.'
+    const finalAnswer = 'Final reconciled answer from the result.'
+    // Stream a plan + the draft answer (so the answer delta reaches Slack), then
+    // seal the answer item with a DIFFERENT canonical text. The recomposed
+    // answer no longer extends the already-streamed text, so the renderer
+    // freezes the live stream instead of interleaving, and the render swaps the
+    // message for the durable result.
+    codexApi.emitOutputLines(
+      key,
+      sampleCodexNotifications(draft).map(notification => JSON.stringify(notification))
+    )
+    codexApi.emitOutputLine(
+      key,
+      JSON.stringify({
+        method: 'item/completed',
+        params: {
+          threadId: 'thread-1',
+          turnId: 'turn-1',
+          item: {
+            type: 'agentMessage',
+            id: 'answer-1',
+            text: finalAnswer,
+            phase: 'final_answer',
+            memoryCitation: null
+          }
+        }
+      })
+    )
+    codexApi.emitSessionEvent(key, 'session.execution_completed', {
+      execution_id: 'exe-divergence-swap',
+      status: 'completed',
+      result_text: finalAnswer
+    })
+
+    await Promise.all(waits)
+    await waitFor(async () => {
+      const threadState = await sharedState.get<Record<string, unknown>>(`thread-state:${key}`)
+      return threadState?.renderObligation === null
+    }, 3000)
+
+    const texts = await threadTexts(parent.ts)
+    // The streamed message was replaced in place with the durable final answer...
+    expect(texts.filter(text => text.includes(finalAnswer))).toHaveLength(1)
+    // ...and the diverging live draft is gone (neither interleaved nor left behind).
+    expect(texts.some(text => text.includes('Draft answer from the live deltas'))).toBe(false)
+  })
+
   it('reposts the durable final answer when the Slack stream expires mid-render', async () => {
     const sharedState = createMemoryState()
     await sharedState.connect()
@@ -2464,6 +2552,67 @@ describe('slackbotv2', () => {
       })
     )
     expect(Number(recoveredThreadState?.lastEventId)).toBeGreaterThan(0)
+  })
+
+  it('skips stale render obligations from Chat SDK state on startup', async () => {
+    const logs: CapturedLog[] = []
+    const sharedState = createMemoryState()
+    await sharedState.connect()
+
+    const parent = await postUserMessage('Context before stale recovery.')
+    const mentionText = `<@${BOT_USER_ID}> this answer is too old to recover`
+    const mention = await postUserMessage(mentionText, parent.ts)
+    const key = threadKey(parent.ts)
+    const message = {
+      ...apiMessageFromSlackEvent({
+        isMention: true,
+        text: mentionText,
+        threadId: key,
+        ts: mention.ts
+      }),
+      timestamp: new Date(Date.now() - 2 * 60 * 60 * 1000).toISOString()
+    }
+    await sharedState.set(`thread-state:${key}`, {
+      activeExecution: true,
+      executedMessageIds: [mention.ts],
+      forwardedMessageIds: [mention.ts],
+      historyForwarded: true,
+      lastEventId: 0,
+      renderObligation: {
+        afterEventId: 0,
+        executionId: 'exe-stale-recovery',
+        message
+      }
+    })
+    await sharedState.appendToList('slackbotv2:render:index', key)
+    codexApi.emitOutputLines(key, sampleCodexOutputLines('Stale recovered request.'))
+
+    bot = createTestBot({
+      logger: captureLogger(logs),
+      renderRecoveryMaxObligationAgeMs: 60 * 60 * 1000,
+      state: sharedState
+    })
+
+    await waitFor(async () => {
+      const threadState = await sharedState.get<Record<string, unknown>>(`thread-state:${key}`)
+      return threadState?.renderObligation === null
+    }, 2000)
+
+    expect(codexApi.eventRequests).toHaveLength(0)
+    expect(slackApi.calls.some(call => call.method === 'chat.startStream')).toBe(false)
+    expect(slackApi.calls.some(call => call.method === 'chat.stopStream')).toBe(false)
+    const staleState = await sharedState.get<Record<string, unknown>>(`thread-state:${key}`)
+    expect(staleState).toEqual(
+      expect.objectContaining({ activeExecution: false, renderObligation: null })
+    )
+    expect(logData(logs, 'slackbotv2_render_recovery_stale_obligation_skipped')).toEqual(
+      expect.objectContaining({
+        execution_id: 'exe-stale-recovery',
+        max_obligation_age_ms: 60 * 60 * 1000,
+        message_id: mention.ts,
+        thread_id: key
+      })
+    )
   })
 
   it('does not let one hung recovery block the obligations queued behind it', async () => {

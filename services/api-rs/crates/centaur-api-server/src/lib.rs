@@ -6,8 +6,8 @@ pub mod types;
 pub use centaur_session_runtime::{SandboxRuntime, SessionRuntime};
 pub use error::ApiError;
 pub use routes::{
-    build_router_with_runtime, build_router_with_session_and_workflow_runtime,
-    build_router_with_session_runtime,
+    AppState, build_router_with_app_state, build_router_with_runtime,
+    build_router_with_session_and_workflow_runtime, build_router_with_session_runtime,
 };
 
 #[cfg(test)]
@@ -20,7 +20,7 @@ mod tests {
     use async_trait::async_trait;
     use axum::{
         body::{Body, to_bytes},
-        http::{Request, StatusCode, header},
+        http::{Method, Request, StatusCode, header},
     };
     use centaur_sandbox_core::{
         ObservedSandbox, SandboxBackend, SandboxError, SandboxHandle, SandboxId, SandboxIo,
@@ -31,7 +31,7 @@ mod tests {
     use sqlx::PgPool;
     use tower::ServiceExt;
 
-    use super::build_router_with_runtime;
+    use super::{AppState, build_router_with_app_state, build_router_with_runtime};
 
     #[tokio::test]
     async fn router_builds() {
@@ -87,6 +87,141 @@ mod tests {
                 r#"http_server_requests_total{method="GET",route="/healthz",status="200"}"#
             )
         );
+    }
+
+    #[tokio::test]
+    async fn healthz_is_available_before_runtime_is_ready() {
+        let app = build_router_with_app_state(AppState::unready());
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/healthz")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn readyz_reports_starting_until_runtime_is_ready() {
+        let state = AppState::unready();
+        let app = build_router_with_app_state(state.clone());
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/readyz")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+
+        let pool =
+            PgPool::connect_lazy("postgres://postgres:postgres@localhost/centaur_test").unwrap();
+        state.mark_ready(
+            centaur_session_runtime::SessionRuntime::new(
+                PgSessionStore::new(pool),
+                SandboxRuntime::backend(Arc::new(TestBackend::default()), SandboxSpec::new("test")),
+            ),
+            None,
+        );
+        let app = build_router_with_app_state(state);
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/readyz")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn runtime_routes_report_unavailable_until_runtime_is_ready() {
+        for request in [
+            Request::builder()
+                .method(Method::GET)
+                .uri("/api/session/slack%3AC123%3A123.456")
+                .body(Body::empty())
+                .unwrap(),
+            Request::builder()
+                .method(Method::POST)
+                .uri("/api/session/slack%3AC123%3A123.456")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(r#"{"harness_type":"codex"}"#))
+                .unwrap(),
+            Request::builder()
+                .method(Method::POST)
+                .uri("/api/session/slack%3AC123%3A123.456/messages")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(r#"{"messages":[]}"#))
+                .unwrap(),
+            Request::builder()
+                .method(Method::POST)
+                .uri("/api/session/slack%3AC123%3A123.456/execute")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(r#"{"input_lines":[]}"#))
+                .unwrap(),
+            Request::builder()
+                .method(Method::GET)
+                .uri("/api/session/slack%3AC123%3A123.456/events")
+                .body(Body::empty())
+                .unwrap(),
+            Request::builder()
+                .method(Method::POST)
+                .uri("/api/sandboxes/drain")
+                .body(Body::empty())
+                .unwrap(),
+            Request::builder()
+                .method(Method::GET)
+                .uri("/api/workflows/schedules")
+                .body(Body::empty())
+                .unwrap(),
+            Request::builder()
+                .method(Method::GET)
+                .uri("/api/workflows/runs")
+                .body(Body::empty())
+                .unwrap(),
+            Request::builder()
+                .method(Method::POST)
+                .uri("/api/workflows/runs")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(r#"{"workflow_name":"agent_turn","input":{}}"#))
+                .unwrap(),
+            Request::builder()
+                .method(Method::GET)
+                .uri("/api/workflows/runs/run-1")
+                .body(Body::empty())
+                .unwrap(),
+            Request::builder()
+                .method(Method::POST)
+                .uri("/api/workflows/runs/run-1/cancel")
+                .body(Body::empty())
+                .unwrap(),
+            Request::builder()
+                .method(Method::POST)
+                .uri("/api/workflows/events")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(r#"{"event_name":"test.event","payload":{}}"#))
+                .unwrap(),
+            Request::builder()
+                .method(Method::POST)
+                .uri("/api/webhooks/test")
+                .body(Body::empty())
+                .unwrap(),
+        ] {
+            let app = build_router_with_app_state(AppState::unready());
+            let response = app.oneshot(request).await.unwrap();
+            assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        }
     }
 
     #[tokio::test]
