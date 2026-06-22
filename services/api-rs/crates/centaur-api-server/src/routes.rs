@@ -27,7 +27,7 @@ use axum::{
     routing::{any, get, post},
 };
 use base64::{Engine as _, engine::general_purpose};
-use centaur_session_core::ThreadKey;
+use centaur_session_core::{ChatDestination, ThreadKey};
 use centaur_session_runtime::{
     ExecuteSessionInput, HarnessConflictPolicy, SandboxRuntime, SessionRuntime,
 };
@@ -55,9 +55,9 @@ use crate::{
     ApiError,
     types::{
         AppendMessagesRequest, AppendMessagesResponse, CreateSessionRequest, CreateSessionResponse,
-        EmitWorkflowEventRequest, EventsQuery, ExecuteSessionRequest, ExecuteSessionResponse,
-        ListWorkflowRunsQuery, OnHarnessConflict, SessionContextResponse, SessionSseEvent,
-        SlackThreadContext, stream_error_sse,
+        DiscordThreadContext, EmitWorkflowEventRequest, EventsQuery, ExecuteSessionRequest,
+        ExecuteSessionResponse, ListWorkflowRunsQuery, OnHarnessConflict, SessionContextResponse,
+        SessionSseEvent, SlackThreadContext, stream_error_sse,
     },
 };
 
@@ -350,33 +350,43 @@ async fn get_session_context(
 ) -> Result<Json<SessionContextResponse>, ApiError> {
     let _runtime = state.runtime()?;
     let thread_key = ThreadKey::try_from(raw_thread_key)?;
-    Ok(Json(SessionContextResponse {
-        slack: slack_thread_context(&thread_key),
-        thread_key,
-    }))
-}
-
-fn slack_thread_context(thread_key: &ThreadKey) -> Option<SlackThreadContext> {
-    let parts = thread_key.as_str().split(':').collect::<Vec<_>>();
-    let (channel_id, thread_ts) = match parts.as_slice() {
-        ["slack", channel_id, thread_ts] => (*channel_id, *thread_ts),
-        ["slack", _team_id, channel_id, thread_ts] => (*channel_id, *thread_ts),
-        [channel_id, thread_ts] if is_slack_conversation_id(channel_id) => {
-            (*channel_id, *thread_ts)
-        }
-        _ => return None,
+    let destination = thread_key.chat_destination();
+    let platform = destination
+        .as_ref()
+        .map(ChatDestination::platform)
+        .unwrap_or("unknown")
+        .to_owned();
+    let (slack, discord) = match destination {
+        Some(ChatDestination::Slack {
+            channel_id,
+            thread_ts,
+        }) => (
+            Some(SlackThreadContext {
+                channel_id,
+                thread_ts,
+            }),
+            None,
+        ),
+        Some(ChatDestination::Discord {
+            guild_id,
+            channel_id,
+            thread_id,
+        }) => (
+            None,
+            Some(DiscordThreadContext {
+                guild_id,
+                channel_id,
+                thread_id,
+            }),
+        ),
+        None => (None, None),
     };
-    if channel_id.is_empty() || thread_ts.is_empty() {
-        return None;
-    }
-    Some(SlackThreadContext {
-        channel_id: channel_id.to_owned(),
-        thread_ts: thread_ts.to_owned(),
-    })
-}
-
-fn is_slack_conversation_id(value: &str) -> bool {
-    matches!(value.as_bytes().first(), Some(b'C' | b'D' | b'G'))
+    Ok(Json(SessionContextResponse {
+        thread_key,
+        platform,
+        slack,
+        discord,
+    }))
 }
 
 async fn append_messages(

@@ -3561,7 +3561,33 @@ fn input_line_with_session_context(
         map.entry("traceparent")
             .or_insert_with(|| Value::String(traceparent.clone()));
     }
+    prepend_chat_surface_note(map, thread_key);
     serde_json::to_string(&value).unwrap_or_else(|_| line.to_owned())
+}
+
+/// Prepend a terse chat-surface note to a user turn's content so the agent always
+/// knows which platform (Slack/Discord) and destination it is operating on.
+///
+/// The static system prompt is platform-neutral, so this per-turn line is the
+/// agent's authoritative signal for where its reply and uploads land. It is added
+/// only to `user` turns whose content is an array of message parts and whose
+/// thread key resolves to a known chat destination; every other shape is left
+/// untouched.
+fn prepend_chat_surface_note(map: &mut serde_json::Map<String, Value>, thread_key: &ThreadKey) {
+    if map.get("type").and_then(Value::as_str) != Some("user") {
+        return;
+    }
+    let Some(destination) = thread_key.chat_destination() else {
+        return;
+    };
+    let Some(Value::Array(content)) = map.get_mut("message").and_then(|m| m.get_mut("content"))
+    else {
+        return;
+    };
+    content.insert(
+        0,
+        json!({ "type": "text", "text": destination.context_line() }),
+    );
 }
 
 fn steering_input_lines(
@@ -4724,6 +4750,63 @@ mod tests {
             input_line_with_session_context(&thread_key, &trace, "raw"),
             "raw"
         );
+    }
+
+    #[test]
+    fn input_line_prepends_discord_chat_surface_note_to_user_content() {
+        let thread_key = ThreadKey::parse("discord:111:222:333").unwrap();
+        let trace = SessionTraceContext::new(&thread_key, None);
+
+        let line = input_line_with_session_context(
+            &thread_key,
+            &trace,
+            r#"{"type":"user","message":{"role":"user","content":[{"type":"text","text":"hi"}]}}"#,
+        );
+        let value: Value = serde_json::from_str(&line).unwrap();
+        let content = value["message"]["content"].as_array().unwrap();
+
+        // The note is prepended ahead of the original parts, which are preserved.
+        assert_eq!(content.len(), 2);
+        let note = content[0]["text"].as_str().unwrap();
+        assert!(note.contains("Discord"));
+        assert!(note.contains("222"));
+        assert_eq!(content[1]["text"], "hi");
+    }
+
+    #[test]
+    fn input_line_prepends_slack_chat_surface_note_to_user_content() {
+        let thread_key = ThreadKey::parse("slack:C123:123.456").unwrap();
+        let trace = SessionTraceContext::new(&thread_key, None);
+
+        let line = input_line_with_session_context(
+            &thread_key,
+            &trace,
+            r#"{"type":"user","message":{"role":"user","content":[{"type":"text","text":"hi"}]}}"#,
+        );
+        let value: Value = serde_json::from_str(&line).unwrap();
+        let content = value["message"]["content"].as_array().unwrap();
+
+        assert_eq!(content.len(), 2);
+        assert!(content[0]["text"].as_str().unwrap().contains("Slack"));
+        assert_eq!(content[1]["text"], "hi");
+    }
+
+    #[test]
+    fn input_line_leaves_content_untouched_without_a_chat_destination() {
+        // A non-platform thread key resolves to no destination, so nothing is added.
+        let thread_key = ThreadKey::parse("cli:test").unwrap();
+        let trace = SessionTraceContext::new(&thread_key, None);
+
+        let line = input_line_with_session_context(
+            &thread_key,
+            &trace,
+            r#"{"type":"user","message":{"role":"user","content":[{"type":"text","text":"hi"}]}}"#,
+        );
+        let value: Value = serde_json::from_str(&line).unwrap();
+        let content = value["message"]["content"].as_array().unwrap();
+
+        assert_eq!(content.len(), 1);
+        assert_eq!(content[0]["text"], "hi");
     }
 
     #[test]

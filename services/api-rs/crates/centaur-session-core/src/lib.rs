@@ -115,6 +115,116 @@ fn validate_thread_key(value: &str) -> Result<(), ThreadKeyError> {
     Ok(())
 }
 
+/// The chat surface a thread is delivered to, parsed from its thread key.
+///
+/// Slack and Discord both encode the destination — where a reply or uploaded
+/// file lands — directly in the key. Resolving it in one place lets the API
+/// session context, the per-turn context line the agent reads, and any caller
+/// that needs a posting destination share a single parser instead of each
+/// re-deriving the platform from the key shape.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum ChatDestination {
+    Slack {
+        channel_id: String,
+        thread_ts: String,
+    },
+    Discord {
+        guild_id: String,
+        channel_id: String,
+        thread_id: Option<String>,
+    },
+}
+
+impl ChatDestination {
+    /// The platform identifier surfaced to the agent (`slack` / `discord`).
+    pub fn platform(&self) -> &'static str {
+        match self {
+            Self::Slack { .. } => "slack",
+            Self::Discord { .. } => "discord",
+        }
+    }
+
+    /// A terse, model-visible note describing the current chat surface. It is
+    /// prepended to each user turn so the agent never has to infer which platform
+    /// it is on — the static system prompt is platform-neutral, so this line is
+    /// the agent's authoritative signal for where its reply and uploads go.
+    pub fn context_line(&self) -> String {
+        match self {
+            Self::Slack {
+                channel_id,
+                thread_ts,
+            } => format!(
+                "[chat surface: Slack · channel {channel_id} · thread {thread_ts}. \
+                 Centaur delivers your reply to this thread automatically — do not repost it with the slack tool. \
+                 Send files here with `slack upload`.]"
+            ),
+            Self::Discord {
+                guild_id,
+                channel_id,
+                thread_id,
+            } => {
+                let thread = thread_id
+                    .as_deref()
+                    .map(|id| format!(" · thread {id}"))
+                    .unwrap_or_default();
+                format!(
+                    "[chat surface: Discord · channel {channel_id}{thread} (guild {guild_id}). \
+                     Centaur delivers your reply to this thread automatically — do not repost it with the discord tool. \
+                     Send files here with `discord upload`.]"
+                )
+            }
+        }
+    }
+}
+
+impl ThreadKey {
+    /// Resolve the chat surface this thread is delivered to, when the key encodes
+    /// a recognized platform destination.
+    ///
+    /// Returns `None` for keys that are not platform-addressable (e.g. `api:`
+    /// threads). The Slack arms are kept byte-for-byte compatible with the
+    /// historical session-context parser so existing Slack behavior is preserved;
+    /// Discord keys are `discord:<guild>:<channel>[:<thread>]`.
+    pub fn chat_destination(&self) -> Option<ChatDestination> {
+        let key = self.as_str();
+        if let Some(rest) = key.strip_prefix("discord:") {
+            let mut segments = rest.split(':').map(str::trim);
+            let guild_id = segments.next().filter(|s| !s.is_empty())?;
+            let channel_id = segments.next().filter(|s| !s.is_empty())?;
+            let thread_id = segments
+                .next()
+                .filter(|s| !s.is_empty())
+                .map(ToOwned::to_owned);
+            return Some(ChatDestination::Discord {
+                guild_id: guild_id.to_owned(),
+                channel_id: channel_id.to_owned(),
+                thread_id,
+            });
+        }
+        let parts = key.split(':').collect::<Vec<_>>();
+        let (channel_id, thread_ts) = match parts.as_slice() {
+            ["slack", channel_id, thread_ts] => (*channel_id, *thread_ts),
+            ["slack", _team_id, channel_id, thread_ts] => (*channel_id, *thread_ts),
+            [channel_id, thread_ts] if is_slack_conversation_id(channel_id) => {
+                (*channel_id, *thread_ts)
+            }
+            _ => return None,
+        };
+        if channel_id.is_empty() || thread_ts.is_empty() {
+            return None;
+        }
+        Some(ChatDestination::Slack {
+            channel_id: channel_id.to_owned(),
+            thread_ts: thread_ts.to_owned(),
+        })
+    }
+}
+
+/// Slack conversation ids start with `C` (channel), `D` (DM), or `G` (group).
+fn is_slack_conversation_id(value: &str) -> bool {
+    matches!(value.as_bytes().first(), Some(b'C' | b'D' | b'G'))
+}
+
 #[derive(
     Clone, Debug, Eq, PartialEq, Hash, Serialize, Deserialize, AsRefStr, Display, EnumString,
 )]
@@ -226,7 +336,119 @@ pub fn empty_object() -> Value {
 mod tests {
     use std::str::FromStr;
 
-    use super::{HarnessType, ThreadKey};
+    use super::{ChatDestination, HarnessType, ThreadKey};
+
+    #[test]
+    fn chat_destination_resolves_slack_keys() {
+        let dest = ThreadKey::parse("slack:C123:123.456")
+            .unwrap()
+            .chat_destination()
+            .unwrap();
+        assert_eq!(
+            dest,
+            ChatDestination::Slack {
+                channel_id: "C123".to_owned(),
+                thread_ts: "123.456".to_owned(),
+            }
+        );
+        assert_eq!(dest.platform(), "slack");
+
+        // The team-id variant shifts the channel/ts one segment to the right.
+        let team = ThreadKey::parse("slack:T999:C123:123.456")
+            .unwrap()
+            .chat_destination()
+            .unwrap();
+        assert_eq!(
+            team,
+            ChatDestination::Slack {
+                channel_id: "C123".to_owned(),
+                thread_ts: "123.456".to_owned(),
+            }
+        );
+
+        // A bare conversation id (C/D/G prefix) plus a timestamp also resolves.
+        let bare = ThreadKey::parse("D42:123.456")
+            .unwrap()
+            .chat_destination()
+            .unwrap();
+        assert_eq!(
+            bare,
+            ChatDestination::Slack {
+                channel_id: "D42".to_owned(),
+                thread_ts: "123.456".to_owned(),
+            }
+        );
+    }
+
+    #[test]
+    fn chat_destination_resolves_discord_keys() {
+        let with_thread = ThreadKey::parse("discord:111:222:333")
+            .unwrap()
+            .chat_destination()
+            .unwrap();
+        assert_eq!(
+            with_thread,
+            ChatDestination::Discord {
+                guild_id: "111".to_owned(),
+                channel_id: "222".to_owned(),
+                thread_id: Some("333".to_owned()),
+            }
+        );
+        assert_eq!(with_thread.platform(), "discord");
+
+        // The thread segment is optional (a channel-root message).
+        let no_thread = ThreadKey::parse("discord:111:222")
+            .unwrap()
+            .chat_destination()
+            .unwrap();
+        assert_eq!(
+            no_thread,
+            ChatDestination::Discord {
+                guild_id: "111".to_owned(),
+                channel_id: "222".to_owned(),
+                thread_id: None,
+            }
+        );
+    }
+
+    #[test]
+    fn chat_destination_is_none_for_unaddressable_keys() {
+        // No channel id → not a postable Discord destination.
+        assert!(
+            ThreadKey::parse("discord:111")
+                .unwrap()
+                .chat_destination()
+                .is_none()
+        );
+        // Non-platform namespaces resolve to nothing.
+        assert!(
+            ThreadKey::parse("api:abc123")
+                .unwrap()
+                .chat_destination()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn chat_destination_renders_a_platform_context_line() {
+        let slack = ThreadKey::parse("slack:C123:123.456")
+            .unwrap()
+            .chat_destination()
+            .unwrap()
+            .context_line();
+        assert!(slack.contains("Slack"));
+        assert!(slack.contains("C123"));
+        assert!(slack.contains("slack upload"));
+
+        let discord = ThreadKey::parse("discord:111:222:333")
+            .unwrap()
+            .chat_destination()
+            .unwrap()
+            .context_line();
+        assert!(discord.contains("Discord"));
+        assert!(discord.contains("222"));
+        assert!(discord.contains("discord upload"));
+    }
 
     #[test]
     fn thread_key_accepts_namespaced_values() {
