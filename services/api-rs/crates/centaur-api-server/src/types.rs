@@ -36,14 +36,27 @@ pub struct CreateSessionResponse {
 #[derive(Clone, Debug, Serialize)]
 pub struct SessionContextResponse {
     pub thread_key: ThreadKey,
+    /// The chat surface the agent is operating on: `slack`, `discord`, or
+    /// `unknown` for threads that are not platform-addressable.
+    pub platform: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub slack: Option<SlackThreadContext>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub discord: Option<DiscordThreadContext>,
 }
 
 #[derive(Clone, Debug, Serialize)]
 pub struct SlackThreadContext {
     pub channel_id: String,
     pub thread_ts: String,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct DiscordThreadContext {
+    pub guild_id: String,
+    pub channel_id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub thread_id: Option<String>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
