@@ -2,6 +2,7 @@ import type { RustSessionStreamEvent } from '@centaur/harness-events'
 import type { CodexAppServerToChatStreamOptions } from '@centaur/rendering'
 import type { Attachment, Chat, Logger, StateAdapter } from 'chat'
 import type { Hono } from 'hono'
+import type { SlackDisplayTextSource } from './slack-display-text'
 
 export type JsonPrimitive = string | number | boolean | null
 export type JsonValue = JsonPrimitive | JsonObject | JsonValue[]
@@ -32,9 +33,13 @@ export type SlackbotV2ApiAttachment = {
 export type SlackbotV2ApiMessage = {
   attachments: SlackbotV2ApiAttachment[]
   author: SlackbotV2ApiAuthor
+  displayText?: string
+  displayTextSource?: SlackDisplayTextSource
   id: string
   isMention: boolean
   raw: unknown
+  rawSlackAttachmentCount?: number
+  rawSlackBlockCount?: number
   teamId: string
   text: string
   threadId: string
@@ -100,8 +105,12 @@ export type SlackbotV2Options = {
   renderRecoveryMaxObligationAgeMs?: number
   /** Per-thread deadline for one recovery attempt during the startup scan. */
   renderRecoveryThreadTimeoutMs?: number
+  /** Deadline for Centaur session API HTTP calls made during Slack handoff. */
+  sessionApiTimeoutMs?: number
   signingSecret: string
   slackApiUrl?: string
+  /** Deadline for optional Slack Web API metadata lookups. */
+  slackApiTimeoutMs?: number
   state?: StateAdapter
   stateKeyPrefix?: string
   streamTaskDisplayMode?: 'plan' | 'timeline'
