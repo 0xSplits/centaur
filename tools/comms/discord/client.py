@@ -200,6 +200,37 @@ class DiscordClient:
 
         return _run(self._with_client(action))
 
+    def create_thread(
+        self,
+        channel: str,
+        name: str,
+        from_message_id: str | None = None,
+        content: str | None = None,
+        private: bool = False,
+    ) -> dict[str, Any]:
+        """Create a thread in a channel by name or ID.
+
+        Pass from_message_id to branch a public thread off an existing message.
+        Otherwise a standalone thread is created (public by default, or private
+        when private is set), and content, if given, is posted as its first message.
+        """
+
+        async def action(client):
+            resolved = self._find_channel(client, channel)
+            if from_message_id:
+                starter = await resolved.fetch_message(int(from_message_id))
+                thread = await resolved.create_thread(name=name, message=starter)
+            else:
+                thread_type = (
+                    discord.ChannelType.private_thread if private else discord.ChannelType.public_thread
+                )
+                thread = await resolved.create_thread(name=name, type=thread_type)
+                if content:
+                    await thread.send(content)
+            return self._format_thread(thread)
+
+        return _run(self._with_client(action))
+
     def _find_guild(self, client, guild_str: str):
         if guild_str.isdigit():
             guild = client.get_guild(int(guild_str))
@@ -239,6 +270,18 @@ class DiscordClient:
             "timestamp": msg.created_at.isoformat(),
             "content": msg.content or "",
             "reply_to": str(msg.reference.message_id) if msg.reference else None,
+        }
+
+    def _format_thread(self, thread) -> dict[str, Any]:
+        return {
+            "id": str(thread.id),
+            "name": thread.name,
+            "parent_id": str(thread.parent_id),
+            "guild_id": str(thread.guild.id),
+            "owner_id": str(thread.owner_id),
+            "type": thread.type.name if thread.type else None,
+            "archived": thread.archived,
+            "url": thread.jump_url,
         }
 
 
