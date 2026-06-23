@@ -1,5 +1,5 @@
 use std::{
-    collections::{HashMap, HashSet, VecDeque},
+    collections::{BTreeMap, HashMap, HashSet, VecDeque},
     sync::Arc,
     time::{Duration, SystemTime},
 };
@@ -26,6 +26,7 @@ use centaur_telemetry::{
 };
 use dashmap::DashMap;
 use futures_util::{SinkExt, Stream, StreamExt, stream};
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use thiserror::Error;
@@ -45,7 +46,9 @@ const STEERING_STARTUP_RETRY_INTERVAL: Duration = Duration::from_millis(250);
 const STEERING_STARTUP_RETRY_TIMEOUT: Duration = Duration::from_secs(15);
 const COMPONENT_SESSION_RUNTIME: &str = "session_runtime";
 
-type SandboxSpecFactory = Arc<dyn Fn(&ThreadKey, &str, &HarnessType) -> SandboxSpec + Send + Sync>;
+type SandboxSpecFactory = Arc<
+    dyn Fn(&ThreadKey, &str, &HarnessType, Option<&PersonaContext>) -> SandboxSpec + Send + Sync,
+>;
 type SessionInputSink = FramedWrite<SandboxWrite, LinesCodec>;
 type ExecutionSpanRegistry = Arc<Mutex<HashMap<String, Span>>>;
 type SessionPipeMap = Arc<DashMap<String, SessionPipe>>;
@@ -60,6 +63,108 @@ pub struct SessionRuntime {
     execution_spans: ExecutionSpanRegistry,
     iron_control: Option<SessionRegistrar>,
     warm_pool: Option<Arc<WarmPoolManager>>,
+    personas: Option<Arc<PersonaRegistry>>,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct PersonaRegistry {
+    personas: BTreeMap<String, PersonaDefinition>,
+    default_persona_id: Option<String>,
+    overlay_chain: Vec<String>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct PersonaDefinition {
+    pub id: String,
+    pub source_root: String,
+    pub source_path: String,
+    pub source_ref: Option<String>,
+    pub prompt_hash: String,
+    #[serde(skip_serializing)]
+    pub prompt: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct PersonaSummary {
+    pub id: String,
+    pub source_root: String,
+    pub source_path: String,
+    pub source_ref: Option<String>,
+    pub prompt_hash: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct PersonaContext {
+    pub persona_id: String,
+    pub source_root: String,
+    pub source_path: String,
+    pub source_ref: Option<String>,
+    pub prompt_hash: String,
+    pub defaulted: bool,
+    pub overlay_chain: Vec<String>,
+}
+
+impl PersonaRegistry {
+    pub fn new(
+        personas: impl IntoIterator<Item = PersonaDefinition>,
+        default_persona_id: Option<String>,
+        overlay_chain: Vec<String>,
+    ) -> Result<Self, String> {
+        let personas = personas
+            .into_iter()
+            .map(|persona| (persona.id.clone(), persona))
+            .collect::<BTreeMap<_, _>>();
+        if let Some(default_persona_id) = default_persona_id.as_deref()
+            && !personas.contains_key(default_persona_id)
+        {
+            return Err(format!(
+                "CENTAUR_DEFAULT_PERSONA {default_persona_id:?} is not in the deployed persona registry"
+            ));
+        }
+        Ok(Self {
+            personas,
+            default_persona_id,
+            overlay_chain,
+        })
+    }
+
+    pub fn summaries(&self) -> Vec<PersonaSummary> {
+        self.personas
+            .values()
+            .map(|persona| PersonaSummary {
+                id: persona.id.clone(),
+                source_root: persona.source_root.clone(),
+                source_path: persona.source_path.clone(),
+                source_ref: persona.source_ref.clone(),
+                prompt_hash: persona.prompt_hash.clone(),
+            })
+            .collect()
+    }
+
+    fn default_persona_id(&self) -> Option<&str> {
+        self.default_persona_id.as_deref()
+    }
+
+    fn get(&self, persona_id: &str) -> Option<&PersonaDefinition> {
+        self.personas.get(persona_id)
+    }
+
+    fn context_for(&self, persona_id: &str, defaulted: bool) -> Result<PersonaContext, String> {
+        let Some(persona) = self.get(persona_id) else {
+            return Err(format!(
+                "persona {persona_id:?} is not available in this deployment"
+            ));
+        };
+        Ok(PersonaContext {
+            persona_id: persona.id.clone(),
+            source_root: persona.source_root.clone(),
+            source_path: persona.source_path.clone(),
+            source_ref: persona.source_ref.clone(),
+            prompt_hash: persona.prompt_hash.clone(),
+            defaulted,
+            overlay_chain: self.overlay_chain.clone(),
+        })
+    }
 }
 
 #[derive(Clone)]
@@ -169,6 +274,12 @@ struct SandboxReadyObservation<'a> {
     startup_duration: Option<Duration>,
 }
 
+struct PersonaResolution {
+    persona_id: Option<String>,
+    context: Option<PersonaContext>,
+    defaulted: bool,
+}
+
 impl SessionRuntime {
     pub fn new(store: PgSessionStore, sandbox_runtime: SandboxRuntime) -> Self {
         Self {
@@ -179,7 +290,68 @@ impl SessionRuntime {
             execution_spans: Arc::new(Mutex::new(HashMap::new())),
             iron_control: None,
             warm_pool: None,
+            personas: None,
         }
+    }
+
+    pub fn with_personas(mut self, personas: PersonaRegistry) -> Self {
+        self.personas = Some(Arc::new(personas));
+        self
+    }
+
+    pub fn personas(&self) -> Vec<PersonaSummary> {
+        self.personas
+            .as_ref()
+            .map(|personas| personas.summaries())
+            .unwrap_or_default()
+    }
+
+    fn resolve_persona_for_create(
+        &self,
+        requested_persona_id: Option<&str>,
+    ) -> Result<PersonaResolution, SessionRuntimeError> {
+        let requested = requested_persona_id.and_then(clean_persona_id);
+        let selected = requested.or_else(|| self.default_persona_id());
+        let defaulted = requested.is_none() && selected.is_some();
+        let context = self.resolve_persona_context(selected, defaulted)?;
+        Ok(PersonaResolution {
+            persona_id: selected.map(str::to_owned),
+            context,
+            defaulted,
+        })
+    }
+
+    fn resolve_stored_persona(
+        &self,
+        persona_id: Option<&str>,
+        _harness_type: &HarnessType,
+    ) -> Result<Option<PersonaContext>, SessionRuntimeError> {
+        self.resolve_persona_context(persona_id.and_then(clean_persona_id), false)
+    }
+
+    fn resolve_persona_context(
+        &self,
+        persona_id: Option<&str>,
+        defaulted: bool,
+    ) -> Result<Option<PersonaContext>, SessionRuntimeError> {
+        let Some(persona_id) = persona_id else {
+            return Ok(None);
+        };
+        let Some(registry) = self.personas.as_ref() else {
+            return Err(SessionRuntimeError::BadRequest(format!(
+                "persona {persona_id:?} was requested but no persona registry is configured"
+            )));
+        };
+        registry
+            .context_for(persona_id, defaulted)
+            .map(Some)
+            .map_err(SessionRuntimeError::BadRequest)
+    }
+
+    fn default_persona_id(&self) -> Option<&str> {
+        self.personas
+            .as_ref()
+            .and_then(|personas| personas.default_persona_id())
     }
 
     fn context(&self) -> RuntimeContext {
@@ -284,17 +456,34 @@ impl SessionRuntime {
                 .and_then(Value::as_str)
                 .map(ToOwned::to_owned);
             let mut harness_switched = false;
+            let persona_resolution = self.resolve_persona_for_create(persona_id)?;
+            let mut session_metadata = default_metadata(metadata);
+            if let Some(context) = persona_resolution.context.as_ref() {
+                add_persona_metadata(&mut session_metadata, context);
+            }
             let session = match self
                 .store
                 .create_or_get_session(
                     thread_key,
                     harness_type,
-                    persona_id,
-                    default_metadata(metadata),
+                    persona_resolution.persona_id.as_deref(),
+                    session_metadata,
                 )
                 .await
             {
                 Ok(session) => session,
+                Err(SessionStoreError::PersonaConflict { existing, .. })
+                    if persona_id.is_none() && persona_resolution.defaulted =>
+                {
+                    self.store
+                        .create_or_get_session(
+                            thread_key,
+                            harness_type,
+                            existing.as_deref(),
+                            default_metadata(None),
+                        )
+                        .await?
+                }
                 Err(SessionStoreError::HarnessConflict { existing, .. })
                     if on_harness_conflict == HarnessConflictPolicy::Restart =>
                 {
@@ -306,6 +495,22 @@ impl SessionRuntime {
                 }
                 Err(error) => return Err(error.into()),
             };
+            if let Some(context) =
+                self.resolve_stored_persona(session.persona_id.as_deref(), harness_type)?
+            {
+                self.store
+                    .append_event(
+                        thread_key,
+                        None,
+                        "session.persona_resolved",
+                        json!({
+                            "persona": context,
+                            "requested_persona_id": persona_id,
+                            "deployment_default_persona_id": self.default_persona_id(),
+                        }),
+                    )
+                    .await?;
+            }
             if let Some(registrar) = &self.iron_control {
                 // iron-control is the source of truth for the session's egress
                 // proxy: without a registered principal the proxy has no identity
@@ -647,6 +852,7 @@ impl SessionRuntime {
                 .ensure_session_sandbox(
                     thread_key,
                     &session.harness_type,
+                    session.persona_id.as_deref(),
                     session.sandbox_id.as_deref(),
                     session.iron_control_principal.as_deref(),
                     &execution.execution_id,
@@ -960,6 +1166,7 @@ impl SessionRuntime {
         &self,
         thread_key: &ThreadKey,
         harness_type: &HarnessType,
+        persona_id: Option<&str>,
         existing_sandbox_id: Option<&str>,
         iron_control_principal: Option<&str>,
         execution_id: &str,
@@ -976,9 +1183,11 @@ impl SessionRuntime {
             sandbox_id = tracing::field::Empty,
             existing_sandbox_id = existing_sandbox_id.unwrap_or(""),
             iron_control_principal_present = iron_control_principal.is_some(),
+            persona_id = persona_id.unwrap_or(""),
         );
         let ensure_started = Instant::now();
         let result = async {
+            let persona_context = self.resolve_stored_persona(persona_id, harness_type)?;
             if let Some(sandbox_id) = existing_sandbox_id {
                 let id = SandboxId::new(sandbox_id);
                 match self.sandbox_runtime.manager.status(&id).await {
@@ -1111,10 +1320,18 @@ impl SessionRuntime {
                 .warm_harness
                 .as_ref()
                 .is_none_or(|warm| warm == harness_type);
+            let warm_persona_matches = persona_context.is_none();
             if !warm_harness_matches && self.warm_pool.is_some() {
                 record_sandbox_warm_pool_claim("harness_mismatch");
             }
-            if let Some(warm_pool) = self.warm_pool.as_ref().filter(|_| warm_harness_matches) {
+            if !warm_persona_matches && self.warm_pool.is_some() {
+                record_sandbox_warm_pool_claim("persona_specific");
+            }
+            if let Some(warm_pool) = self
+                .warm_pool
+                .as_ref()
+                .filter(|_| warm_harness_matches && warm_persona_matches)
+            {
                 match warm_pool
                     .claim(thread_key.as_str(), iron_control_principal)
                     .await
@@ -1171,8 +1388,12 @@ impl SessionRuntime {
                 }
             }
 
-            let mut spec =
-                (self.sandbox_runtime.spec_factory)(thread_key, execution_id, harness_type);
+            let mut spec = (self.sandbox_runtime.spec_factory)(
+                thread_key,
+                execution_id,
+                harness_type,
+                persona_context.as_ref(),
+            );
             if let Some(principal) = iron_control_principal {
                 spec.iron_control_principal = Some(principal.to_owned());
             }
@@ -1692,9 +1913,10 @@ impl SandboxRuntime {
     pub fn backend(backend: Arc<dyn SandboxBackend>, spec: SandboxSpec) -> Self {
         let warm_spec = spec.clone();
         let spec_factory =
-            move |_thread_key: &ThreadKey, _execution_id: &str, _harness: &HarnessType| {
-                spec.clone()
-            };
+            move |_thread_key: &ThreadKey,
+                  _execution_id: &str,
+                  _harness: &HarnessType,
+                  _persona: Option<&PersonaContext>| { spec.clone() };
         let warm_spec_factory = move || warm_spec.clone();
         Self::backend_with_warm_spec_factory(backend, spec_factory, warm_spec_factory)
     }
@@ -1707,7 +1929,9 @@ impl SandboxRuntime {
         let warm_workload = workload.clone();
         let mut runtime = Self::backend_with_warm_spec_factory(
             backend,
-            move |thread_key, _execution_id, harness| workload.spec(thread_key, harness),
+            move |thread_key, _execution_id, harness, persona| {
+                workload.spec(thread_key, harness, persona)
+            },
             move || warm_workload.warm_spec(),
         );
         runtime.warm_harness = warm_harness;
@@ -1716,7 +1940,10 @@ impl SandboxRuntime {
 
     pub fn backend_with_spec_factory<F>(backend: Arc<dyn SandboxBackend>, spec_factory: F) -> Self
     where
-        F: Fn(&ThreadKey, &str, &HarnessType) -> SandboxSpec + Send + Sync + 'static,
+        F: Fn(&ThreadKey, &str, &HarnessType, Option<&PersonaContext>) -> SandboxSpec
+            + Send
+            + Sync
+            + 'static,
     {
         Self {
             manager: Arc::new(SandboxManager::new(backend)),
@@ -1733,7 +1960,10 @@ impl SandboxRuntime {
         warm_spec_factory: W,
     ) -> Self
     where
-        F: Fn(&ThreadKey, &str, &HarnessType) -> SandboxSpec + Send + Sync + 'static,
+        F: Fn(&ThreadKey, &str, &HarnessType, Option<&PersonaContext>) -> SandboxSpec
+            + Send
+            + Sync
+            + 'static,
         W: Fn() -> SandboxSpec + Send + Sync + 'static,
     {
         let warm_spec_factory: WarmSandboxSpecFactory = Arc::new(warm_spec_factory);
@@ -1783,23 +2013,36 @@ impl SandboxWorkloadMode {
         }
     }
 
-    fn spec(&self, thread_key: &ThreadKey, harness: &HarnessType) -> SandboxSpec {
-        self.spec_for(Some(thread_key), harness)
+    fn spec(
+        &self,
+        thread_key: &ThreadKey,
+        harness: &HarnessType,
+        persona: Option<&PersonaContext>,
+    ) -> SandboxSpec {
+        self.spec_for(Some(thread_key), harness, persona)
     }
 
     fn warm_spec(&self) -> SandboxSpec {
         match self {
-            Self::MockAppServer { .. } => self.spec_for(None, &HarnessType::Codex),
-            Self::CodexAppServer { harness, .. } => self.spec_for(None, harness),
+            Self::MockAppServer { .. } => self.spec_for(None, &HarnessType::Codex, None),
+            Self::CodexAppServer { harness, .. } => self.spec_for(None, harness, None),
         }
     }
 
-    fn spec_for(&self, thread_key: Option<&ThreadKey>, harness: &HarnessType) -> SandboxSpec {
+    fn spec_for(
+        &self,
+        thread_key: Option<&ThreadKey>,
+        harness: &HarnessType,
+        persona: Option<&PersonaContext>,
+    ) -> SandboxSpec {
         match self {
-            Self::MockAppServer { image } => SandboxSpec::new(image)
-                .command(["/bin/sh", "-lc"])
-                .args([mock_app_server_script()])
-                .env("CENTAUR_HARNESS_TYPE", harness.as_ref()),
+            Self::MockAppServer { image } => apply_persona_spec_env(
+                SandboxSpec::new(image)
+                    .command(["/bin/sh", "-lc"])
+                    .args([mock_app_server_script()])
+                    .env("CENTAUR_HARNESS_TYPE", harness.as_ref()),
+                persona,
+            ),
             Self::CodexAppServer {
                 image, env, mounts, ..
             } => {
@@ -1812,6 +2055,13 @@ impl SandboxWorkloadMode {
                     .args(["harness-server", harness_server_subcommand(harness)]);
                 if let Some(thread_key) = thread_key {
                     spec = spec.env("CENTAUR_THREAD_KEY", thread_key.as_str());
+                    if let Some((channel_id, thread_ts)) =
+                        slack_destination_from_thread_key(thread_key.as_str())
+                    {
+                        spec = spec
+                            .env("SLACK_CHANNEL_ID", channel_id)
+                            .env("SLACK_THREAD_TS", thread_ts);
+                    }
                 }
                 for mount in mounts {
                     spec = spec.mount(mount.clone());
@@ -1819,9 +2069,24 @@ impl SandboxWorkloadMode {
                 for (name, value) in env {
                     spec = spec.env(name.clone(), value.clone());
                 }
-                spec
+                apply_persona_spec_env(spec, persona)
             }
         }
+    }
+}
+
+fn slack_destination_from_thread_key(thread_key: &str) -> Option<(&str, &str)> {
+    let parts = thread_key.split(':').collect::<Vec<_>>();
+    match parts.as_slice() {
+        ["slack", channel_id, thread_ts] if !channel_id.is_empty() && !thread_ts.is_empty() => {
+            Some((*channel_id, *thread_ts))
+        }
+        ["slack", _team_id, channel_id, thread_ts]
+            if !channel_id.is_empty() && !thread_ts.is_empty() =>
+        {
+            Some((*channel_id, *thread_ts))
+        }
+        _ => None,
     }
 }
 
@@ -3111,6 +3376,61 @@ fn duration_millis_u64(duration: Duration) -> u64 {
     duration.as_millis().min(u128::from(u64::MAX)) as u64
 }
 
+fn clean_persona_id(value: &str) -> Option<&str> {
+    let value = value.trim();
+    if value.is_empty() { None } else { Some(value) }
+}
+
+fn upsert_spec_env(spec: &mut SandboxSpec, name: &str, value: String) {
+    if let Some(existing) = spec.env.iter_mut().find(|env| env.name == name) {
+        existing.value = value;
+    } else {
+        spec.env
+            .push(centaur_sandbox_core::EnvVar::new(name, value));
+    }
+}
+
+fn apply_persona_spec_env(mut spec: SandboxSpec, persona: Option<&PersonaContext>) -> SandboxSpec {
+    for name in [
+        "AGENT_PERSONA",
+        "CENTAUR_PERSONA_ID",
+        "CENTAUR_PERSONA_PROMPT_HASH",
+        "CENTAUR_PERSONA_SOURCE_PATH",
+        "CENTAUR_PERSONA_SOURCE_REF",
+    ] {
+        remove_spec_env(&mut spec, name);
+    }
+    let Some(persona) = persona else {
+        return spec;
+    };
+    upsert_spec_env(&mut spec, "AGENT_PERSONA", persona.persona_id.clone());
+    upsert_spec_env(&mut spec, "CENTAUR_PERSONA_ID", persona.persona_id.clone());
+    upsert_spec_env(
+        &mut spec,
+        "CENTAUR_PERSONA_PROMPT_HASH",
+        persona.prompt_hash.clone(),
+    );
+    upsert_spec_env(
+        &mut spec,
+        "CENTAUR_PERSONA_SOURCE_PATH",
+        persona.source_path.clone(),
+    );
+    if let Some(source_ref) = persona.source_ref.as_ref() {
+        upsert_spec_env(&mut spec, "CENTAUR_PERSONA_SOURCE_REF", source_ref.clone());
+    }
+    spec
+}
+
+fn remove_spec_env(spec: &mut SandboxSpec, name: &str) {
+    spec.env.retain(|env| env.name != name);
+}
+
+fn add_persona_metadata(metadata: &mut Value, context: &PersonaContext) {
+    if let Value::Object(object) = metadata {
+        object.insert("persona".to_owned(), json!(context));
+    }
+}
+
 async fn record_finished_execution_metric(
     store: &PgSessionStore,
     thread_key: &ThreadKey,
@@ -3892,6 +4212,35 @@ mod tests {
     use time::OffsetDateTime;
 
     #[test]
+    fn persona_registry_validates_default_and_summarizes_without_prompt() {
+        let registry = PersonaRegistry::new(
+            [PersonaDefinition {
+                id: "eng".to_owned(),
+                source_root: "/repo/tools".to_owned(),
+                source_path: "/repo/tools/personas/eng".to_owned(),
+                source_ref: Some("abc123".to_owned()),
+                prompt_hash: "sha256:prompt".to_owned(),
+                prompt: "secret prompt".to_owned(),
+            }],
+            Some("eng".to_owned()),
+            vec!["/repo/tools".to_owned()],
+        )
+        .unwrap();
+
+        let summaries = registry.summaries();
+
+        assert_eq!(summaries.len(), 1);
+        assert_eq!(summaries[0].id, "eng");
+        assert!(
+            serde_json::to_value(registry.get("eng").unwrap())
+                .unwrap()
+                .get("prompt")
+                .is_none()
+        );
+        assert!(PersonaRegistry::new(Vec::new(), Some("missing".to_owned()), Vec::new()).is_err());
+    }
+
+    #[test]
     fn turn_completed_without_answer_text_is_terminal() {
         let event = json!({
             "type": "turn.completed",
@@ -4499,7 +4848,7 @@ mod tests {
         );
         let thread_key = ThreadKey::parse("chat:C123:1780000000.000000").unwrap();
 
-        let spec = workload.spec(&thread_key, &HarnessType::Codex);
+        let spec = workload.spec(&thread_key, &HarnessType::Codex, None);
 
         assert_eq!(spec.mounts.len(), 1);
         assert_eq!(spec.mounts[0].target_path, "/home/agent/github");
@@ -4513,6 +4862,31 @@ mod tests {
     }
 
     #[test]
+    fn codex_workload_reflects_resolved_persona_in_sandbox_spec() {
+        let workload = SandboxWorkloadMode::codex_app_server(
+            "centaur-agent:latest",
+            [("AGENT_PERSONA".to_owned(), "stale".to_owned())],
+            HarnessType::Codex,
+        );
+        let thread_key = ThreadKey::parse("chat:C123:1780000000.000000").unwrap();
+        let persona = test_persona_context("eng");
+
+        let spec = workload.spec(&thread_key, &HarnessType::Codex, Some(&persona));
+
+        assert_eq!(env_value(&spec, "AGENT_PERSONA"), Some("eng"));
+        assert_eq!(env_value(&spec, "CENTAUR_PERSONA_ID"), Some("eng"));
+        assert_eq!(
+            env_value(&spec, "CENTAUR_PERSONA_PROMPT_HASH"),
+            Some("sha256:prompt")
+        );
+        assert_eq!(
+            env_value(&spec, "CENTAUR_PERSONA_SOURCE_REF"),
+            Some("abc123")
+        );
+        assert_eq!(env_value(&workload.warm_spec(), "AGENT_PERSONA"), None);
+    }
+
+    #[test]
     fn codex_workload_does_not_inject_stale_continue_thread_id() {
         let workload = SandboxWorkloadMode::codex_app_server(
             "centaur-agent:latest",
@@ -4521,7 +4895,7 @@ mod tests {
         );
         let thread_key = ThreadKey::parse("chat:C123:1780000000.000000").unwrap();
 
-        let spec = workload.spec(&thread_key, &HarnessType::Codex);
+        let spec = workload.spec(&thread_key, &HarnessType::Codex, None);
 
         assert_eq!(
             spec.env
@@ -4548,7 +4922,7 @@ mod tests {
         );
         let thread_key = ThreadKey::parse("chat:C123:1780000000.000000").unwrap();
 
-        let claimed_spec = workload.spec(&thread_key, &HarnessType::ClaudeCode);
+        let claimed_spec = workload.spec(&thread_key, &HarnessType::ClaudeCode, None);
         let warm_spec = workload.warm_spec();
 
         assert_eq!(
@@ -4556,6 +4930,27 @@ mod tests {
             Some(thread_key.as_str())
         );
         assert_eq!(env_value(&warm_spec, "CENTAUR_THREAD_KEY"), None);
+    }
+
+    #[test]
+    fn codex_claimed_slack_spec_exports_upload_destination() {
+        let workload = SandboxWorkloadMode::codex_app_server(
+            "centaur-agent:latest",
+            [("CENTAUR_API_URL".to_owned(), "http://api:8000".to_owned())],
+            HarnessType::Codex,
+        );
+        let thread_key = ThreadKey::parse("slack:T123:C123:1780000000.000000").unwrap();
+
+        let claimed_spec = workload.spec(&thread_key, &HarnessType::Codex, None);
+        let warm_spec = workload.warm_spec();
+
+        assert_eq!(env_value(&claimed_spec, "SLACK_CHANNEL_ID"), Some("C123"));
+        assert_eq!(
+            env_value(&claimed_spec, "SLACK_THREAD_TS"),
+            Some("1780000000.000000")
+        );
+        assert_eq!(env_value(&warm_spec, "SLACK_CHANNEL_ID"), None);
+        assert_eq!(env_value(&warm_spec, "SLACK_THREAD_TS"), None);
     }
 
     #[test]
@@ -4569,8 +4964,8 @@ mod tests {
         let second_thread_key = ThreadKey::parse("chat:C456:1780000000.000001").unwrap();
 
         assert_ne!(
-            sandbox_spec_key(&workload.spec(&first_thread_key, &HarnessType::ClaudeCode)),
-            sandbox_spec_key(&workload.spec(&second_thread_key, &HarnessType::ClaudeCode))
+            sandbox_spec_key(&workload.spec(&first_thread_key, &HarnessType::ClaudeCode, None)),
+            sandbox_spec_key(&workload.spec(&second_thread_key, &HarnessType::ClaudeCode, None))
         );
         assert_eq!(
             sandbox_spec_key(&workload.warm_spec()),
@@ -4587,9 +4982,9 @@ mod tests {
         );
         let thread_key = ThreadKey::parse("chat:C123:1780000000.000000").unwrap();
 
-        let codex_spec = workload.spec(&thread_key, &HarnessType::Codex);
-        let claude_spec = workload.spec(&thread_key, &HarnessType::ClaudeCode);
-        let amp_spec = workload.spec(&thread_key, &HarnessType::Amp);
+        let codex_spec = workload.spec(&thread_key, &HarnessType::Codex, None);
+        let claude_spec = workload.spec(&thread_key, &HarnessType::ClaudeCode, None);
+        let amp_spec = workload.spec(&thread_key, &HarnessType::Amp, None);
 
         assert_eq!(codex_spec.args, vec!["harness-server", "codex"]);
         assert_eq!(claude_spec.args, vec!["harness-server", "claude-code"]);
@@ -4607,7 +5002,7 @@ mod tests {
         );
         let thread_key = ThreadKey::parse("chat:C123:1780000000.000000").unwrap();
 
-        let spec = workload.spec(&thread_key, &HarnessType::ClaudeCode);
+        let spec = workload.spec(&thread_key, &HarnessType::ClaudeCode, None);
 
         assert_eq!(
             spec.labels.get("centaur.ai/component").map(String::as_str),
@@ -4636,7 +5031,9 @@ mod tests {
         // warm claim for it would hand over the wrong harness.
         let thread_key = ThreadKey::parse("chat:C123:1780000000.000000").unwrap();
         assert_eq!(
-            workload.spec(&thread_key, &HarnessType::ClaudeCode).args,
+            workload
+                .spec(&thread_key, &HarnessType::ClaudeCode, None)
+                .args,
             vec!["harness-server", "claude-code"]
         );
     }
@@ -4736,6 +5133,18 @@ mod tests {
             .iter()
             .find(|env| env.name == name)
             .map(|env| env.value.as_str())
+    }
+
+    fn test_persona_context(persona_id: &str) -> PersonaContext {
+        PersonaContext {
+            persona_id: persona_id.to_owned(),
+            source_root: "/repo/tools".to_owned(),
+            source_path: format!("/repo/tools/personas/{persona_id}"),
+            source_ref: Some("abc123".to_owned()),
+            prompt_hash: "sha256:prompt".to_owned(),
+            defaulted: false,
+            overlay_chain: vec!["/repo/tools".to_owned()],
+        }
     }
 }
 
