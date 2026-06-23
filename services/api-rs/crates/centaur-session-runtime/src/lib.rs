@@ -5147,6 +5147,26 @@ mod tests {
     }
 
     #[test]
+    fn input_line_prepends_linear_chat_surface_note_to_user_content() {
+        let thread_key = ThreadKey::parse("linear:ISSUE:s:SESS").unwrap();
+        let trace = SessionTraceContext::new(&thread_key, None);
+
+        let line = input_line_with_session_context(
+            &thread_key,
+            &trace,
+            r#"{"type":"user","message":{"role":"user","content":[{"type":"text","text":"hi"}]}}"#,
+        );
+        let value: Value = serde_json::from_str(&line).unwrap();
+        let content = value["message"]["content"].as_array().unwrap();
+
+        assert_eq!(content.len(), 2);
+        let note = content[0]["text"].as_str().unwrap();
+        assert!(note.contains("Linear"));
+        assert!(note.contains("ISSUE"));
+        assert_eq!(content[1]["text"], "hi");
+    }
+
+    #[test]
     fn input_line_leaves_content_untouched_without_a_chat_destination() {
         // A non-platform thread key resolves to no destination, so nothing is added.
         let thread_key = ThreadKey::parse("cli:test").unwrap();

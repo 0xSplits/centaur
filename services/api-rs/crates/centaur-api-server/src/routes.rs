@@ -56,8 +56,8 @@ use crate::{
     types::{
         AppendMessagesRequest, AppendMessagesResponse, CreateSessionRequest, CreateSessionResponse,
         DiscordThreadContext, EmitWorkflowEventRequest, EventsQuery, ExecuteSessionRequest,
-        ExecuteSessionResponse, ListWorkflowRunsQuery, OnHarnessConflict, SessionContextResponse,
-        SessionSseEvent, SlackThreadContext, stream_error_sse,
+        ExecuteSessionResponse, LinearThreadContext, ListWorkflowRunsQuery, OnHarnessConflict,
+        SessionContextResponse, SessionSseEvent, SlackThreadContext, stream_error_sse,
     },
 };
 
@@ -365,7 +365,7 @@ async fn get_session_context(
         .map(ChatDestination::platform)
         .unwrap_or("unknown")
         .to_owned();
-    let (slack, discord) = match destination {
+    let (slack, discord, linear) = match destination {
         Some(ChatDestination::Slack {
             channel_id,
             thread_ts,
@@ -374,6 +374,7 @@ async fn get_session_context(
                 channel_id,
                 thread_ts,
             }),
+            None,
             None,
         ),
         Some(ChatDestination::Discord {
@@ -387,14 +388,29 @@ async fn get_session_context(
                 channel_id,
                 thread_id,
             }),
+            None,
         ),
-        None => (None, None),
+        Some(ChatDestination::Linear {
+            issue_id,
+            comment_id,
+            agent_session_id,
+        }) => (
+            None,
+            None,
+            Some(LinearThreadContext {
+                issue_id,
+                comment_id,
+                agent_session_id,
+            }),
+        ),
+        None => (None, None, None),
     };
     Ok(Json(SessionContextResponse {
         thread_key,
         platform,
         slack,
         discord,
+        linear,
     }))
 }
 

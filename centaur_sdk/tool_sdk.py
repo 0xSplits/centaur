@@ -149,12 +149,32 @@ def current_discord_thread() -> dict[str, str]:
     return destination
 
 
+def current_linear_thread() -> dict[str, str]:
+    """Return the current Linear destination.
+
+    ``{"issue_id": ..., "comment_id": ..., "agent_session_id": ...}`` (the
+    optional comment/session ids are omitted when absent). Raises if the current
+    thread is not a Linear thread.
+    """
+    context = current_session_context()
+    linear = context.get("linear")
+    if not isinstance(linear, dict) or not linear.get("issue_id"):
+        raise RuntimeError(f"current thread is not a Linear thread: {context.get('thread_key')!r}")
+    destination = {"issue_id": str(linear["issue_id"])}
+    if linear.get("comment_id"):
+        destination["comment_id"] = str(linear["comment_id"])
+    if linear.get("agent_session_id"):
+        destination["agent_session_id"] = str(linear["agent_session_id"])
+    return destination
+
+
 def current_chat_destination() -> dict[str, str]:
     """Return the current chat surface in a platform-agnostic shape.
 
-    Always includes ``platform`` (``"slack"`` / ``"discord"``) plus that
-    platform's destination ids (Slack: ``channel_id``/``thread_ts``; Discord:
-    ``guild_id``/``channel_id``/``thread_id``). Prefer this over the
+    Always includes ``platform`` (``"slack"`` / ``"discord"`` / ``"linear"``)
+    plus that platform's destination ids (Slack: ``channel_id``/``thread_ts``;
+    Discord: ``guild_id``/``channel_id``/``thread_id``; Linear:
+    ``issue_id``/``comment_id``/``agent_session_id``). Prefer this over the
     platform-specific helpers when writing tooling that should work on any chat
     surface. Raises if the current thread is not a recognized chat surface.
     """
@@ -164,6 +184,8 @@ def current_chat_destination() -> dict[str, str]:
         return {"platform": "slack", **current_slack_thread()}
     if platform == "discord":
         return {"platform": "discord", **current_discord_thread()}
+    if platform == "linear":
+        return {"platform": "linear", **current_linear_thread()}
     raise RuntimeError(
         f"current thread is not a recognized chat surface: {context.get('thread_key')!r}"
     )
