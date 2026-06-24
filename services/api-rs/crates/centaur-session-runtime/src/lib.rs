@@ -14,8 +14,8 @@ use centaur_sandbox_manager::{
     WarmPoolManager, WarmSandboxSpecFactory,
 };
 use centaur_session_core::{
-    ExecutionStatus, HarnessType, MessageRole, Session, SessionEvent, SessionExecution,
-    SessionMessageInput, ThreadKey,
+    ChatDestination, ExecutionStatus, HarnessType, MessageRole, Session, SessionEvent,
+    SessionExecution, SessionMessageInput, ThreadKey,
 };
 use centaur_session_sqlx::{
     PgSessionStore, SessionEventListener, SessionStoreError, default_metadata,
@@ -3886,42 +3886,64 @@ fn merge_session_context(
     }
 }
 
+/// Build the structured per-turn session context for a thread, mirroring the
+/// `/api/session` response shape (`{ platform, <slack|discord|linear>: { .. } }`).
+///
+/// Resolved from the same [`ChatDestination`] the session-context route uses, so
+/// the structured context the agent sees in its input is consistent with what
+/// tools read back from the API. Returns `None` for non-platform threads (e.g.
+/// `api:` keys), which carry no chat destination and get no `session_context`.
 fn session_context_for_thread(thread_key: &ThreadKey) -> Option<serde_json::Map<String, Value>> {
-    let slack = slack_context_for_thread(thread_key)?;
+    let destination = thread_key.chat_destination()?;
     let mut context = serde_json::Map::new();
-    context.insert("platform".to_owned(), Value::String("slack".to_owned()));
-    context.insert("slack".to_owned(), Value::Object(slack));
-    Some(context)
-}
-
-fn slack_context_for_thread(thread_key: &ThreadKey) -> Option<serde_json::Map<String, Value>> {
-    let parts = thread_key.as_str().split(':').collect::<Vec<_>>();
-    let (team_id, channel_id, thread_ts) = match parts.as_slice() {
-        ["slack", channel_id, thread_ts] => (None, *channel_id, *thread_ts),
-        ["slack", team_id, channel_id, thread_ts] => (Some(*team_id), *channel_id, *thread_ts),
-        [channel_id, thread_ts] if is_slack_conversation_id(channel_id) => {
-            (None, *channel_id, *thread_ts)
-        }
-        _ => return None,
-    };
-    if channel_id.is_empty() || thread_ts.is_empty() {
-        return None;
-    }
-
-    let mut slack = serde_json::Map::new();
-    if let Some(team_id) = team_id.filter(|value| !value.is_empty()) {
-        slack.insert("team_id".to_owned(), Value::String(team_id.to_owned()));
-    }
-    slack.insert(
-        "channel_id".to_owned(),
-        Value::String(channel_id.to_owned()),
+    context.insert(
+        "platform".to_owned(),
+        Value::String(destination.platform().to_owned()),
     );
-    slack.insert("thread_ts".to_owned(), Value::String(thread_ts.to_owned()));
-    Some(slack)
-}
-
-fn is_slack_conversation_id(value: &str) -> bool {
-    matches!(value.as_bytes().first(), Some(b'C' | b'D' | b'G'))
+    let (platform_key, block) = match destination {
+        ChatDestination::Slack {
+            channel_id,
+            thread_ts,
+        } => {
+            let mut slack = serde_json::Map::new();
+            slack.insert("channel_id".to_owned(), Value::String(channel_id));
+            slack.insert("thread_ts".to_owned(), Value::String(thread_ts));
+            ("slack", slack)
+        }
+        ChatDestination::Discord {
+            guild_id,
+            channel_id,
+            thread_id,
+        } => {
+            let mut discord = serde_json::Map::new();
+            discord.insert("guild_id".to_owned(), Value::String(guild_id));
+            discord.insert("channel_id".to_owned(), Value::String(channel_id));
+            if let Some(thread_id) = thread_id {
+                discord.insert("thread_id".to_owned(), Value::String(thread_id));
+            }
+            ("discord", discord)
+        }
+        ChatDestination::Linear {
+            issue_id,
+            comment_id,
+            agent_session_id,
+        } => {
+            let mut linear = serde_json::Map::new();
+            linear.insert("issue_id".to_owned(), Value::String(issue_id));
+            if let Some(comment_id) = comment_id {
+                linear.insert("comment_id".to_owned(), Value::String(comment_id));
+            }
+            if let Some(agent_session_id) = agent_session_id {
+                linear.insert(
+                    "agent_session_id".to_owned(),
+                    Value::String(agent_session_id),
+                );
+            }
+            ("linear", linear)
+        }
+    };
+    context.insert(platform_key.to_owned(), Value::Object(block));
+    Some(context)
 }
 
 fn steering_input_lines(
@@ -5104,12 +5126,44 @@ mod tests {
         let value: Value = serde_json::from_str(&line).unwrap();
 
         assert_eq!(value["session_context"]["platform"], "slack");
-        assert_eq!(value["session_context"]["slack"]["team_id"], "T123");
         assert_eq!(value["session_context"]["slack"]["channel_id"], "C123");
         assert_eq!(
             value["session_context"]["slack"]["thread_ts"],
             "1780000000.000000"
         );
+    }
+
+    #[test]
+    fn input_line_with_session_context_adds_discord_thread_context() {
+        let thread_key = ThreadKey::parse("discord:111:222:333").unwrap();
+        let trace = SessionTraceContext::new(&thread_key, None);
+
+        let line = input_line_with_session_context(&thread_key, &trace, r#"{"type":"user"}"#);
+        let value: Value = serde_json::from_str(&line).unwrap();
+
+        assert_eq!(value["session_context"]["platform"], "discord");
+        assert_eq!(value["session_context"]["discord"]["guild_id"], "111");
+        assert_eq!(value["session_context"]["discord"]["channel_id"], "222");
+        assert_eq!(value["session_context"]["discord"]["thread_id"], "333");
+        assert!(value["session_context"].get("slack").is_none());
+    }
+
+    #[test]
+    fn input_line_with_session_context_adds_linear_thread_context() {
+        let thread_key = ThreadKey::parse("linear:ISSUE:s:SESS").unwrap();
+        let trace = SessionTraceContext::new(&thread_key, None);
+
+        let line = input_line_with_session_context(&thread_key, &trace, r#"{"type":"user"}"#);
+        let value: Value = serde_json::from_str(&line).unwrap();
+
+        assert_eq!(value["session_context"]["platform"], "linear");
+        assert_eq!(value["session_context"]["linear"]["issue_id"], "ISSUE");
+        assert_eq!(
+            value["session_context"]["linear"]["agent_session_id"],
+            "SESS"
+        );
+        // No comment in this key, so the optional field is omitted entirely.
+        assert!(value["session_context"]["linear"].get("comment_id").is_none());
     }
 
     #[test]
