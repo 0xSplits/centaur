@@ -27,7 +27,7 @@ use centaur_sandbox_core::{Mount, MountKind, SandboxSpec};
 use centaur_sandbox_local::LocalSandboxBackend;
 use centaur_sandbox_manager::{SandboxReaperConfig, WarmPoolConfig};
 use centaur_session_core::HarnessType;
-use centaur_session_runtime::{PersonaRegistry, SandboxWorkloadMode};
+use centaur_session_runtime::{PersonaRegistry, SandboxWorkloadMode, SessionSandboxCleanupConfig};
 use centaur_workflows::WorkflowHostSandboxRuntime;
 use clap::{Args as ClapArgs, Parser, ValueEnum};
 use tracing::{error, info, warn};
@@ -89,6 +89,10 @@ impl Args {
 
     pub(crate) fn sandbox_reaper_config(&self) -> SandboxReaperConfig {
         self.sandbox.sandbox_reaper_config()
+    }
+
+    pub(crate) fn sandbox_cleanup_config(&self) -> SessionSandboxCleanupConfig {
+        self.sandbox.sandbox_cleanup_config()
     }
 
     pub(crate) async fn workflow_host_sandbox_runtime(
@@ -550,6 +554,18 @@ struct SandboxArgs {
     )]
     sandbox_reap_interval_secs: u64,
     #[arg(
+        long = "session-sandbox-cleanup-interval-secs",
+        env = "SESSION_SANDBOX_CLEANUP_INTERVAL_SECS",
+        default_value_t = 300
+    )]
+    sandbox_cleanup_interval_secs: u64,
+    #[arg(
+        long = "session-sandbox-idle-cleanup-backstop-secs",
+        env = "SESSION_SANDBOX_IDLE_CLEANUP_BACKSTOP_SECS",
+        default_value_t = 21_600
+    )]
+    sandbox_idle_cleanup_backstop_secs: u64,
+    #[arg(
         long = "session-sandbox-k8s-context",
         alias = "kubernetes-context",
         env = "SESSION_SANDBOX_K8S_CONTEXT"
@@ -919,14 +935,7 @@ impl SandboxArgs {
     }
 
     fn codex_app_server_env_template(&self) -> Result<Vec<(String, String)>, ServerError> {
-        let mut envs = vec![(
-            "CENTAUR_API_URL".to_owned(),
-            self.centaur_api_url_override
-                .as_deref()
-                .or(self.centaur_api_url.as_deref())
-                .unwrap_or("http://api:8000")
-                .to_owned(),
-        )];
+        let mut envs = vec![("CENTAUR_API_URL".to_owned(), self.centaur_api_url())];
 
         // Single source of truth: propagate this control plane's harness auth
         // modes into the sandbox so the agent's auth.json matches the
@@ -1109,7 +1118,7 @@ impl SandboxArgs {
     }
 
     fn workflow_host_env_template(&self) -> Result<Vec<(String, String)>, ServerError> {
-        let mut envs = Vec::new();
+        let mut envs = vec![("CENTAUR_API_URL".to_owned(), self.centaur_api_url())];
 
         for (name, value) in self.iron_proxy.sandbox_placeholder_env()? {
             envs.push((name, value));
@@ -1151,6 +1160,14 @@ impl SandboxArgs {
         }
 
         Ok(envs)
+    }
+
+    fn centaur_api_url(&self) -> String {
+        self.centaur_api_url_override
+            .as_deref()
+            .or(self.centaur_api_url.as_deref())
+            .unwrap_or("http://api:8000")
+            .to_owned()
     }
 
     fn passthrough_env_names(&self) -> impl Iterator<Item = &str> {
@@ -1210,6 +1227,14 @@ impl SandboxArgs {
             interval: Duration::from_secs(self.sandbox_reap_interval_secs),
             idle_ttl: ttl(self.sandbox_idle_stop_ttl_secs),
             max_lifetime: ttl(self.sandbox_max_lifetime_secs),
+        }
+    }
+
+    fn sandbox_cleanup_config(&self) -> SessionSandboxCleanupConfig {
+        let duration = |secs: u64| (secs > 0).then(|| Duration::from_secs(secs));
+        SessionSandboxCleanupConfig {
+            interval: duration(self.sandbox_cleanup_interval_secs),
+            idle_backstop: duration(self.sandbox_idle_cleanup_backstop_secs),
         }
     }
 }
@@ -2209,6 +2234,8 @@ mod tests {
             "postgres://postgres:postgres@localhost/centaur",
             "--session-sandbox-backend",
             "agent-k8s",
+            "--session-sandbox-centaur-api-url",
+            "http://centaur-api-rs:8080",
             "--kubernetes-sandbox-iron-proxy-mode",
             "disabled",
         ])
@@ -2216,6 +2243,13 @@ mod tests {
 
         let spec = args.sandbox.workflow_host_spec(None).unwrap();
 
+        assert_eq!(
+            spec.env
+                .iter()
+                .find(|env| env.name == "CENTAUR_API_URL")
+                .map(|env| env.value.as_str()),
+            Some("http://centaur-api-rs:8080")
+        );
         assert_eq!(
             spec.env
                 .iter()

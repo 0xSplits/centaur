@@ -295,6 +295,11 @@ apiRs:
   sandboxIdleStopTtlSecs: 10800 # 3 hours
   sandboxMaxLifetimeSecs: 259200 # 3 days
   sandboxReapIntervalSecs: 300
+  # Cleanup worker: stop unreferenced session/warm-pool sandboxes after two
+  # consecutive sweeps and restore idle-pauses lost across api-rs restarts.
+  # 0 disables the corresponding arm.
+  sandboxCleanupIntervalSecs: 300
+  sandboxIdleCleanupBackstopSecs: 21600 # 6 hours
   ironProxy:
     mode: enabled
   metrics:
@@ -378,6 +383,30 @@ discordbot:
   mentionRoleIds: ""
   # Rename auto-created threads to the triggering message; set false to keep generic names.
   nameThreads: true
+  extraEnv: {}
+  resources: {}
+
+# Microsoft Teams chat ingress. Forwards Teams Bot Framework activities to the
+# api-rs control plane (:8080) and renders session events back to Teams. Off by
+# default; needs a Teams app registration and Bot Framework endpoint routing.
+teamsbot:
+  enabled: false
+  replicaCount: 1
+  image:
+    repository: centaur-teamsbot
+    tag: latest
+    pullPolicy: Always
+  allowedTeamIds: ""
+  allowedChannelIds: ""
+  allowedTenantIds: ""
+  requireMention: true
+  downloadAttachments: false
+  ingress:
+    enabled: false
+    className: ""
+    annotations: {}
+    host: ""
+    tls: []
   extraEnv: {}
   resources: {}
 

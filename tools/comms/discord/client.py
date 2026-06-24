@@ -15,6 +15,12 @@ from centaur_sdk import secret
 BASE_URL = "https://discord.com/api/v10"
 INVITE_RE = re.compile(r"(?:https?://)?(?:discord(?:\.gg|\.com/invite)/)?([A-Za-z0-9-]+)")
 
+# Discord thread channel types
+# (https://discord.com/developers/docs/resources/channel#channel-object-channel-types).
+THREAD_TYPES = {10: "announcement_thread", 11: "public_thread", 12: "private_thread"}
+PUBLIC_THREAD_TYPE = 11
+PRIVATE_THREAD_TYPE = 12
+
 
 class DiscordClient:
     """High-level Discord client using a regular user token."""
@@ -311,6 +317,38 @@ class DiscordClient:
                 raise
         return {"path": dest, "size": total, "url": url}
 
+    def create_thread(
+        self,
+        channel: str,
+        name: str,
+        from_message_id: str | None = None,
+        content: str | None = None,
+        private: bool = False,
+    ) -> dict[str, Any]:
+        """Create a thread in a channel by name or ID.
+
+        Pass from_message_id to branch a public thread off an existing message.
+        Otherwise a standalone thread is created (public by default, or private
+        when private is set), and content, if given, is posted as its first message.
+        """
+        resolved = self._find_channel(channel)
+        if from_message_id:
+            thread = self._request(
+                "POST",
+                f"/channels/{resolved['id']}/messages/{from_message_id}/threads",
+                json={"name": name},
+            )
+            return self._format_thread(thread)
+        thread_type = PRIVATE_THREAD_TYPE if private else PUBLIC_THREAD_TYPE
+        thread = self._request(
+            "POST",
+            f"/channels/{resolved['id']}/threads",
+            json={"name": name, "type": thread_type},
+        )
+        if content:
+            self._request("POST", f"/channels/{thread['id']}/messages", json={"content": content})
+        return self._format_thread(thread)
+
     def _guild_channels(self, guild_id: str) -> list[dict[str, Any]]:
         return list(self._request("GET", f"/guilds/{guild_id}/channels"))
 
@@ -383,6 +421,21 @@ class DiscordClient:
                 }
                 for attachment in (msg.get("attachments") or [])
             ],
+        }
+
+    def _format_thread(self, thread: dict[str, Any]) -> dict[str, Any]:
+        metadata = thread.get("thread_metadata") or {}
+        guild_id = str(thread.get("guild_id", ""))
+        thread_id = str(thread.get("id", ""))
+        return {
+            "id": thread_id,
+            "name": thread.get("name"),
+            "parent_id": str(thread.get("parent_id", "")),
+            "guild_id": guild_id,
+            "owner_id": str(thread.get("owner_id", "")),
+            "type": THREAD_TYPES.get(thread.get("type")),
+            "archived": metadata.get("archived", False),
+            "url": f"https://discord.com/channels/{guild_id}/{thread_id}",
         }
 
 
