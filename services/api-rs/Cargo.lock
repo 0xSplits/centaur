@@ -838,6 +838,7 @@ dependencies = [
 name = "centaur-iron-control"
 version = "0.1.0"
 dependencies = [
+ "base64",
  "centaur-iron-proxy",
  "reqwest",
  "serde",

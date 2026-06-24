@@ -435,27 +435,6 @@ impl SessionRuntime {
                 iron_control_enabled = self.iron_control.is_some(),
                 "creating or loading session"
             );
-            // Read slack_user_id before `metadata` is consumed below; it keys the
-            // 1:1 DM principal and is only known here at session creation.
-            let slack_user_id = metadata
-                .as_ref()
-                .and_then(|metadata| metadata.get("slack_user_id"))
-                .and_then(Value::as_str)
-                .map(ToOwned::to_owned);
-            // The human-readable conversation name the chat bot resolved
-            // (Slack channel/DM, Discord channel, or Linear issue), used as the
-            // principal's display name. Read it here for the same reason, before
-            // `metadata` is consumed below.
-            let conversation_name = metadata
-                .as_ref()
-                .and_then(|metadata| {
-                    metadata
-                        .get("slack_conversation_name")
-                        .or_else(|| metadata.get("discord_conversation_name"))
-                        .or_else(|| metadata.get("linear_conversation_name"))
-                })
-                .and_then(Value::as_str)
-                .map(ToOwned::to_owned);
             let mut harness_switched = false;
             let persona_resolution = self.resolve_persona_for_create(persona_id)?;
             let mut session_metadata = default_metadata(metadata);
@@ -468,7 +447,7 @@ impl SessionRuntime {
                     thread_key,
                     harness_type,
                     persona_resolution.persona_id.as_deref(),
-                    session_metadata,
+                    session_metadata.clone(),
                 )
                 .await
             {
@@ -518,11 +497,7 @@ impl SessionRuntime {
                 // to bind to, so a registration failure must fail session creation
                 // rather than silently boot a sandbox with a non-functional proxy.
                 let principal = registrar
-                    .register_session(
-                        thread_key.as_str(),
-                        slack_user_id.as_deref(),
-                        conversation_name.as_deref(),
-                    )
+                    .register_session(thread_key.as_str(), Some(&session_metadata))
                     .await?;
                 // Persist the principal OID on the session row so a resumed session
                 // can recreate its sandbox after a restart without re-deriving it.

@@ -381,6 +381,30 @@ discordbot:
   extraEnv: {}
   resources: {}
 
+# Microsoft Teams chat ingress. Forwards Teams Bot Framework activities to the
+# api-rs control plane (:8080) and renders session events back to Teams. Off by
+# default; needs a Teams app registration and Bot Framework endpoint routing.
+teamsbot:
+  enabled: false
+  replicaCount: 1
+  image:
+    repository: centaur-teamsbot
+    tag: latest
+    pullPolicy: Always
+  allowedTeamIds: ""
+  allowedChannelIds: ""
+  allowedTenantIds: ""
+  requireMention: true
+  downloadAttachments: false
+  ingress:
+    enabled: false
+    className: ""
+    annotations: {}
+    host: ""
+    tls: []
+  extraEnv: {}
+  resources: {}
+
 postgres:
   enabled: true
   image:
