@@ -28,6 +28,20 @@ def _emit(data, json_output: bool):
     return False
 
 
+def _print_attachments(message):
+    """Render a message's attachments so their id/url are visible without --json.
+
+    `discord download <channel> <message_id>` needs the attachment id, and
+    `discord download --url` needs the url, so the default output has to surface
+    them — otherwise an agent listing messages can't tell a file is there.
+    """
+    for attachment in message.get("attachments") or []:
+        console.print(
+            f"  [magenta]📎 {attachment.get('id')}[/] "
+            f"{attachment.get('filename', '')} [dim]{attachment.get('url', '')}[/]"
+        )
+
+
 @app.command()
 def me(json_output: bool = typer.Option(False, "--json", help="Output as JSON")):
     """Get info about the current user."""
@@ -104,6 +118,7 @@ def messages(
         author = message.get("author", "unknown")
         content = (message.get("content") or "").replace("\n", " ")
         console.print(f"[cyan]{author}[/] [dim]{message.get('timestamp')}[/]: {content}")
+        _print_attachments(message)
 
 
 @app.command("search")
@@ -127,6 +142,7 @@ def search(
             f"[green]{result.get('author')}[/] [dim]{result.get('timestamp')}[/]"
         )
         console.print(result.get("content", ""))
+        _print_attachments(result)
 
 
 @app.command("search-all")
@@ -146,6 +162,7 @@ def search_all(
             f"[green]{result.get('author')}[/] [dim]{result.get('timestamp')}[/]"
         )
         console.print(result.get("content", ""))
+        _print_attachments(result)
 
 
 @app.command("context")
@@ -170,6 +187,7 @@ def context(
         content = (message.get("content") or "").replace("\n", " ")
         marker = ">" if message.get("id") == message_id else " "
         console.print(f"{marker} [cyan]{author}[/] [dim]{message.get('timestamp')}[/]: {content}")
+        _print_attachments(message)
 
 
 @app.command("post")

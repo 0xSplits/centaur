@@ -4,6 +4,7 @@ import asyncio
 import os
 import re
 from typing import Any
+from urllib.parse import urlparse
 
 import httpx
 
@@ -20,6 +21,14 @@ def _run(coro):
 
 class DiscordClient:
     """High-level Discord client using a regular user token."""
+
+    # Hosts a Discord attachment ``url`` can point at. ``download_url`` refuses
+    # anything else so it can never be aimed at an internal service or metadata
+    # endpoint (it shares the cluster network with the API control plane).
+    _CDN_HOSTS = frozenset({"cdn.discordapp.com", "media.discordapp.net"})
+    # Direct-URL downloads stream to disk, but still cap the total so a hostile
+    # or accidental large URL can't fill the sandbox disk.
+    _MAX_DOWNLOAD_BYTES = 25 * 1024 * 1024
 
     def __init__(self, token: str | None = None, timeout: float = 30.0):
         self._token = token
@@ -240,7 +249,9 @@ class DiscordClient:
             target = await resolved.fetch_message(int(message_id))
             saved = []
             for attachment in target.attachments:
-                dest = os.path.join(output_dir, attachment.filename)
+                # Never let a Discord-supplied filename escape output_dir.
+                safe_name = os.path.basename(attachment.filename) or "attachment"
+                dest = os.path.join(output_dir, safe_name)
                 await attachment.save(dest)
                 saved.append(
                     {
@@ -264,19 +275,37 @@ class DiscordClient:
 
         Useful when a message listing already surfaced an attachment ``url`` and a
         gateway round-trip is unnecessary. Discord CDN links are pre-signed, so no
-        Authorization header is sent.
+        Authorization header is sent. Only ``https`` Discord CDN hosts are
+        accepted, and the response is streamed to disk with a size cap so the URL
+        can't be aimed at an internal endpoint or exhaust sandbox storage.
         """
+        parsed = urlparse(url)
+        if parsed.scheme != "https" or (parsed.hostname or "").lower() not in self._CDN_HOSTS:
+            raise ValueError(
+                "Discord downloads only accept https Discord CDN URLs "
+                f"(cdn.discordapp.com / media.discordapp.net); refusing {url!r}"
+            )
         os.makedirs(output_dir, exist_ok=True)
-        with httpx.Client(timeout=self.timeout) as client:
-            response = client.get(url)
-        if response.status_code >= 400:
-            raise RuntimeError(f"Download failed ({response.status_code}) for {url}")
-        data = response.content
-        name = filename or url.split("?")[0].rsplit("/", 1)[-1] or "download"
+        name = filename or os.path.basename(parsed.path) or "download"
         dest = os.path.join(output_dir, name)
-        with open(dest, "wb") as handle:
-            handle.write(data)
-        return {"path": dest, "size": len(data), "url": url}
+        total = 0
+        with httpx.Client(timeout=self.timeout) as client, client.stream("GET", url) as response:
+            if response.status_code >= 400:
+                raise RuntimeError(f"Discord download failed ({response.status_code}) for {url}")
+            try:
+                with open(dest, "wb") as handle:
+                    for chunk in response.iter_bytes():
+                        total += len(chunk)
+                        if total > self._MAX_DOWNLOAD_BYTES:
+                            raise ValueError(
+                                f"file exceeds the {self._MAX_DOWNLOAD_BYTES}-byte download limit"
+                            )
+                        handle.write(chunk)
+            except ValueError:
+                if os.path.exists(dest):
+                    os.unlink(dest)
+                raise
+        return {"path": dest, "size": total, "url": url}
 
     def _find_guild(self, client, guild_str: str):
         if guild_str.isdigit():
