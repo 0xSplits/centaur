@@ -2,7 +2,8 @@
 //!
 //! A principal is the identity that holds roles and owns proxies. For Centaur
 //! the principal is the conversation: a Discord **channel** (every thread in it
-//! shares one principal), or — for Slack — a **user** for a 1:1 DM and a
+//! shares one principal) or a Linear **issue** (every agent session on it shares
+//! one principal), or — for Slack — a **user** for a 1:1 DM and a
 //! **channel** for a multi-party channel/group thread. The Slack thread key is
 //! ``<source>:[<team_id>:]<conversation_id>[:<thread_ts>]`` — segments are
 //! identified by their Slack prefix rather than position, because the optional
@@ -88,6 +89,22 @@ pub fn derive_principal(
         };
     }
 
+    // Linear sessions key on the issue so every agent session on an issue shares
+    // one principal (mirrors the Slack channel model). The thread key is
+    // ``linear:<issue_id>[:…]``; ``display_name`` is the issue identifier the
+    // linearbot resolves — cosmetic, since the key stays derived from the id.
+    if let Some(issue_id) = parse_linear_issue(thread_key) {
+        let mut labels = BTreeMap::new();
+        labels.insert("linear_issue_id".to_owned(), issue_id.to_owned());
+        return PrincipalRef {
+            foreign_id: format!("linear-issue-{}", slugify(issue_id)),
+            name: display_name
+                .map(|name| format!("Linear Issue #{name}"))
+                .unwrap_or_else(|| format!("Linear Issue {issue_id}")),
+            labels,
+        };
+    }
+
     let (team_id, conversation_id) = parse_slack_segments(thread_key);
     let mut labels = BTreeMap::new();
     if let Some(team) = team_id {
@@ -162,6 +179,18 @@ fn parse_discord_segments(thread_key: &str) -> Option<(&str, Option<&str>)> {
     let guild = segments.next().filter(|guild| !guild.is_empty())?;
     let channel = segments.next().filter(|channel| !channel.is_empty());
     Some((guild, channel))
+}
+
+/// The Linear issue id from a ``linear:<issue_id>[:…]`` thread key, or ``None``
+/// when the key is not a Linear thread. The linearbot encodes every agent
+/// session on an issue with the same ``linear:<issue_id>:s:<session_id>`` key,
+/// so keying on the issue id groups one issue's sessions onto one principal.
+fn parse_linear_issue(thread_key: &str) -> Option<&str> {
+    let rest = thread_key.strip_prefix("linear:")?;
+    rest.split(':')
+        .next()
+        .map(str::trim)
+        .filter(|issue| !issue.is_empty())
 }
 
 /// Slack direct-message conversation ids start with ``D``.
@@ -281,11 +310,39 @@ mod tests {
     }
 
     #[test]
+    fn linear_sessions_key_on_the_issue() {
+        // Two agent sessions on the same issue resolve to one principal.
+        let session_a = derive_principal("linear:issue-1:s:sess-a", None, None);
+        let session_b = derive_principal("linear:issue-1:s:sess-b", None, None);
+        assert_eq!(session_a.foreign_id, "linear-issue-issue-1");
+        assert_eq!(session_a.foreign_id, session_b.foreign_id);
+        assert_eq!(session_a.name, "Linear Issue issue-1");
+        assert_eq!(
+            session_a.labels.get("linear_issue_id").map(String::as_str),
+            Some("issue-1")
+        );
+    }
+
+    #[test]
     fn discord_conversation_name_overrides_the_display_name_but_not_the_key() {
         let principal = derive_principal("discord:111:222:333", None, Some("general"));
         // Key stays derived from the ids so a channel rename never splits it.
         assert_eq!(principal.foreign_id, "discord-channel-111-222");
         assert_eq!(principal.name, "Discord Channel #general");
+    }
+
+    #[test]
+    fn linear_conversation_name_overrides_the_display_name_but_not_the_key() {
+        let principal = derive_principal("linear:issue-1:s:sess-a", None, Some("ENG-123"));
+        // Key stays derived from the issue id so a rename never splits it.
+        assert_eq!(principal.foreign_id, "linear-issue-issue-1");
+        assert_eq!(principal.name, "Linear Issue #ENG-123");
+    }
+
+    #[test]
+    fn linear_issue_level_thread_keys_on_the_issue() {
+        let principal = derive_principal("linear:issue-1", None, None);
+        assert_eq!(principal.foreign_id, "linear-issue-issue-1");
     }
 
     #[test]

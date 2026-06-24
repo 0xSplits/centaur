@@ -29,6 +29,17 @@ Optional repo-cache GitHub token:
                                -> existingSecretName) to clone tool/overlay repos.
                                Updated on every run when set, so it rotates.
 
+Optional Linear bot bootstrap (consumed when linearbot.enabled=true):
+  LINEAR_ACCESS_TOKEN          actor=app OAuth token from the Linear agent
+                               install; required together with the webhook
+                               secret (partial config fails fast)
+  LINEARBOT_WEBHOOK_SECRET     signing secret from the linearbot webhook's
+                               settings page (distinct from the linear_webhook
+                               workflow's LINEAR_WEBHOOK_SECRET — separate
+                               Linear webhook, separate secret)
+  LINEARBOT_API_KEY            bearer the bot sends to api-rs; auto-generated
+                               when absent
+
 Optional Discord ingress bootstrap (consumed when discordbot.enabled=true):
   DISCORD_BOT_TOKEN            when set, seeds the discordbot keys; requires
                                DISCORD_PUBLIC_KEY and DISCORD_APPLICATION_ID
@@ -110,6 +121,14 @@ require_env OP_VAULT
 require_env SLACK_BOT_TOKEN
 require_env SLACK_SIGNING_SECRET
 require_env SLACKBOT_API_KEY
+
+# Linear config is optional but must be complete: a token without the webhook
+# secret (or vice versa) deploys a linearbot that boots and then rejects every
+# delivery, which reads as silence.
+if [[ -n "${LINEAR_ACCESS_TOKEN:-}" || -n "${LINEARBOT_WEBHOOK_SECRET:-}" ]]; then
+  require_env LINEAR_ACCESS_TOKEN
+  require_env LINEARBOT_WEBHOOK_SECRET
+fi
 
 # Discord keys are optional as a group, but partial configuration would silently
 # seed empty values and crashloop the bot at deploy time instead of failing here.
@@ -200,6 +219,17 @@ if secret_exists centaur-infra-env; then
   if ! secret_key_present IRON_CONTROL_SECRET_KEY_BASE; then
     patch_data+=("\"IRON_CONTROL_SECRET_KEY_BASE\":\"$(printf '%s%s' "$(rand_hex)" "$(rand_hex)" | base64 | tr -d '\n')\"")
   fi
+  # Linear bot credentials. Set whenever present so the OAuth token can be
+  # rotated; the api-rs bearer is generated once and kept stable.
+  if [[ -n "${LINEAR_ACCESS_TOKEN:-}" ]]; then
+    patch_data+=("\"LINEAR_ACCESS_TOKEN\":\"$(printf '%s' "$LINEAR_ACCESS_TOKEN" | base64 | tr -d '\n')\"")
+    patch_data+=("\"LINEARBOT_WEBHOOK_SECRET\":\"$(printf '%s' "$LINEARBOT_WEBHOOK_SECRET" | base64 | tr -d '\n')\"")
+    if [[ -n "${LINEARBOT_API_KEY:-}" ]]; then
+      patch_data+=("\"LINEARBOT_API_KEY\":\"$(printf '%s' "$LINEARBOT_API_KEY" | base64 | tr -d '\n')\"")
+    elif ! secret_key_present LINEARBOT_API_KEY; then
+      patch_data+=("\"LINEARBOT_API_KEY\":\"$(rand_hex | base64 | tr -d '\n')\"")
+    fi
+  fi
   if [[ "${#patch_data[@]}" -gt 0 ]]; then
     patch_json="{\"data\":{$(IFS=,; echo "${patch_data[*]}")}}"
     kubectl -n "$NAMESPACE" patch secret centaur-infra-env --type merge -p "$patch_json" >/dev/null
@@ -252,6 +282,11 @@ else
   fi
   if [[ -n "${GITHUB_TOKEN:-}" ]]; then
     secret_args+=(--from-literal=GITHUB_TOKEN="$GITHUB_TOKEN")
+  fi
+  if [[ -n "${LINEAR_ACCESS_TOKEN:-}" ]]; then
+    secret_args+=(--from-literal=LINEAR_ACCESS_TOKEN="$LINEAR_ACCESS_TOKEN")
+    secret_args+=(--from-literal=LINEARBOT_WEBHOOK_SECRET="$LINEARBOT_WEBHOOK_SECRET")
+    secret_args+=(--from-literal=LINEARBOT_API_KEY="${LINEARBOT_API_KEY:-$(rand_hex)}")
   fi
   kubectl "${secret_args[@]}" >/dev/null
   echo "Created Secret centaur-infra-env in namespace $NAMESPACE"
