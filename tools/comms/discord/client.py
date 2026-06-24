@@ -1,22 +1,19 @@
 """Discord self-token client."""
 
-import asyncio
+import json
 import os
 import re
+import time
+from datetime import datetime, timezone
 from typing import Any
 from urllib.parse import urlparse
 
 import httpx
 
-import discord
 from centaur_sdk import secret
 
 BASE_URL = "https://discord.com/api/v10"
 INVITE_RE = re.compile(r"(?:https?://)?(?:discord(?:\.gg|\.com/invite)/)?([A-Za-z0-9-]+)")
-
-
-def _run(coro):
-    return asyncio.run(coro)
 
 
 class DiscordClient:
@@ -51,6 +48,14 @@ class DiscordClient:
         }
         with httpx.Client(timeout=self.timeout) as client:
             response = client.request(method, f"{BASE_URL}{endpoint}", headers=headers, **kwargs)
+            if response.status_code == 429:
+                try:
+                    retry_after = float(response.json().get("retry_after", 0))
+                except Exception:
+                    retry_after = 0
+                if 0 < retry_after <= self.timeout:
+                    time.sleep(retry_after)
+                    response = client.request(method, f"{BASE_URL}{endpoint}", headers=headers, **kwargs)
         if response.status_code == 204:
             return {}
         if response.status_code >= 400:
@@ -60,29 +65,6 @@ class DiscordClient:
                 message = response.text
             raise RuntimeError(f"Discord API error ({response.status_code}): {message}")
         return response.json()
-
-    async def _with_client(self, action):
-        client = discord.Client()
-        done = asyncio.Event()
-        result: Any = None
-        error: BaseException | None = None
-
-        @client.event
-        async def on_ready():
-            nonlocal result, error
-            try:
-                result = await action(client)
-            except BaseException as exc:
-                error = exc
-            finally:
-                done.set()
-                await client.close()
-
-        await client.start(self._get_token())
-        await done.wait()
-        if error:
-            raise error
-        return result
 
     def get_me(self) -> dict[str, Any]:
         """Get the current Discord user."""
@@ -103,76 +85,80 @@ class DiscordClient:
 
     def list_servers(self, query: str = "", limit: int = 100) -> list[dict[str, Any]]:
         """List joined servers/guilds."""
-
-        async def action(client):
-            rows = []
-            for guild in client.guilds:
-                if query and query.lower() not in guild.name.lower():
-                    continue
-                rows.append({"id": str(guild.id), "name": guild.name, "member_count": guild.member_count})
-                if len(rows) >= limit:
-                    break
-            return rows
-
-        return _run(self._with_client(action))
+        rows = []
+        for guild in self._request("GET", "/users/@me/guilds"):
+            if query and query.lower() not in guild.get("name", "").lower():
+                continue
+            rows.append(
+                {
+                    "id": str(guild.get("id", "")),
+                    "name": guild.get("name", ""),
+                    "member_count": guild.get("approximate_member_count"),
+                }
+            )
+            if len(rows) >= limit:
+                break
+        return rows
 
     def list_channels(self, guild: str, query: str = "") -> list[dict[str, Any]]:
         """List text channels in a server by name or ID."""
-
-        async def action(client):
-            resolved = self._find_guild(client, guild)
-            rows = []
-            for channel in resolved.text_channels:
-                if query and query.lower().lstrip("#") not in channel.name.lower():
-                    continue
-                rows.append(
-                    {
-                        "id": str(channel.id),
-                        "name": channel.name,
-                        "guild_id": str(resolved.id),
-                        "guild_name": resolved.name,
-                    }
-                )
-            return rows
-
-        return _run(self._with_client(action))
+        resolved = self._find_guild(guild)
+        rows = []
+        needle = query.lower().lstrip("#")
+        for channel in self._guild_channels(resolved["id"]):
+            if channel.get("type") != 0:
+                continue
+            if needle and needle not in channel.get("name", "").lower():
+                continue
+            rows.append(
+                {
+                    "id": str(channel.get("id", "")),
+                    "name": channel.get("name", ""),
+                    "guild_id": str(resolved["id"]),
+                    "guild_name": resolved["name"],
+                }
+            )
+        return rows
 
     def get_messages(self, channel: str, limit: int = 50) -> list[dict[str, Any]]:
         """Get recent messages from a channel by name or ID."""
-
-        async def action(client):
-            resolved = self._find_channel(client, channel)
-            messages = [self._format_message(msg) async for msg in resolved.history(limit=limit)]
-            return list(reversed(messages))
-
-        return _run(self._with_client(action))
+        resolved = self._find_channel(channel)
+        messages = self._request("GET", f"/channels/{resolved['id']}/messages", params={"limit": min(limit, 100)})
+        return list(reversed([self._format_message(msg, resolved.get("name")) for msg in messages]))
 
     def search_messages(self, query: str, channel: str, limit: int = 50) -> list[dict[str, Any]]:
         """Search recent messages in one channel by name or ID."""
-
-        async def action(client):
-            resolved = self._find_channel(client, channel)
-            rows = []
-            async for msg in resolved.history(limit=500):
-                if query.lower() in (msg.content or "").lower():
-                    rows.append(self._format_message(msg))
+        resolved = self._find_channel(channel)
+        rows = []
+        before = None
+        while len(rows) < limit:
+            params: dict[str, Any] = {"limit": 100}
+            if before:
+                params["before"] = before
+            messages = self._request("GET", f"/channels/{resolved['id']}/messages", params=params)
+            if not messages:
+                break
+            for msg in messages:
+                if query.lower() in (msg.get("content") or "").lower():
+                    rows.append(self._format_message(msg, resolved.get("name")))
                     if len(rows) >= limit:
                         break
-            return list(reversed(rows))
-
-        return _run(self._with_client(action))
+            before = messages[-1].get("id")
+        return list(reversed(rows))
 
     def search_all(self, guild: str, query: str, limit: int = 50) -> list[dict[str, Any]]:
         """Search messages across a server by name or ID."""
-
-        async def action(client):
-            resolved = self._find_guild(client, guild)
-            rows = []
-            async for msg in resolved.search(query, limit=limit):
-                rows.append(self._format_message(msg, channel_name=f"#{msg.channel.name}"))
-            return rows
-
-        return _run(self._with_client(action))
+        resolved = self._find_guild(guild)
+        channels = [c for c in self._guild_channels(resolved["id"]) if c.get("type") == 0]
+        rows = []
+        for channel in channels:
+            try:
+                rows.extend(self.search_messages(query, channel["id"], limit=limit - len(rows)))
+            except RuntimeError:
+                continue
+            if len(rows) >= limit:
+                break
+        return rows
 
     def get_context(
         self,
@@ -182,15 +168,20 @@ class DiscordClient:
         after: int = 10,
     ) -> list[dict[str, Any]]:
         """Get messages around a specific message."""
-
-        async def action(client):
-            resolved = self._find_channel(client, channel)
-            target = await resolved.fetch_message(int(message_id))
-            after_msgs = [msg async for msg in resolved.history(limit=after, after=target)]
-            before_msgs = [msg async for msg in resolved.history(limit=before, before=target)]
-            return [self._format_message(msg) for msg in [*reversed(after_msgs), target, *before_msgs]]
-
-        return _run(self._with_client(action))
+        resolved = self._find_channel(channel)
+        target = self._request("GET", f"/channels/{resolved['id']}/messages/{message_id}")
+        before_msgs = self._request(
+            "GET",
+            f"/channels/{resolved['id']}/messages",
+            params={"limit": min(before, 100), "before": message_id},
+        )
+        after_msgs = self._request(
+            "GET",
+            f"/channels/{resolved['id']}/messages",
+            params={"limit": min(after, 100), "after": message_id},
+        )
+        messages = [*reversed(after_msgs), target, *before_msgs]
+        return [self._format_message(msg, resolved.get("name")) for msg in messages]
 
     def post_message(
         self,
@@ -199,16 +190,12 @@ class DiscordClient:
         reply_to_message_id: str | None = None,
     ) -> dict[str, Any]:
         """Post a message to a channel by name or ID."""
-
-        async def action(client):
-            resolved = self._find_channel(client, channel)
-            reference = None
-            if reply_to_message_id:
-                reference = await resolved.fetch_message(int(reply_to_message_id))
-            msg = await resolved.send(content, reference=reference)
-            return self._format_message(msg)
-
-        return _run(self._with_client(action))
+        resolved = self._find_channel(channel)
+        payload: dict[str, Any] = {"content": content}
+        if reply_to_message_id:
+            payload["message_reference"] = {"message_id": reply_to_message_id}
+        msg = self._request("POST", f"/channels/{resolved['id']}/messages", json=payload)
+        return self._format_message(msg, resolved.get("name"))
 
     def upload_file(
         self,
@@ -220,20 +207,38 @@ class DiscordClient:
         """Upload a local file to a channel by name or ID, with optional message text."""
         if not os.path.isfile(file_path):
             raise FileNotFoundError(f"File not found: {file_path}")
-
-        async def action(client):
-            resolved = self._find_channel(client, channel)
-            reference = None
-            if reply_to_message_id:
-                reference = await resolved.fetch_message(int(reply_to_message_id))
-            msg = await resolved.send(
-                content or None,
-                file=discord.File(file_path),
-                reference=reference,
-            )
-            return self._format_message(msg)
-
-        return _run(self._with_client(action))
+        resolved = self._find_channel(channel)
+        payload: dict[str, Any] = {}
+        if content:
+            payload["content"] = content
+        if reply_to_message_id:
+            payload["message_reference"] = {"message_id": reply_to_message_id}
+        # Multipart upload: the JSON body rides in ``payload_json`` and the file in
+        # ``files[0]``. The shared ``_request`` always sends a JSON content type, so
+        # this request is issued directly, letting httpx set the multipart boundary.
+        headers = {
+            "Authorization": self._get_token(),
+            "User-Agent": (
+                "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+                "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+            ),
+        }
+        with open(file_path, "rb") as handle:
+            files = {"files[0]": (os.path.basename(file_path), handle)}
+            with httpx.Client(timeout=self.timeout) as client:
+                response = client.post(
+                    f"{BASE_URL}/channels/{resolved['id']}/messages",
+                    headers=headers,
+                    data={"payload_json": json.dumps(payload)},
+                    files=files,
+                )
+        if response.status_code >= 400:
+            try:
+                message = response.json().get("message", response.text)
+            except Exception:
+                message = response.text
+            raise RuntimeError(f"Discord API error ({response.status_code}): {message}")
+        return self._format_message(response.json(), resolved.get("name"))
 
     def download_message_attachments(
         self,
@@ -242,28 +247,27 @@ class DiscordClient:
         output_dir: str = ".",
     ) -> list[dict[str, Any]]:
         """Download every attachment on a specific message into output_dir."""
+        resolved = self._find_channel(channel)
+        target = self._request("GET", f"/channels/{resolved['id']}/messages/{message_id}")
         os.makedirs(output_dir, exist_ok=True)
-
-        async def action(client):
-            resolved = self._find_channel(client, channel)
-            target = await resolved.fetch_message(int(message_id))
-            saved = []
-            for attachment in target.attachments:
-                # Never let a Discord-supplied filename escape output_dir.
-                safe_name = os.path.basename(attachment.filename) or "attachment"
-                dest = os.path.join(output_dir, safe_name)
-                await attachment.save(dest)
-                saved.append(
-                    {
-                        "filename": attachment.filename,
-                        "path": dest,
-                        "size": getattr(attachment, "size", None),
-                        "url": attachment.url,
-                    }
-                )
-            return saved
-
-        return _run(self._with_client(action))
+        saved = []
+        for attachment in target.get("attachments") or []:
+            url = attachment.get("url")
+            if not url:
+                continue
+            filename = attachment.get("filename") or "attachment"
+            # Never let a Discord-supplied filename escape output_dir.
+            safe_name = os.path.basename(filename) or "attachment"
+            result = self.download_url(url, output_dir=output_dir, filename=safe_name)
+            saved.append(
+                {
+                    "filename": filename,
+                    "path": result["path"],
+                    "size": result.get("size"),
+                    "url": url,
+                }
+            )
+        return saved
 
     def download_url(
         self,
@@ -307,57 +311,91 @@ class DiscordClient:
                 raise
         return {"path": dest, "size": total, "url": url}
 
-    def _find_guild(self, client, guild_str: str):
+    def _guild_channels(self, guild_id: str) -> list[dict[str, Any]]:
+        return list(self._request("GET", f"/guilds/{guild_id}/channels"))
+
+    def _find_guild(self, guild_str: str) -> dict[str, Any]:
+        guilds = list(self._request("GET", "/users/@me/guilds"))
         if guild_str.isdigit():
-            guild = client.get_guild(int(guild_str))
-            if guild:
-                return guild
-        for guild in client.guilds:
-            if guild.name.lower() == guild_str.lower():
-                return guild
-        for guild in client.guilds:
-            if guild_str.lower() in guild.name.lower():
-                return guild
+            for guild in guilds:
+                if guild.get("id") == guild_str:
+                    return {"id": str(guild["id"]), "name": guild.get("name", "")}
+        for guild in guilds:
+            if guild.get("name", "").lower() == guild_str.lower():
+                return {"id": str(guild["id"]), "name": guild.get("name", "")}
+        for guild in guilds:
+            if guild_str.lower() in guild.get("name", "").lower():
+                return {"id": str(guild["id"]), "name": guild.get("name", "")}
         raise RuntimeError(f"Guild not found: {guild_str}")
 
-    def _find_channel(self, client, channel_str: str):
+    def _find_channel(self, channel_str: str) -> dict[str, Any]:
         if channel_str.isdigit():
-            channel = client.get_channel(int(channel_str))
-            if channel:
-                return channel
+            channel = dict(self._request("GET", f"/channels/{channel_str}"))
+            return {
+                "id": str(channel["id"]),
+                "name": channel.get("name"),
+                "guild_id": str(channel.get("guild_id", "")),
+                "guild_name": None,
+            }
         needle = channel_str.lstrip("#").lower()
-        for guild in client.guilds:
-            for channel in guild.text_channels:
-                if channel.name.lower() == needle:
-                    return channel
-        for guild in client.guilds:
-            for channel in guild.text_channels:
-                if needle in channel.name.lower():
-                    return channel
+        partial = None
+        for guild in self._request("GET", "/users/@me/guilds"):
+            for channel in self._guild_channels(guild["id"]):
+                if channel.get("type") != 0:
+                    continue
+                name = channel.get("name", "")
+                if name.lower() == needle:
+                    return {
+                        "id": str(channel["id"]),
+                        "name": name,
+                        "guild_id": str(guild["id"]),
+                        "guild_name": guild.get("name"),
+                    }
+                if partial is None and needle in name.lower():
+                    partial = {
+                        "id": str(channel["id"]),
+                        "name": name,
+                        "guild_id": str(guild["id"]),
+                        "guild_name": guild.get("name"),
+                    }
+        if partial:
+            return partial
         raise RuntimeError(f"Channel not found: {channel_str}")
 
-    def _format_message(self, msg, channel_name: str | None = None) -> dict[str, Any]:
+    def _format_message(self, msg: dict[str, Any], channel_name: str | None = None) -> dict[str, Any]:
+        author = msg.get("author") or {}
         return {
-            "id": str(msg.id),
-            "channel_id": str(msg.channel.id),
-            "channel_name": channel_name or getattr(msg.channel, "name", None),
-            "author": getattr(msg.author, "display_name", None) or str(msg.author),
-            "author_id": str(msg.author.id),
-            "timestamp": msg.created_at.isoformat(),
-            "content": msg.content or "",
-            "reply_to": str(msg.reference.message_id) if msg.reference else None,
+            "id": str(msg.get("id", "")),
+            "channel_id": str(msg.get("channel_id", "")),
+            "channel_name": channel_name,
+            "author": author.get("global_name") or author.get("username") or "",
+            "author_id": str(author.get("id", "")),
+            "timestamp": _format_timestamp(msg),
+            "content": msg.get("content") or "",
+            "reply_to": ((msg.get("message_reference") or {}).get("message_id")),
             "attachments": [
                 {
-                    "id": str(attachment.id),
-                    "filename": attachment.filename,
-                    "url": attachment.url,
-                    "size": getattr(attachment, "size", None),
-                    "content_type": getattr(attachment, "content_type", None),
+                    "id": str(attachment.get("id", "")),
+                    "filename": attachment.get("filename"),
+                    "url": attachment.get("url"),
+                    "size": attachment.get("size"),
+                    "content_type": attachment.get("content_type"),
                 }
-                for attachment in getattr(msg, "attachments", None) or []
+                for attachment in (msg.get("attachments") or [])
             ],
         }
 
 
 def _client() -> DiscordClient:
     return DiscordClient()
+
+
+def _format_timestamp(msg: dict[str, Any]) -> str:
+    timestamp = msg.get("timestamp")
+    if timestamp:
+        return str(timestamp)
+    snowflake = msg.get("id")
+    if not snowflake:
+        return ""
+    created_ms = (int(snowflake) >> 22) + 1420070400000
+    return datetime.fromtimestamp(created_ms / 1000, tz=timezone.utc).isoformat()
