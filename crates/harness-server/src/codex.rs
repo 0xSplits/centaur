@@ -302,15 +302,22 @@ fn run_codex_user_turn<W: Write>(
                 HarnessServerError::Protocol("turn/start response missing turn.id".to_string())
             })?
             .to_string();
-        let retry_allowed = retries < max_retries;
         match codex.read_until_turn_terminal(
             stdout,
             thread_id.as_deref().unwrap_or_default(),
             &turn_id,
-            retry_allowed,
         )? {
             TurnTermination::Done => return Ok(()),
-            TurnTermination::RetriableEngineError => {
+            TurnTermination::RetriableEngineError { withheld } => {
+                if retries >= max_retries {
+                    // Out of retry budget: release the withheld `systemError`
+                    // status and error so the client sees the real failure.
+                    // This is also the `CODEX_ENGINE_RETRY_MAX=0` fail-fast path.
+                    for value in &withheld {
+                        write_value(stdout, value)?;
+                    }
+                    return Ok(());
+                }
                 retries += 1;
                 eprintln!(
                     "codex turn hit a transient engine-registration error; \
@@ -487,16 +494,16 @@ impl CodexJsonRpcChild {
     }
 
     /// Drives a codex turn to its terminal notification, forwarding events to
-    /// `stdout`. When `retry_allowed` is true and the turn fails with a
-    /// transient engine-registration error before streaming any output, the
-    /// error (and the `systemError` status that precedes it) are withheld and
-    /// `RetriableEngineError` is returned so the caller can re-submit the turn.
+    /// `stdout`. If the turn fails with a transient engine-registration error
+    /// before streaming any output, the error (and the `systemError` status that
+    /// precedes it) are withheld and handed back via `RetriableEngineError` so
+    /// the caller can either drop them and re-submit the turn, or forward them
+    /// once its retry budget is spent.
     fn read_until_turn_terminal<W: Write>(
         &mut self,
         stdout: &mut W,
         thread_id: &str,
         turn_id: &str,
-        retry_allowed: bool,
     ) -> Result<TurnTermination> {
         let mut guard = TurnGuard::default();
         loop {
@@ -509,8 +516,10 @@ impl CodexJsonRpcChild {
                 continue;
             }
             let terminal = is_terminal_notification(&value, thread_id, turn_id);
-            match guard.observe(value, retry_allowed, terminal) {
-                GuardStep::Retry => return Ok(TurnTermination::RetriableEngineError),
+            match guard.observe(value, terminal) {
+                GuardStep::Retry(withheld) => {
+                    return Ok(TurnTermination::RetriableEngineError { withheld });
+                }
                 GuardStep::Forward(values) => {
                     for value in &values {
                         write_value(stdout, value)?;
@@ -557,9 +566,10 @@ enum TurnTermination {
     /// error); everything that needed forwarding has been forwarded.
     Done,
     /// The turn failed with a transient engine-registration error before
-    /// streaming any output. The error was withheld so the caller can
-    /// re-submit the same turn.
-    RetriableEngineError,
+    /// streaming any output. The `systemError` status and error notification
+    /// were withheld so the caller can drop them and re-submit the turn, or
+    /// forward them once its retry budget is spent.
+    RetriableEngineError { withheld: Vec<Value> },
 }
 
 /// Per-turn notification filter. Sits between codex's stdout and the client so
@@ -582,25 +592,26 @@ enum GuardStep {
     Forward(Vec<Value>),
     /// Forward these notifications (in order); the turn is then terminal.
     ForwardThenDone(Vec<Value>),
-    /// Swallow the current (retriable) error; the caller may re-submit the turn.
-    Retry,
+    /// Withhold these (retriable) notifications; the caller drops them and
+    /// re-submits the turn, or forwards them if it is out of retry budget.
+    Retry(Vec<Value>),
 }
 
 impl TurnGuard {
-    fn observe(&mut self, value: Value, retry_allowed: bool, terminal: bool) -> GuardStep {
+    fn observe(&mut self, value: Value, terminal: bool) -> GuardStep {
         // Owned so `value` can be moved into `pending_system_error`/`out` below.
         let method = notification_method(&value).unwrap_or_default().to_owned();
 
-        // A retriable engine error before any output: swallow it (and the
-        // `systemError` status we were holding) so the caller can retry.
-        if terminal
-            && method == "error"
-            && retry_allowed
-            && !self.streamed
-            && is_retriable_engine_error(&value)
-        {
-            self.pending_system_error = None;
-            return GuardStep::Retry;
+        // A retriable engine error before any output: withhold it (and the
+        // `systemError` status we were holding) and hand both back so the caller
+        // can drop them on retry or forward them once out of budget.
+        if terminal && method == "error" && !self.streamed && is_retriable_engine_error(&value) {
+            let mut withheld = Vec::new();
+            if let Some(status) = self.pending_system_error.take() {
+                withheld.push(status);
+            }
+            withheld.push(value);
+            return GuardStep::Retry(withheld);
         }
 
         // We are forwarding `value`; release any held status first to preserve
@@ -613,7 +624,7 @@ impl TurnGuard {
         // Defer a `systemError` status: it usually precedes the engine error,
         // and if we end up retrying we want to drop it rather than flicker a
         // failed status at the client.
-        if retry_allowed && !self.streamed && is_system_error_status(&value) {
+        if !self.streamed && is_system_error_status(&value) {
             self.pending_system_error = Some(value);
             return GuardStep::Forward(out);
         }
@@ -809,21 +820,24 @@ mod tests {
     }
 
     /// Runs a `(notification, is_terminal)` sequence through a `TurnGuard` and
-    /// returns the methods actually forwarded plus whether a retry was signalled.
-    fn drive(events: Vec<(Value, bool)>, retry_allowed: bool) -> (Vec<String>, bool) {
+    /// returns the methods forwarded plus, when a retry is signalled, the methods
+    /// withheld for the caller to drop (on retry) or forward (out of budget).
+    fn drive(events: Vec<(Value, bool)>) -> (Vec<String>, Option<Vec<String>>) {
         let mut guard = TurnGuard::default();
         let mut forwarded = Vec::new();
         for (value, terminal) in events {
-            match guard.observe(value, retry_allowed, terminal) {
-                GuardStep::Retry => return (methods(&forwarded), true),
+            match guard.observe(value, terminal) {
+                GuardStep::Retry(withheld) => {
+                    return (methods(&forwarded), Some(methods(&withheld)));
+                }
                 GuardStep::Forward(values) => forwarded.extend(values),
                 GuardStep::ForwardThenDone(values) => {
                     forwarded.extend(values);
-                    return (methods(&forwarded), false);
+                    return (methods(&forwarded), None);
                 }
             }
         }
-        (methods(&forwarded), false)
+        (methods(&forwarded), None)
     }
 
     fn methods(values: &[Value]) -> Vec<String> {
@@ -879,52 +893,35 @@ mod tests {
     }
 
     #[test]
-    fn swallows_output_free_engine_error_for_retry() {
+    fn withholds_output_free_engine_error_for_retry() {
         // Cold engine: status + error arrive before any output, so both are
-        // withheld and the caller is told to retry.
-        let (forwarded, retried) = drive(
-            vec![
-                (turn_started(), false),
-                (system_error_status(), false),
-                (engine_error(), true),
-            ],
-            true,
-        );
-        assert!(retried);
+        // withheld (handed back to the caller) and a retry is signalled. The
+        // withheld pair is exactly what the caller forwards once out of budget.
+        let (forwarded, withheld) = drive(vec![
+            (turn_started(), false),
+            (system_error_status(), false),
+            (engine_error(), true),
+        ]);
         assert_eq!(forwarded, vec!["turn/started"]);
-    }
-
-    #[test]
-    fn forwards_engine_error_when_no_retry_budget() {
-        // With retries exhausted the failure (and its status) reach the client.
-        let (forwarded, retried) = drive(
-            vec![
-                (turn_started(), false),
-                (system_error_status(), false),
-                (engine_error(), true),
-            ],
-            false,
-        );
-        assert!(!retried);
         assert_eq!(
-            forwarded,
-            vec!["turn/started", "thread/status/changed", "error"]
+            withheld,
+            Some(vec![
+                "thread/status/changed".to_string(),
+                "error".to_string(),
+            ])
         );
     }
 
     #[test]
     fn never_retries_after_output_streamed() {
         // The engine dropped mid-turn after streaming: retrying would duplicate
-        // output, so the error is forwarded even with budget remaining.
-        let (forwarded, retried) = drive(
-            vec![
-                (agent_delta(), false),
-                (system_error_status(), false),
-                (engine_error(), true),
-            ],
-            true,
-        );
-        assert!(!retried);
+        // output, so the error is forwarded rather than withheld.
+        let (forwarded, withheld) = drive(vec![
+            (agent_delta(), false),
+            (system_error_status(), false),
+            (engine_error(), true),
+        ]);
+        assert_eq!(withheld, None);
         assert_eq!(
             forwarded,
             vec!["item/agentMessage/delta", "thread/status/changed", "error"]
@@ -938,15 +935,12 @@ mod tests {
             "method": "error",
             "params": { "error": { "message": "boom" } }
         });
-        let (forwarded, retried) = drive(
-            vec![
-                (turn_started(), false),
-                (system_error_status(), false),
-                (other_error, true),
-            ],
-            true,
-        );
-        assert!(!retried);
+        let (forwarded, withheld) = drive(vec![
+            (turn_started(), false),
+            (system_error_status(), false),
+            (other_error, true),
+        ]);
+        assert_eq!(withheld, None);
         assert_eq!(
             forwarded,
             vec!["turn/started", "thread/status/changed", "error"]
