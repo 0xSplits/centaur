@@ -37,8 +37,8 @@ use centaur_telemetry::{
     record_http_request_started,
 };
 use centaur_workflows::{
-    CreateWorkflowRunRequest, WorkflowRuntime, WorkflowWebhookAuth, WorkflowWebhookSpec,
-    WorkflowWebhookTriggerKey,
+    CreateWorkflowRunRequest, WebhookFilter, WorkflowRuntime, WorkflowWebhookAuth,
+    WorkflowWebhookSpec, WorkflowWebhookTriggerKey,
 };
 use futures_util::{Stream, StreamExt};
 use hmac::{Hmac, Mac};
@@ -46,7 +46,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use sqlx::PgPool;
-use time::OffsetDateTime;
+use time::{Duration as TimeDuration, OffsetDateTime};
 use tower_http::trace::TraceLayer;
 use tracing::Span;
 use uuid::Uuid;
@@ -240,6 +240,14 @@ pub fn build_router_with_app_state(state: AppState) -> Router {
         .route(
             "/api/admin/slack/archive-imports/{import_id}/retry",
             post(retry_slack_archive_import),
+        )
+        .route(
+            "/api/admin/slack/dm-sync/checkpoints",
+            get(list_slack_dm_sync_checkpoints),
+        )
+        .route(
+            "/api/admin/slack/dm-sync/batch",
+            post(ingest_slack_dm_sync_batch).layer(DefaultBodyLimit::disable()),
         )
         .route("/api/webhooks/{slug}", any(invoke_workflow_webhook))
         .layer(
@@ -605,6 +613,184 @@ workflow_run_id, workflow_task_id, channels_imported, users_imported, messages_i
 error_text, created_by, uploaded_at, started_at, finished_at, upload_url_expires_at, created_at, \
 updated_at, metadata";
 
+#[derive(Debug, Deserialize)]
+struct ListSlackDmSyncCheckpointsQuery {
+    broker_credential_id: String,
+    #[serde(default)]
+    home_team_id: Option<String>,
+}
+
+#[derive(Debug, Serialize, sqlx::FromRow)]
+struct SlackDmSyncCheckpointResponse {
+    broker_credential_id: String,
+    home_team_id: String,
+    conversation_id: String,
+    watermark_ts: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct SlackDmSyncBatchRequest {
+    #[serde(default)]
+    run: Option<SlackDmSyncRunPayload>,
+    #[serde(default)]
+    replace_memberships: bool,
+    #[serde(default)]
+    conversations: Vec<SlackDmSyncConversationPayload>,
+    #[serde(default)]
+    members: Vec<SlackDmSyncMemberPayload>,
+    #[serde(default)]
+    messages: Vec<SlackDmSyncMessagePayload>,
+    #[serde(default)]
+    attachments: Vec<SlackDmSyncAttachmentPayload>,
+    #[serde(default)]
+    checkpoints: Vec<SlackDmSyncCheckpointPayload>,
+}
+
+#[derive(Debug, Deserialize)]
+struct SlackDmSyncRunPayload {
+    run_id: String,
+    #[serde(default)]
+    workflow_run_id: Option<String>,
+    #[serde(default = "default_slack_dm_sync_mode")]
+    mode: String,
+    status: String,
+    broker_credential_id: String,
+    source_user_id: String,
+    home_team_id: String,
+    #[serde(default)]
+    conversations_requested: i32,
+    #[serde(default)]
+    conversations_synced: i32,
+    #[serde(default)]
+    conversations_failed: i32,
+    #[serde(default)]
+    messages_fetched: i32,
+    #[serde(default)]
+    messages_upserted: i32,
+    #[serde(default)]
+    replies_fetched: i32,
+    #[serde(default)]
+    replies_upserted: i32,
+    #[serde(default)]
+    finished: bool,
+    #[serde(default)]
+    error_text: String,
+    #[serde(default = "empty_object")]
+    metadata: Value,
+}
+
+#[derive(Debug, Deserialize)]
+struct SlackDmSyncConversationPayload {
+    home_team_id: String,
+    conversation_id: String,
+    conversation_type: String,
+    #[serde(default)]
+    is_archived: bool,
+    #[serde(default)]
+    is_ext_shared: bool,
+    #[serde(default = "empty_object")]
+    raw_payload: Value,
+}
+
+#[derive(Debug, Deserialize)]
+struct SlackDmSyncMemberPayload {
+    home_team_id: String,
+    conversation_id: String,
+    user_id: String,
+    #[serde(default)]
+    user_team_id: Option<String>,
+    #[serde(default)]
+    is_external: bool,
+    #[serde(default = "default_true")]
+    is_current_member: bool,
+    #[serde(default = "empty_object")]
+    raw_payload: Value,
+}
+
+#[derive(Debug, Deserialize)]
+struct SlackDmSyncMessagePayload {
+    home_team_id: String,
+    conversation_id: String,
+    message_ts: String,
+    #[serde(default)]
+    thread_ts: Option<String>,
+    #[serde(default)]
+    parent_message_ts: Option<String>,
+    #[serde(default)]
+    is_thread_root: bool,
+    #[serde(default)]
+    user_id: String,
+    #[serde(default)]
+    user_team_id: Option<String>,
+    #[serde(default)]
+    bot_id: String,
+    #[serde(default = "default_slack_message_type")]
+    message_type: String,
+    #[serde(default)]
+    message_subtype: Option<String>,
+    #[serde(default)]
+    text: String,
+    #[serde(default)]
+    permalink: String,
+    #[serde(default)]
+    reply_count: i32,
+    #[serde(default = "empty_array")]
+    reply_users: Value,
+    #[serde(default)]
+    latest_reply_ts: Option<String>,
+    #[serde(default)]
+    thread_refreshed: bool,
+    #[serde(default = "empty_object")]
+    raw_payload: Value,
+    #[serde(default)]
+    source_run_id: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct SlackDmSyncAttachmentPayload {
+    home_team_id: String,
+    conversation_id: String,
+    message_ts: String,
+    slack_file_id: String,
+    #[serde(default)]
+    name: String,
+    #[serde(default)]
+    title: String,
+    #[serde(default)]
+    mimetype: String,
+    #[serde(default)]
+    filetype: String,
+    #[serde(default)]
+    size_bytes: i64,
+    #[serde(default)]
+    url_private: String,
+    #[serde(default)]
+    permalink: String,
+    #[serde(default = "default_attachment_download_status")]
+    download_status: String,
+    #[serde(default)]
+    download_error: String,
+    #[serde(default)]
+    content_sha256: Option<String>,
+    #[serde(default = "empty_object")]
+    raw_payload: Value,
+    #[serde(default)]
+    source_run_id: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct SlackDmSyncCheckpointPayload {
+    broker_credential_id: String,
+    home_team_id: String,
+    conversation_id: String,
+    #[serde(default)]
+    watermark_ts: Option<String>,
+    #[serde(default)]
+    last_run_id: Option<String>,
+    #[serde(default)]
+    last_error: String,
+}
+
 impl From<SlackArchiveImportRow> for SlackArchiveImportResponse {
     fn from(row: SlackArchiveImportRow) -> Self {
         Self {
@@ -918,6 +1104,265 @@ async fn retry_slack_archive_import(
     ))
 }
 
+async fn list_slack_dm_sync_checkpoints(
+    State(state): State<AppState>,
+    Query(query): Query<ListSlackDmSyncCheckpointsQuery>,
+) -> Result<Json<Value>, ApiError> {
+    let pool = db_pool(&state)?;
+    require_non_empty("broker_credential_id", &query.broker_credential_id)?;
+    let rows = sqlx::query_as::<_, SlackDmSyncCheckpointResponse>(
+        "SELECT broker_credential_id, home_team_id, conversation_id, watermark_ts \
+         FROM slack_dm_sync_checkpoints \
+         WHERE broker_credential_id = $1 \
+         AND ($2::text IS NULL OR home_team_id = $2) \
+         ORDER BY home_team_id, conversation_id",
+    )
+    .bind(&query.broker_credential_id)
+    .bind(
+        query
+            .home_team_id
+            .as_deref()
+            .filter(|value| !value.is_empty()),
+    )
+    .fetch_all(&pool)
+    .await?;
+
+    Ok(Json(json!({ "ok": true, "checkpoints": rows })))
+}
+
+async fn ingest_slack_dm_sync_batch(
+    State(state): State<AppState>,
+    Json(request): Json<SlackDmSyncBatchRequest>,
+) -> Result<Json<Value>, ApiError> {
+    validate_slack_dm_sync_batch(&request)?;
+    let pool = db_pool(&state)?;
+    let mut tx = pool.begin().await?;
+
+    if let Some(run) = &request.run {
+        upsert_slack_dm_sync_run(&mut tx, run).await?;
+    }
+
+    for conversation in &request.conversations {
+        sqlx::query(
+            "INSERT INTO slack_dm_sync_conversations (\
+             home_team_id, conversation_id, conversation_type, is_archived, is_ext_shared, \
+             raw_payload, last_seen_at, updated_at\
+             ) VALUES ($1, $2, $3, $4, $5, $6::jsonb, NOW(), NOW()) \
+             ON CONFLICT (home_team_id, conversation_id) DO UPDATE SET \
+             conversation_type = EXCLUDED.conversation_type, \
+             is_archived = EXCLUDED.is_archived, \
+             is_ext_shared = EXCLUDED.is_ext_shared, \
+             raw_payload = EXCLUDED.raw_payload, \
+             last_seen_at = NOW(), \
+             updated_at = NOW()",
+        )
+        .bind(&conversation.home_team_id)
+        .bind(&conversation.conversation_id)
+        .bind(&conversation.conversation_type)
+        .bind(conversation.is_archived)
+        .bind(conversation.is_ext_shared)
+        .bind(&conversation.raw_payload)
+        .execute(&mut *tx)
+        .await?;
+    }
+
+    if request.replace_memberships {
+        let mut conversations = BTreeMap::new();
+        for member in &request.members {
+            conversations.insert(
+                (member.home_team_id.clone(), member.conversation_id.clone()),
+                true,
+            );
+        }
+        for ((home_team_id, conversation_id), _) in conversations {
+            sqlx::query(
+                "UPDATE slack_dm_sync_conversation_members \
+                 SET is_current_member = false, updated_at = NOW() \
+                 WHERE home_team_id = $1 AND conversation_id = $2",
+            )
+            .bind(home_team_id)
+            .bind(conversation_id)
+            .execute(&mut *tx)
+            .await?;
+        }
+    }
+
+    for member in &request.members {
+        sqlx::query(
+            "INSERT INTO slack_dm_sync_conversation_members (\
+             home_team_id, conversation_id, user_id, user_team_id, is_external, \
+             is_current_member, raw_payload, last_seen_at, updated_at\
+             ) VALUES ($1, $2, $3, $4, $5, $6, $7::jsonb, NOW(), NOW()) \
+             ON CONFLICT (home_team_id, conversation_id, user_id) DO UPDATE SET \
+             user_team_id = EXCLUDED.user_team_id, \
+             is_external = EXCLUDED.is_external, \
+             is_current_member = EXCLUDED.is_current_member, \
+             raw_payload = EXCLUDED.raw_payload, \
+             last_seen_at = NOW(), \
+             updated_at = NOW()",
+        )
+        .bind(&member.home_team_id)
+        .bind(&member.conversation_id)
+        .bind(&member.user_id)
+        .bind(&member.user_team_id)
+        .bind(member.is_external)
+        .bind(member.is_current_member)
+        .bind(&member.raw_payload)
+        .execute(&mut *tx)
+        .await?;
+    }
+
+    for message in &request.messages {
+        let occurred_at = slack_ts_to_datetime(Some(&message.message_ts))?;
+        let thread_refreshed_at = if message.thread_refreshed {
+            Some(OffsetDateTime::now_utc())
+        } else {
+            None
+        };
+        sqlx::query(
+            "INSERT INTO slack_dm_sync_messages (\
+             home_team_id, conversation_id, message_ts, occurred_at, thread_ts, \
+             parent_message_ts, is_thread_root, user_id, user_team_id, bot_id, \
+             message_type, message_subtype, text, permalink, reply_count, reply_users, \
+             latest_reply_ts, thread_refreshed_at, raw_payload, source_run_id, \
+             last_seen_at, updated_at\
+             ) VALUES (\
+             $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, \
+             $11, $12, $13, $14, $15, $16::jsonb, $17, $18, $19::jsonb, $20, \
+             NOW(), NOW()) \
+             ON CONFLICT (home_team_id, conversation_id, message_ts) DO UPDATE SET \
+             occurred_at = EXCLUDED.occurred_at, \
+             thread_ts = EXCLUDED.thread_ts, \
+             parent_message_ts = EXCLUDED.parent_message_ts, \
+             is_thread_root = EXCLUDED.is_thread_root, \
+             user_id = EXCLUDED.user_id, \
+             user_team_id = EXCLUDED.user_team_id, \
+             bot_id = EXCLUDED.bot_id, \
+             message_type = EXCLUDED.message_type, \
+             message_subtype = EXCLUDED.message_subtype, \
+             text = EXCLUDED.text, \
+             permalink = EXCLUDED.permalink, \
+             reply_count = EXCLUDED.reply_count, \
+             reply_users = EXCLUDED.reply_users, \
+             latest_reply_ts = EXCLUDED.latest_reply_ts, \
+             thread_refreshed_at = COALESCE(EXCLUDED.thread_refreshed_at, slack_dm_sync_messages.thread_refreshed_at), \
+             raw_payload = EXCLUDED.raw_payload, \
+             source_run_id = COALESCE(EXCLUDED.source_run_id, slack_dm_sync_messages.source_run_id), \
+             last_seen_at = NOW(), \
+             updated_at = NOW()",
+        )
+        .bind(&message.home_team_id)
+        .bind(&message.conversation_id)
+        .bind(&message.message_ts)
+        .bind(occurred_at)
+        .bind(empty_to_none(message.thread_ts.as_deref()))
+        .bind(empty_to_none(message.parent_message_ts.as_deref()))
+        .bind(message.is_thread_root)
+        .bind(&message.user_id)
+        .bind(&message.user_team_id)
+        .bind(&message.bot_id)
+        .bind(&message.message_type)
+        .bind(&message.message_subtype)
+        .bind(&message.text)
+        .bind(&message.permalink)
+        .bind(message.reply_count)
+        .bind(&message.reply_users)
+        .bind(empty_to_none(message.latest_reply_ts.as_deref()))
+        .bind(thread_refreshed_at)
+        .bind(&message.raw_payload)
+        .bind(empty_to_none(message.source_run_id.as_deref()))
+        .execute(&mut *tx)
+        .await?;
+    }
+
+    for attachment in &request.attachments {
+        sqlx::query(
+            "INSERT INTO slack_dm_sync_message_attachments (\
+             home_team_id, conversation_id, message_ts, slack_file_id, name, title, \
+             mimetype, filetype, size_bytes, url_private, permalink, download_status, \
+             download_error, content_sha256, raw_payload, source_run_id, last_seen_at, updated_at\
+             ) VALUES (\
+             $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, \
+             $13, $14, $15::jsonb, $16, NOW(), NOW()) \
+             ON CONFLICT (home_team_id, conversation_id, message_ts, slack_file_id) DO UPDATE SET \
+             name = EXCLUDED.name, \
+             title = EXCLUDED.title, \
+             mimetype = EXCLUDED.mimetype, \
+             filetype = EXCLUDED.filetype, \
+             size_bytes = EXCLUDED.size_bytes, \
+             url_private = EXCLUDED.url_private, \
+             permalink = EXCLUDED.permalink, \
+             download_status = EXCLUDED.download_status, \
+             download_error = EXCLUDED.download_error, \
+             content_sha256 = EXCLUDED.content_sha256, \
+             raw_payload = EXCLUDED.raw_payload, \
+             source_run_id = COALESCE(EXCLUDED.source_run_id, slack_dm_sync_message_attachments.source_run_id), \
+             last_seen_at = NOW(), \
+             updated_at = NOW()",
+        )
+        .bind(&attachment.home_team_id)
+        .bind(&attachment.conversation_id)
+        .bind(&attachment.message_ts)
+        .bind(&attachment.slack_file_id)
+        .bind(&attachment.name)
+        .bind(&attachment.title)
+        .bind(&attachment.mimetype)
+        .bind(&attachment.filetype)
+        .bind(attachment.size_bytes)
+        .bind(&attachment.url_private)
+        .bind(&attachment.permalink)
+        .bind(&attachment.download_status)
+        .bind(&attachment.download_error)
+        .bind(&attachment.content_sha256)
+        .bind(&attachment.raw_payload)
+        .bind(empty_to_none(attachment.source_run_id.as_deref()))
+        .execute(&mut *tx)
+        .await?;
+    }
+
+    for checkpoint in &request.checkpoints {
+        let last_success_at = if checkpoint.last_error.trim().is_empty() {
+            Some(OffsetDateTime::now_utc())
+        } else {
+            None
+        };
+        sqlx::query(
+            "INSERT INTO slack_dm_sync_checkpoints (\
+             broker_credential_id, home_team_id, conversation_id, watermark_ts, \
+             last_run_id, last_success_at, last_error, updated_at\
+             ) VALUES ($1, $2, $3, $4, $5, $6, $7, NOW()) \
+             ON CONFLICT (broker_credential_id, home_team_id, conversation_id) DO UPDATE SET \
+             watermark_ts = EXCLUDED.watermark_ts, \
+             last_run_id = EXCLUDED.last_run_id, \
+             last_success_at = COALESCE(EXCLUDED.last_success_at, slack_dm_sync_checkpoints.last_success_at), \
+             last_error = EXCLUDED.last_error, \
+             updated_at = NOW()",
+        )
+        .bind(&checkpoint.broker_credential_id)
+        .bind(&checkpoint.home_team_id)
+        .bind(&checkpoint.conversation_id)
+        .bind(empty_to_none(checkpoint.watermark_ts.as_deref()))
+        .bind(empty_to_none(checkpoint.last_run_id.as_deref()))
+        .bind(last_success_at)
+        .bind(&checkpoint.last_error)
+        .execute(&mut *tx)
+        .await?;
+    }
+
+    tx.commit().await?;
+
+    Ok(Json(json!({
+        "ok": true,
+        "counts": {
+            "conversations": request.conversations.len(),
+            "members": request.members.len(),
+            "messages": request.messages.len(),
+            "attachments": request.attachments.len(),
+            "checkpoints": request.checkpoints.len(),
+        }
+    })))
+}
+
 async fn create_workflow_run(
     State(state): State<AppState>,
     Json(request): Json<CreateWorkflowRunRequest>,
@@ -1016,6 +1461,18 @@ async fn invoke_workflow_webhook(
 
     let raw_body_sha256 = hex::encode(Sha256::digest(&raw_body));
     let body = parse_webhook_body(&headers, &raw_body)?;
+
+    // Edge pre-filter: drop events no handler could match, in-process, before
+    // spawning a sandbox-backed run. Keeps org-wide webhooks cheap.
+    if let Some(filter) = &spec.filter
+        && !webhook_filter_matches(filter, &headers, &body)
+    {
+        return Ok((
+            StatusCode::OK,
+            Json(json!({ "ok": true, "filtered": true })),
+        ));
+    }
+
     let trigger_key = webhook_trigger_key(&slug, &raw_body_sha256, spec, &headers);
     let request = CreateWorkflowRunRequest {
         workflow_name: registered.workflow_name.clone(),
@@ -1171,6 +1628,64 @@ async fn mark_slack_archive_import_queued(
         .map_err(ApiError::from)
 }
 
+async fn upsert_slack_dm_sync_run(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    run: &SlackDmSyncRunPayload,
+) -> Result<(), ApiError> {
+    let finished_at = if run.finished {
+        Some(OffsetDateTime::now_utc())
+    } else {
+        None
+    };
+    sqlx::query(
+        "INSERT INTO slack_dm_sync_runs (\
+         run_id, workflow_run_id, mode, status, broker_credential_id, source_user_id, \
+         home_team_id, conversations_requested, conversations_synced, conversations_failed, \
+         messages_fetched, messages_upserted, replies_fetched, replies_upserted, \
+         finished_at, error_text, metadata\
+         ) VALUES (\
+         $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, \
+         $11, $12, $13, $14, $15, $16, $17::jsonb) \
+         ON CONFLICT (run_id) DO UPDATE SET \
+         workflow_run_id = EXCLUDED.workflow_run_id, \
+         mode = EXCLUDED.mode, \
+         status = EXCLUDED.status, \
+         broker_credential_id = EXCLUDED.broker_credential_id, \
+         source_user_id = EXCLUDED.source_user_id, \
+         home_team_id = EXCLUDED.home_team_id, \
+         conversations_requested = EXCLUDED.conversations_requested, \
+         conversations_synced = EXCLUDED.conversations_synced, \
+         conversations_failed = EXCLUDED.conversations_failed, \
+         messages_fetched = EXCLUDED.messages_fetched, \
+         messages_upserted = EXCLUDED.messages_upserted, \
+         replies_fetched = EXCLUDED.replies_fetched, \
+         replies_upserted = EXCLUDED.replies_upserted, \
+         finished_at = COALESCE(EXCLUDED.finished_at, slack_dm_sync_runs.finished_at), \
+         error_text = EXCLUDED.error_text, \
+         metadata = EXCLUDED.metadata",
+    )
+    .bind(&run.run_id)
+    .bind(&run.workflow_run_id)
+    .bind(&run.mode)
+    .bind(&run.status)
+    .bind(&run.broker_credential_id)
+    .bind(&run.source_user_id)
+    .bind(&run.home_team_id)
+    .bind(run.conversations_requested)
+    .bind(run.conversations_synced)
+    .bind(run.conversations_failed)
+    .bind(run.messages_fetched)
+    .bind(run.messages_upserted)
+    .bind(run.replies_fetched)
+    .bind(run.replies_upserted)
+    .bind(finished_at)
+    .bind(&run.error_text)
+    .bind(&run.metadata)
+    .execute(&mut **tx)
+    .await?;
+    Ok(())
+}
+
 fn slack_archive_upload_config() -> Result<SlackArchiveUploadConfig, ApiError> {
     let bucket = env::var("SLACK_ARCHIVE_UPLOAD_BUCKET")
         .unwrap_or_default()
@@ -1214,6 +1729,129 @@ fn positive_env_u64(name: &str, default: u64) -> u64 {
 
 fn prefixed_id(prefix: &str) -> String {
     format!("{prefix}_{}", Uuid::new_v4().simple())
+}
+
+fn default_slack_dm_sync_mode() -> String {
+    "incremental".to_owned()
+}
+
+fn default_slack_message_type() -> String {
+    "message".to_owned()
+}
+
+fn default_attachment_download_status() -> String {
+    "metadata_only".to_owned()
+}
+
+fn empty_object() -> Value {
+    json!({})
+}
+
+fn empty_array() -> Value {
+    json!([])
+}
+
+fn default_true() -> bool {
+    true
+}
+
+fn empty_to_none(value: Option<&str>) -> Option<&str> {
+    value.map(str::trim).filter(|value| !value.is_empty())
+}
+
+fn require_non_empty(field: &str, value: &str) -> Result<(), ApiError> {
+    if value.trim().is_empty() {
+        return Err(ApiError::BadRequest(format!("{field} must not be empty")));
+    }
+    Ok(())
+}
+
+fn slack_ts_to_datetime(value: Option<&str>) -> Result<Option<OffsetDateTime>, ApiError> {
+    let Some(value) = empty_to_none(value) else {
+        return Ok(None);
+    };
+    let (seconds, micros) = value.split_once('.').unwrap_or((value, "0"));
+    let seconds = seconds
+        .parse::<i64>()
+        .map_err(|_| ApiError::BadRequest(format!("invalid Slack timestamp {value}")))?;
+    let micros = format!("{micros:0<6}");
+    let micros = micros[..micros.len().min(6)]
+        .parse::<i64>()
+        .map_err(|_| ApiError::BadRequest(format!("invalid Slack timestamp {value}")))?;
+    let timestamp = OffsetDateTime::from_unix_timestamp(seconds)
+        .map_err(|_| ApiError::BadRequest(format!("invalid Slack timestamp {value}")))?
+        .checked_add(TimeDuration::microseconds(micros))
+        .ok_or_else(|| ApiError::BadRequest(format!("invalid Slack timestamp {value}")))?;
+    Ok(Some(timestamp))
+}
+
+fn validate_json_shape(field: &str, value: &Value, object: bool) -> Result<(), ApiError> {
+    let valid = if object {
+        value.is_object()
+    } else {
+        value.is_array()
+    };
+    if valid {
+        return Ok(());
+    }
+    let expected = if object { "object" } else { "array" };
+    Err(ApiError::BadRequest(format!(
+        "{field} must be a JSON {expected}"
+    )))
+}
+
+fn validate_slack_dm_sync_batch(request: &SlackDmSyncBatchRequest) -> Result<(), ApiError> {
+    if let Some(run) = &request.run {
+        require_non_empty("run.run_id", &run.run_id)?;
+        require_non_empty("run.status", &run.status)?;
+        require_non_empty("run.broker_credential_id", &run.broker_credential_id)?;
+        require_non_empty("run.source_user_id", &run.source_user_id)?;
+        require_non_empty("run.home_team_id", &run.home_team_id)?;
+        validate_json_shape("run.metadata", &run.metadata, true)?;
+    }
+    for conversation in &request.conversations {
+        require_non_empty("conversation.home_team_id", &conversation.home_team_id)?;
+        require_non_empty(
+            "conversation.conversation_id",
+            &conversation.conversation_id,
+        )?;
+        if !matches!(conversation.conversation_type.as_str(), "im" | "mpim") {
+            return Err(ApiError::BadRequest(
+                "conversation.conversation_type must be im or mpim".to_owned(),
+            ));
+        }
+        validate_json_shape("conversation.raw_payload", &conversation.raw_payload, true)?;
+    }
+    for member in &request.members {
+        require_non_empty("member.home_team_id", &member.home_team_id)?;
+        require_non_empty("member.conversation_id", &member.conversation_id)?;
+        require_non_empty("member.user_id", &member.user_id)?;
+        validate_json_shape("member.raw_payload", &member.raw_payload, true)?;
+    }
+    for message in &request.messages {
+        require_non_empty("message.home_team_id", &message.home_team_id)?;
+        require_non_empty("message.conversation_id", &message.conversation_id)?;
+        require_non_empty("message.message_ts", &message.message_ts)?;
+        validate_json_shape("message.reply_users", &message.reply_users, false)?;
+        validate_json_shape("message.raw_payload", &message.raw_payload, true)?;
+        slack_ts_to_datetime(Some(&message.message_ts))?;
+    }
+    for attachment in &request.attachments {
+        require_non_empty("attachment.home_team_id", &attachment.home_team_id)?;
+        require_non_empty("attachment.conversation_id", &attachment.conversation_id)?;
+        require_non_empty("attachment.message_ts", &attachment.message_ts)?;
+        require_non_empty("attachment.slack_file_id", &attachment.slack_file_id)?;
+        validate_json_shape("attachment.raw_payload", &attachment.raw_payload, true)?;
+    }
+    for checkpoint in &request.checkpoints {
+        require_non_empty(
+            "checkpoint.broker_credential_id",
+            &checkpoint.broker_credential_id,
+        )?;
+        require_non_empty("checkpoint.home_team_id", &checkpoint.home_team_id)?;
+        require_non_empty("checkpoint.conversation_id", &checkpoint.conversation_id)?;
+    }
+    Ok(())
 }
 
 fn sanitize_path_segment(value: &str) -> String {
@@ -1585,6 +2223,59 @@ fn header_value(headers: &HeaderMap, name: &str) -> Option<String> {
         .map(ToOwned::to_owned)
 }
 
+/// Read a dot-path (e.g. "repository.full_name") out of a JSON body.
+fn webhook_body_path<'a>(body: &'a Value, path: &str) -> Option<&'a Value> {
+    let mut current = body;
+    for part in path.split('.') {
+        current = current.get(part)?;
+    }
+    Some(current)
+}
+
+/// Evaluate a declarative webhook pre-filter against the event.
+fn webhook_filter_matches(filter: &WebhookFilter, headers: &HeaderMap, body: &Value) -> bool {
+    if let Some(any) = &filter.any {
+        return any.iter().any(|f| webhook_filter_matches(f, headers, body));
+    }
+    if let Some(all) = &filter.all {
+        return all.iter().all(|f| webhook_filter_matches(f, headers, body));
+    }
+    let actual = match filter.source.as_deref() {
+        Some("header") => filter
+            .key
+            .as_deref()
+            .and_then(|key| header_value(headers, key)),
+        Some("body") => filter
+            .key
+            .as_deref()
+            .and_then(|key| webhook_body_path(body, key))
+            .and_then(|value| value.as_str().map(ToOwned::to_owned)),
+        // Registry validation rejects empty nodes; fail closed if one reaches
+        // the evaluator anyway.
+        None => return false,
+        Some(_) => return false,
+    };
+    let Some(actual) = actual else {
+        return false;
+    };
+    match filter.op.as_deref() {
+        Some("equals") => filter.value.as_deref() == Some(actual.as_str()),
+        Some("in") => filter
+            .values
+            .as_ref()
+            .is_some_and(|values| values.iter().any(|v| v == &actual)),
+        Some("contains") => filter
+            .value
+            .as_deref()
+            .is_some_and(|needle| actual.contains(needle)),
+        Some("prefix") => filter
+            .value
+            .as_deref()
+            .is_some_and(|prefix| actual.trim_start().starts_with(prefix)),
+        _ => false,
+    }
+}
+
 #[cfg(test)]
 mod slack_archive_import_tests {
     use super::*;
@@ -1781,6 +2472,7 @@ mod webhook_tests {
             trigger_key: None,
             allowed_methods: vec!["POST".to_owned()],
             allowed_content_types: vec!["application/json".to_owned()],
+            filter: None,
         };
         let safe = safe_webhook_headers(&headers, &spec);
         assert_eq!(safe, json!({"x-test-delivery": "delivery-1"}));
@@ -1799,6 +2491,7 @@ mod webhook_tests {
             }),
             allowed_methods: vec!["POST".to_owned()],
             allowed_content_types: vec!["application/json".to_owned()],
+            filter: None,
         };
         assert_eq!(
             webhook_trigger_key("unit", "abc", &spec, &headers),
@@ -1827,6 +2520,74 @@ mod webhook_tests {
             raw_body,
         )
         .unwrap();
+    }
+
+    fn webhook_filter(value: Value) -> WebhookFilter {
+        serde_json::from_value(value).unwrap()
+    }
+
+    #[test]
+    fn webhook_filter_evaluates() {
+        let body = json!({
+            "repository": {"full_name": "ethereum-optimism/ethereum-optimism.github.io"},
+            "comment": {"body": "/review claude please"}
+        });
+        let mut headers = HeaderMap::new();
+        headers.insert("x-github-event", "issue_comment".parse().unwrap());
+
+        // union: a /review comment on any repo matches the command branch
+        let filter = webhook_filter(json!({
+            "any": [
+                {"source": "header", "key": "x-github-event", "op": "equals", "value": "pull_request"},
+                {"all": [
+                    {"source": "header", "key": "x-github-event", "op": "equals", "value": "issue_comment"},
+                    {"source": "body", "key": "comment.body", "op": "contains", "value": "/review"}
+                ]}
+            ]
+        }));
+        assert!(webhook_filter_matches(&filter, &headers, &body));
+
+        // a plain comment on an unrelated repo doesn't match a repo-scoped filter
+        let other = json!({
+            "repository": {"full_name": "ethereum-optimism/k8s"},
+            "comment": {"body": "lgtm"}
+        });
+        let repo_filter = webhook_filter(json!({
+            "all": [
+                {"source": "header", "key": "x-github-event", "op": "equals", "value": "issue_comment"},
+                {"source": "body", "key": "repository.full_name", "op": "in",
+                 "values": ["ethereum-optimism/ethereum-optimism.github.io"]}
+            ]
+        }));
+        assert!(!webhook_filter_matches(&repo_filter, &headers, &other));
+
+        // missing field -> no match.
+        let missing = webhook_filter(json!({
+            "source": "body",
+            "key": "a.b",
+            "op": "equals",
+            "value": "x"
+        }));
+        assert!(!webhook_filter_matches(&missing, &headers, &body));
+
+        let unknown_source = webhook_filter(json!({
+            "source": "query",
+            "key": "event",
+            "op": "equals",
+            "value": "issue_comment"
+        }));
+        assert!(!webhook_filter_matches(&unknown_source, &headers, &body));
+
+        let unknown_op = webhook_filter(json!({
+            "source": "body",
+            "key": "comment.body",
+            "op": "regex",
+            "value": "/review"
+        }));
+        assert!(!webhook_filter_matches(&unknown_op, &headers, &body));
+
+        let empty = webhook_filter(json!({}));
+        assert!(!webhook_filter_matches(&empty, &headers, &body));
     }
 
     #[test]
