@@ -559,9 +559,10 @@ def list_labels(
     table.add_column("Label", style="white", max_width=25)
 
     for label in sorted(
-        result, key=lambda lbl: (lbl.get("team", {}).get("key", "") or "", lbl.get("name", ""))
+        result, key=lambda lbl: ((lbl.get("team") or {}).get("key", ""), lbl.get("name", ""))
     ):
-        team_key = label.get("team", {}).get("key", "") if label.get("team") else "org"
+        team = label.get("team")
+        team_key = team.get("key", "") if team else "org"
         table.add_row(team_key, label.get("name", ""))
 
     console.print(table)
