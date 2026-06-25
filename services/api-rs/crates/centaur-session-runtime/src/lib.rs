@@ -5273,7 +5273,11 @@ mod tests {
             "SESS"
         );
         // No comment in this key, so the optional field is omitted entirely.
-        assert!(value["session_context"]["linear"].get("comment_id").is_none());
+        assert!(
+            value["session_context"]["linear"]
+                .get("comment_id")
+                .is_none()
+        );
     }
 
     #[test]
