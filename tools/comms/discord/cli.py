@@ -177,6 +177,9 @@ def post(
     channel: str = typer.Argument(..., help="Channel name or ID"),
     message: str = typer.Argument(..., help="Message text"),
     reply_to: str = typer.Option(None, "--reply-to", "-r", help="Message ID to reply to"),
+    suppress_embeds: bool = typer.Option(
+        False, "--suppress-embeds", help="Suppress link/embed unfurling on the message"
+    ),
     json_output: bool = typer.Option(False, "--json", help="Output as JSON"),
 ):
     """Post a message to a channel."""
@@ -184,6 +187,7 @@ def post(
         channel=channel,
         content=message,
         reply_to_message_id=reply_to,
+        suppress_embeds=suppress_embeds,
     )
     if _emit(result, json_output):
         return
