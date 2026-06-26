@@ -62,6 +62,17 @@ spec:
                   key: {{ printf "%sDATABASE_URL" .Values.secretManager.envPrefix }}
             - name: GITHUB_BOT_USERNAME
               value: {{ required "githubbot.userName is required (the bot account's GitHub login)" .Values.githubbot.userName | quote }}
+            # v2 PR self-management knobs.
+            - name: GITHUBBOT_AUTO_MERGE
+              value: {{ .Values.githubbot.autoMerge | quote }}
+            - name: GITHUBBOT_MERGE_METHOD
+              value: {{ .Values.githubbot.mergeMethod | quote }}
+            - name: GITHUBBOT_MANAGED_LABEL
+              value: {{ .Values.githubbot.managedLabel | quote }}
+{{- if .Values.githubbot.escalationHandle }}
+            - name: GITHUBBOT_ESCALATION_HANDLE
+              value: {{ .Values.githubbot.escalationHandle | quote }}
+{{- end }}
 {{- range $name, $value := .Values.githubbot.extraEnv }}
             - name: {{ $name }}
               value: {{ $value | quote }}

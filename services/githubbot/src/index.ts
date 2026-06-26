@@ -13,6 +13,12 @@ import { Hono, type Context } from "hono";
 import pg from "pg";
 import { backgroundWaitUntil, requestContext, waitUntil } from "./context";
 import { extractMessageOverrides } from "./overrides";
+import {
+  handleCiEvent,
+  handlePullRequestEvent,
+  handleReviewEvent,
+  type PrManagerContext,
+} from "./pr-manager";
 import { handleReviewRequest } from "./review";
 import {
   forwardToSessionApi,
@@ -103,6 +109,13 @@ export function createGithubbot(options: GithubbotOptions): Githubbot {
     }
   };
 
+  const prManagerCtx: PrManagerContext = {
+    octokit: github.octokit,
+    options,
+    state,
+    userName,
+  };
+
   const app = new Hono();
   app.get("/health", (c) => c.json({ ok: true, service: "githubbot" }));
 
@@ -110,7 +123,10 @@ export function createGithubbot(options: GithubbotOptions): Githubbot {
     const eventType = c.req.header("x-github-event") ?? "";
     const deliveryId = c.req.header("x-github-delivery") ?? "";
     await ensureChatInitialized();
-    const context = { retryableErrors: [], waitUntil: (p: Promise<unknown>) => waitUntil(c, p) };
+    const context = {
+      retryableErrors: [],
+      waitUntil: (p: Promise<unknown>) => waitUntil(c, p),
+    };
 
     // Comment threads (mentions, follow-ups) are the adapter's domain: it
     // verifies the signature and maps the payload to a thread/message that
@@ -126,31 +142,32 @@ export function createGithubbot(options: GithubbotOptions): Githubbot {
       );
     }
 
-    // Lifecycle events the adapter ignores (review requests) are handled here.
-    // The adapter never sees this body, so verify the signature ourselves.
-    if (eventType === "pull_request") {
-      const rawBody = await c.req.raw.clone().text();
-      if (
-        !verifyGithubSignature(
-          rawBody,
-          c.req.header("x-hub-signature-256"),
-          options.webhookSecret,
-        )
-      ) {
-        return new globalThis.Response("invalid signature", { status: 401 });
-      }
-      const handled = requestContext.run(context, () =>
-        handleReviewRequest(rawBody, {
-          botUserName: userName,
-          deliveryId,
-          options,
-          state,
-        }),
-      );
-      if (handled) waitUntil(c, handled);
+    // Every other event is a lifecycle event the adapter ignores (review
+    // requests in v1; PR/review/CI events in v2). The adapter never sees these
+    // bodies, so verify the signature ourselves before acting.
+    if (!LIFECYCLE_EVENTS.has(eventType)) {
       return new globalThis.Response("ok", { status: 200 });
     }
-
+    const rawBody = await c.req.raw.clone().text();
+    if (
+      !verifyGithubSignature(
+        rawBody,
+        c.req.header("x-hub-signature-256"),
+        options.webhookSecret,
+      )
+    ) {
+      return new globalThis.Response("invalid signature", { status: 401 });
+    }
+    const handled = requestContext.run(context, () =>
+      routeLifecycleEvent(eventType, rawBody, {
+        botUserName: userName,
+        deliveryId,
+        options,
+        prManagerCtx,
+        state,
+      }),
+    );
+    if (handled) waitUntil(c, handled);
     return new globalThis.Response("ok", { status: 200 });
   };
   app.post("/api/webhooks/github", handleGithubWebhook);
@@ -314,6 +331,57 @@ async function appendFollowup(
     (options.logger ?? noopLogger).warn("githubbot_followup_append_failed", {
       error: errorMessage(error),
     });
+  }
+}
+
+const LIFECYCLE_EVENTS = new Set([
+  "pull_request",
+  "pull_request_review",
+  "check_run",
+  "check_suite",
+  "workflow_run",
+]);
+
+/**
+ * Route a signature-verified lifecycle event: PR review requests go to v1's
+ * review handler; everything else (PR/review/CI lifecycle) goes to the v2 PR
+ * manager. Returns the work promise (awaited for the webhook's keep-alive) or
+ * null when there's nothing to do.
+ */
+function routeLifecycleEvent(
+  eventType: string,
+  rawBody: string,
+  input: {
+    botUserName: string;
+    deliveryId: string;
+    options: GithubbotOptions;
+    prManagerCtx: PrManagerContext;
+    state: StateAdapter;
+  },
+): Promise<void> | null {
+  if (eventType === "pull_request") {
+    if (pullRequestAction(rawBody) === "review_requested") {
+      return handleReviewRequest(rawBody, {
+        botUserName: input.botUserName,
+        deliveryId: input.deliveryId,
+        options: input.options,
+        state: input.state,
+      });
+    }
+    return handlePullRequestEvent(input.prManagerCtx, rawBody);
+  }
+  if (eventType === "pull_request_review") {
+    return handleReviewEvent(input.prManagerCtx, rawBody);
+  }
+  return handleCiEvent(input.prManagerCtx, eventType, rawBody);
+}
+
+function pullRequestAction(rawBody: string): string | undefined {
+  try {
+    const payload = JSON.parse(rawBody) as { action?: unknown };
+    return typeof payload.action === "string" ? payload.action : undefined;
+  } catch {
+    return undefined;
   }
 }
 

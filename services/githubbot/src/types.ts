@@ -122,6 +122,23 @@ export type GithubbotOptions = {
    * GITHUBBOT_REVIEW_PROMPT(_FILE) so org conventions override ours wholesale.
    */
   reviewPrompt?: string;
+  /**
+   * v2 PR self-management: auto-merge owned PRs when GitHub reports them
+   * mergeable (branch protection is the source of truth). Defaults to true.
+   */
+  autoMerge?: boolean;
+  /** Max consecutive CI-fix attempts on an owned PR before escalating. Default 3. */
+  ciFixMaxAttempts?: number;
+  /** Delete the head branch after the bot merges an owned PR. Default true. */
+  deleteBranchOnMerge?: boolean;
+  /** Fallback @handle to tag when the bot gives up and escalates. */
+  escalationHandle?: string;
+  /** Label that marks a PR as bot-managed (in addition to author == bot). Default "centaur-managed". */
+  managedLabel?: string;
+  /** Label that pauses auto-merge on a PR. Default "do-not-merge". */
+  holdLabel?: string;
+  /** Merge method for auto-merge: "merge" | "squash" | "rebase". Default "squash". */
+  mergeMethod?: "merge" | "squash" | "rebase";
   /** Personal access token for the bot's GitHub teammate account. */
   token: string;
   userName?: string;

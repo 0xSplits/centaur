@@ -75,7 +75,14 @@ if (!postgresUrl) {
 const options: GithubbotOptions = {
   apiUrl,
   apiKey: optionalEnv("GITHUBBOT_API_KEY") ?? optionalEnv("CENTAUR_API_KEY"),
+  autoMerge: boolEnv("GITHUBBOT_AUTO_MERGE", true),
   botUserId: optionalEnv("GITHUBBOT_USER_ID"),
+  ciFixMaxAttempts: optionalNumberEnv("GITHUBBOT_CI_FIX_MAX_ATTEMPTS"),
+  deleteBranchOnMerge: boolEnv("GITHUBBOT_DELETE_BRANCH_ON_MERGE", true),
+  escalationHandle: optionalEnv("GITHUBBOT_ESCALATION_HANDLE"),
+  holdLabel: optionalEnv("GITHUBBOT_HOLD_LABEL"),
+  managedLabel: optionalEnv("GITHUBBOT_MANAGED_LABEL"),
+  mergeMethod: mergeMethodEnv(),
   defaultHarnessType: optionalEnv("GITHUBBOT_DEFAULT_HARNESS"),
   githubApiUrl: optionalEnv("GITHUB_API_URL"),
   idleTimeoutMs: optionalNumberEnv("SESSION_IDLE_TIMEOUT_MS"),
@@ -126,6 +133,23 @@ function stringEnv(name: string, fallback: string): string {
 
 function numberEnv(name: string, fallback: number): number {
   return optionalNumberEnv(name) ?? fallback;
+}
+
+function boolEnv(name: string, fallback: boolean): boolean {
+  const value = optionalEnv(name)?.toLowerCase();
+  if (value === undefined) return fallback;
+  if (["false", "0", "no", "off"].includes(value)) return false;
+  if (["true", "1", "yes", "on"].includes(value)) return true;
+  return fallback;
+}
+
+function mergeMethodEnv(): "merge" | "squash" | "rebase" | undefined {
+  const value = optionalEnv("GITHUBBOT_MERGE_METHOD")?.toLowerCase();
+  if (value === "merge" || value === "squash" || value === "rebase") return value;
+  if (value !== undefined) {
+    throw new Error("GITHUBBOT_MERGE_METHOD must be one of: merge, squash, rebase");
+  }
+  return undefined;
 }
 
 function optionalNumberEnv(name: string): number | undefined {

@@ -42,9 +42,33 @@ reviewer** like any other collaborator.
 - `--claude` / `--codex` / `--amp` / `--model …` / `--opus|--sonnet|--haiku` inline flags pick the
   harness/model, same as the other bots.
 
-> **Scope (v1).** This is the conversational + review-on-request surface. PR self-management —
-> merging on approval, fixing CI failures — is intended as a follow-up (it hangs off the same per-PR
-> thread, driven by `pull_request_review` and `check_run`/`workflow_run` webhooks).
+## PR self-management (v2)
+
+For PRs the bot **owns** — authored by the bot account, or carrying the managed label
+(`GITHUBBOT_MANAGED_LABEL`, default `centaur-managed`) — githubbot drives the PR toward merge by
+reacting to lifecycle webhooks. It only ever acts on owned PRs, and on a dedicated management thread
+(`github-manage:{owner}/{repo}:{n}`); the agent does its GitHub writes via `gh`.
+
+- **Fix CI.** When **all** checks for a head SHA are settled (not per failing job — interwoven jobs
+  make early firing harmful) and red, a fix turn diagnoses and pushes a fix. Bounded to
+  `GITHUBBOT_CI_FIX_MAX_ATTEMPTS` consecutive attempts (default 3, reset when CI goes green); on
+  exhaustion the bot comments tagging a human and stops. It backs off if the failing head commit was
+  authored by a human (it won't step on someone who's taken over).
+- **Address review.** A submitted review (`changes_requested` / `commented`) triggers one holistic
+  turn that reads all the feedback, makes a single coherent commit, replies on each thread, resolves
+  what it addressed, and re-requests review.
+- **Merge when ready.** Deterministic — no agent. When GitHub reports the PR `mergeable_state == clean`
+  the bot merges it (`GITHUBBOT_MERGE_METHOD`, default squash) and deletes the branch. `dirty` →
+  conflict-resolution turn; `behind` → branch update; anything else → wait. Enabled by default for
+  owned PRs; disable globally with `GITHUBBOT_AUTO_MERGE=false`, or per-PR with the hold label
+  (`GITHUBBOT_HOLD_LABEL`, default `do-not-merge`) or by keeping the PR a draft.
+
+> **Scope.** v2 targets **same-repo PRs on repos you control** (where you own the webhook). The
+> fork → upstream contribution flow (e.g. PRs against `paradigmxyz/centaur`) is out of scope: it
+> needs the upstream repo to deliver webhooks to this bot, which isn't yours to configure.
+>
+> **Op requirement:** the agent's sandbox `git`/`gh` identity must be able to push to the managed
+> PR branches (ideally authenticated as the bot account, so commits and replies come from it).
 
 ## Ingress model
 
@@ -70,8 +94,9 @@ from a separate `GITHUBBOT_TOKEN` secret key to avoid collision.
 GitHub App auth is also supported by the adapter (`GITHUB_APP_ID` / `GITHUB_PRIVATE_KEY`), but the
 PAT-teammate model is what we run.
 
-Webhook events to subscribe: **Issue comments**, **Pull request review comments**, and **Pull
-requests** (for the review-request trigger).
+Webhook events to subscribe: **Issue comments**, **Pull request review comments**, **Pull
+requests**, **Pull request reviews**, **Check runs**, **Check suites**, and **Workflow runs**
+(the last four drive v2 PR self-management).
 
 ## Environment
 
@@ -90,9 +115,17 @@ requests** (for the review-request trigger).
 | `GITHUBBOT_USER_ID` | — | Bot's numeric user id for self-message detection (auto-detected otherwise). |
 | `GITHUBBOT_STATE_KEY_PREFIX` | — | Chat-SDK state key prefix, default `centaur-githubbot`. |
 | `GITHUBBOT_LOG_LEVEL` | — | `debug`/`info`/`warn`/`error`, default `info`. |
+| `GITHUBBOT_AUTO_MERGE` | — | Auto-merge owned PRs when mergeable. Default `true`. |
+| `GITHUBBOT_MERGE_METHOD` | — | `merge` / `squash` / `rebase`. Default `squash`. |
+| `GITHUBBOT_MANAGED_LABEL` | — | Label marking a PR bot-managed. Default `centaur-managed`. |
+| `GITHUBBOT_HOLD_LABEL` | — | Label that pauses auto-merge. Default `do-not-merge`. |
+| `GITHUBBOT_CI_FIX_MAX_ATTEMPTS` | — | Consecutive CI-fix attempts before escalating. Default 3. |
+| `GITHUBBOT_DELETE_BRANCH_ON_MERGE` | — | Delete head branch after merge. Default `true`. |
+| `GITHUBBOT_ESCALATION_HANDLE` | — | Fallback @handle (no leading @) tagged when the bot gives up. |
 | `SESSION_IDLE_TIMEOUT_MS` / `SESSION_MAX_DURATION_MS` | — | Forwarded to api-rs executes. |
 
 ## Tests
 
 `bun test test` — unit tests for the override flag parser, the GitHub thread-key parsing / context
-preamble, and the review-request trigger gating.
+preamble, the review-request trigger gating, and the v2 PR-manager decision logic (CI evaluation,
+ownership, merge gating).
