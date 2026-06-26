@@ -156,7 +156,11 @@ function prKey(ctx: PrManagerContext, owner: string, repo: string, n: number): s
   return `${ctx.options.stateKeyPrefix ?? "centaur-githubbot"}:pr:${owner}/${repo}#${n}`;
 }
 
-function managementThreadKey(owner: string, repo: string, n: number): string {
+export function managementThreadKey(
+  owner: string,
+  repo: string,
+  n: number,
+): string {
   return `github-manage:${owner}/${repo}:${n}`;
 }
 
@@ -265,6 +269,37 @@ async function fetchPr(
     });
     return null;
   }
+}
+
+const OWNED_CACHE_TTL_MS = 10 * 60 * 1000;
+
+/**
+ * Whether a PR is bot-owned, cached briefly so the conversational path doesn't
+ * hit the API on every comment. Ownership rarely changes, and a stale "owned"
+ * only affects which session a reply shares context with — low stakes.
+ */
+export async function isPrOwned(
+  ctx: PrManagerContext,
+  owner: string,
+  repo: string,
+  number: number,
+): Promise<boolean> {
+  const cacheKey = `${ctx.options.stateKeyPrefix ?? "centaur-githubbot"}:owned-cache:${owner}/${repo}#${number}`;
+  try {
+    const cached = await ctx.state.get<string>(cacheKey);
+    if (cached === "1") return true;
+    if (cached === "0") return false;
+  } catch {
+    // fall through to a live lookup
+  }
+  const pr = await fetchPr(ctx, owner, repo, number);
+  const owned = pr ? owns(ctx, pr) : false;
+  try {
+    await ctx.state.set(cacheKey, owned ? "1" : "0", OWNED_CACHE_TTL_MS);
+  } catch {
+    // best-effort cache
+  }
+  return owned;
 }
 
 function owns(ctx: PrManagerContext, pr: PullRequestSummary): boolean {

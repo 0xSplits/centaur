@@ -251,6 +251,13 @@ export async function runSessionTurn(input: {
   overrides: { harnessType?: string; model?: string };
   /** Comment to react to (👀 → 🚀/😕); the triggering comment, if any. */
   reactMessageId?: string;
+  /**
+   * Session/sandbox key, when it differs from the posting thread — e.g. an
+   * owned PR's conversation mention runs in the PR's management session
+   * (`github-manage:…`) for shared context but still posts to the
+   * conversation thread. Defaults to `threadKey`.
+   */
+  sessionThreadKey?: string;
   thread: Thread<GithubbotThreadState>;
   threadKey: string;
   trace: GithubbotTrace;
@@ -285,7 +292,7 @@ export async function runSessionTurn(input: {
       forwardInput.afterEventId = lastEventId;
     },
     openStream: false,
-    threadId: threadKey,
+    threadId: input.sessionThreadKey ?? threadKey,
     trace,
   };
 

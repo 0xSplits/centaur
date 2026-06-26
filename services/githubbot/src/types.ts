@@ -162,6 +162,12 @@ export type GithubbotThreadState = {
   /** Highest session-event id seen, used as the replay watermark. */
   lastEventId?: number;
   /**
+   * For an owned PR, the management session key (`github-manage:…`) this
+   * conversation thread routes turns to — resolved once on the first mention
+   * so follow-ups don't re-look-up ownership.
+   */
+  managementSessionKey?: string;
+  /**
    * Ids of comments this thread has already answered, so a webhook redelivery
    * never double-replies. Capped FIFO.
    */

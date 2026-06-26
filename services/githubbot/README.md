@@ -62,6 +62,9 @@ reacting to lifecycle webhooks. It only ever acts on owned PRs, and on a dedicat
   conflict-resolution turn; `behind` → branch update; anything else → wait. Enabled by default for
   owned PRs; disable globally with `GITHUBBOT_AUTO_MERGE=false`, or per-PR with the hold label
   (`GITHUBBOT_HOLD_LABEL`, default `do-not-merge`) or by keeping the PR a draft.
+- **Owned-PR conversation.** An @-mention in an owned PR's conversation (or a review-comment thread)
+  runs in that PR's management session too — so the bot answers with the context of the CI fixes and
+  review work it's been doing on the PR — while the rendered reply still posts to the comment thread.
 
 > **Scope.** v2 targets **same-repo PRs on repos you control** (where you own the webhook). The
 > fork → upstream contribution flow (e.g. PRs against `paradigmxyz/centaur`) is out of scope: it

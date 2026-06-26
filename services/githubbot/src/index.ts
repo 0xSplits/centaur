@@ -17,6 +17,8 @@ import {
   handleCiEvent,
   handlePullRequestEvent,
   handleReviewEvent,
+  isPrOwned,
+  managementThreadKey,
   type PrManagerContext,
 } from "./pr-manager";
 import { handleReviewRequest } from "./review";
@@ -27,6 +29,7 @@ import {
 } from "./session-api";
 import {
   githubContextPreamble,
+  parseGithubThreadKey,
   reviewCommentContextFromRaw,
   runSessionTurn,
 } from "./turn";
@@ -82,6 +85,7 @@ export function createGithubbot(options: GithubbotOptions): Githubbot {
       adapter: github,
       mode: "execute",
       options,
+      prManagerCtx,
       subscribe: true,
     });
   });
@@ -93,6 +97,7 @@ export function createGithubbot(options: GithubbotOptions): Githubbot {
       adapter: github,
       mode: message.isMention === true ? "execute" : "append",
       options,
+      prManagerCtx,
     });
   });
 
@@ -183,6 +188,7 @@ type MessageHandlerInput = {
   adapter: GitHubAdapter;
   mode: "execute" | "append";
   options: GithubbotOptions;
+  prManagerCtx: PrManagerContext;
   subscribe?: boolean;
 };
 
@@ -233,6 +239,11 @@ async function handleMessage(
         });
       }
     }
+    const sessionThreadKey = await resolveManagementSession(
+      thread,
+      threadKey,
+      input,
+    );
     const serialized = await serializeMessage(message);
     const overrides = extractMessageOverrides(serialized.text);
     serialized.text = overrides.cleanedText;
@@ -253,6 +264,7 @@ async function handleMessage(
         options,
         overrides: { harnessType: overrides.harnessType, model: overrides.model },
         reactMessageId: message.id,
+        sessionThreadKey,
         thread,
         threadKey,
         trace,
@@ -287,6 +299,7 @@ async function handleMessage(
       message.id,
     ].slice(-DEDUP_WINDOW),
   });
+  const sessionKey = threadState.managementSessionKey ?? threadKey;
   const serialized = await serializeMessage(message);
   const trace: GithubbotTrace = {
     includeContext: false,
@@ -294,9 +307,44 @@ async function handleMessage(
     mode: "execute",
     openStream: false,
     startedAtMs: nowMs(),
-    threadId: threadKey,
+    threadId: sessionKey,
   };
-  backgroundWaitUntil(appendFollowup(options, serialized, threadKey, trace));
+  backgroundWaitUntil(appendFollowup(options, serialized, sessionKey, trace));
+}
+
+/**
+ * For a PR-conversation/review thread the bot owns, return the PR's management
+ * session key (`github-manage:…`) so the turn shares the sandbox/context the bot
+ * uses to fix CI and address reviews — while replies still post to this thread.
+ * Returns undefined for non-PR threads, non-owned PRs, or on lookup failure (the
+ * turn then runs on its own conversation session). Resolved ownership is cached
+ * on the thread so follow-ups skip the lookup.
+ */
+async function resolveManagementSession(
+  thread: Thread<GithubbotThreadState>,
+  threadKey: string,
+  input: MessageHandlerInput,
+): Promise<string | undefined> {
+  const ref = parseGithubThreadKey(threadKey);
+  if (!ref || ref.type !== "pr") return undefined;
+  let owned = false;
+  try {
+    owned = await isPrOwned(input.prManagerCtx, ref.owner, ref.repo, ref.number);
+  } catch (error) {
+    (input.options.logger ?? noopLogger).debug(
+      "githubbot_ownership_lookup_failed",
+      { error: errorMessage(error) },
+    );
+    return undefined;
+  }
+  if (!owned) return undefined;
+  const sessionKey = managementThreadKey(ref.owner, ref.repo, ref.number);
+  try {
+    await thread.setState({ managementSessionKey: sessionKey });
+  } catch {
+    // best-effort; follow-ups will just re-resolve
+  }
+  return sessionKey;
 }
 
 /**
