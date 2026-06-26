@@ -23,8 +23,9 @@ use centaur_session_sqlx::{
     PgSessionStore, SessionEventListener, SessionStoreError, default_metadata,
 };
 use centaur_telemetry::{
-    record_sandbox_warm_pool_claim, record_session_execution_finished,
-    record_session_execution_started, record_session_failure, record_session_first_token_latency,
+    export_thread_trace_root_span, record_sandbox_warm_pool_claim,
+    record_session_execution_finished, record_session_execution_started, record_session_failure,
+    record_session_first_token_latency, set_span_parent_trace,
 };
 use dashmap::DashMap;
 use futures_util::{SinkExt, Stream, StreamExt, stream};
@@ -48,6 +49,8 @@ pub const SESSION_FIRST_TOKEN_EVENT: &str = "session.first_token";
 const EVENT_STREAM_SAFETY_POLL_INTERVAL: Duration = Duration::from_secs(30);
 const STEERING_STARTUP_RETRY_INTERVAL: Duration = Duration::from_millis(250);
 const STEERING_STARTUP_RETRY_TIMEOUT: Duration = Duration::from_secs(15);
+const SESSION_PIPE_MAX_REATTACH_ATTEMPTS: u32 = 3;
+const SESSION_PIPE_REATTACH_DELAY: Duration = Duration::from_millis(500);
 const COMPONENT_SESSION_RUNTIME: &str = "session_runtime";
 
 type SandboxSpecFactory = Arc<
@@ -448,7 +451,13 @@ impl SessionRuntime {
             harness_type = %harness_type,
             iron_control_enabled = self.iron_control.is_some(),
         );
+        set_span_parent_trace(
+            &span,
+            &thread_trace_id(thread_key),
+            &thread_trace_parent_span_id(thread_key),
+        );
         let result = async {
+            ensure_thread_trace_root_span(thread_key);
             info!(
                 component = COMPONENT_SESSION_RUNTIME,
                 event = "session_create_or_get_started",
@@ -640,7 +649,13 @@ impl SessionRuntime {
             thread_key = %thread_key,
             message_count = messages.len(),
         );
+        set_span_parent_trace(
+            &span,
+            &thread_trace_id(thread_key),
+            &thread_trace_parent_span_id(thread_key),
+        );
         let result = async {
+            ensure_thread_trace_root_span(thread_key);
             if messages.is_empty() {
                 return Err(SessionRuntimeError::BadRequest(
                     "messages must not be empty".to_owned(),
@@ -868,7 +883,13 @@ impl SessionRuntime {
             input_line_count,
             idempotency_key_present,
         );
+        set_span_parent_trace(
+            &span,
+            &thread_trace_id(thread_key),
+            &thread_trace_parent_span_id(thread_key),
+        );
         let result = async {
+            ensure_thread_trace_root_span(thread_key);
             info!(
                 component = COMPONENT_SESSION_RUNTIME,
                 event = "session_execute_started",
@@ -939,6 +960,11 @@ impl SessionRuntime {
                 execution_id = %execution.execution_id,
                 sandbox_id = tracing::field::Empty,
             );
+            set_span_parent_trace(
+                &execution_trace_span,
+                &thread_trace_id(thread_key),
+                &thread_trace_parent_span_id(thread_key),
+            );
             self.execution_spans
                 .lock()
                 .await
@@ -968,6 +994,7 @@ impl SessionRuntime {
                     session.iron_control_principal.as_deref(),
                     &execution.execution_id,
                 )
+                .instrument(execution_trace_span.clone())
                 .await
             {
                 Ok(sandbox_id) => sandbox_id,
@@ -982,7 +1009,11 @@ impl SessionRuntime {
             execution_trace_span.record("centaur.sandbox_id", sandbox_id.as_str());
             execution_trace_span.record("sandbox_id", sandbox_id.as_str());
 
-            let pipe = match self.ensure_session_pipe(thread_key, &sandbox_id).await {
+            let pipe = match self
+                .ensure_session_pipe(thread_key, &sandbox_id)
+                .instrument(execution_trace_span.clone())
+                .await
+            {
                 Ok(pipe) => pipe,
                 Err(error) => {
                     self.record_execution_failure(thread_key, &execution.execution_id, &error)
@@ -1000,6 +1031,7 @@ impl SessionRuntime {
                 &execution.execution_id,
                 Some(&sandbox_id),
             )
+            .instrument(execution_trace_span.clone())
             .await
             {
                 self.record_execution_failure(thread_key, &execution.execution_id, &error)
@@ -1698,12 +1730,11 @@ impl SessionRuntime {
                 .open_io(&SandboxId::new(sandbox_id))
                 .await?
                 .into_parts();
-            let pipe = SessionPipe {
-                stdin: Arc::new(Mutex::new(FramedWrite::new(io.stdin, LinesCodec::new()))),
-            };
+            let pipe = session_pipe_from_stdin(io.stdin);
 
             self.sandbox_pipes
                 .insert(sandbox_id.to_owned(), pipe.clone());
+            drop(_open_guard);
             let ctx = self.context();
             let thread_key = thread_key.clone();
             let pump_thread_key = thread_key.clone();
@@ -1714,54 +1745,17 @@ impl SessionRuntime {
             let guard = io.guard;
             let stderr_key = pump_key.clone();
 
-            tokio::spawn(async move {
-                let result = run_stdout_pump(
-                    ctx.clone(),
-                    pump_thread_key.clone(),
-                    &pump_key,
-                    stdout,
-                    guard,
-                )
-                .await;
-                if let Err(error) = result {
-                    warn!(
-                        component = COMPONENT_SESSION_RUNTIME,
-                        event = "session_stdout_pump_failed",
-                        thread_key = %pump_thread_key,
-                        sandbox_id = %pump_key,
-                        %error,
-                        "session stdout pump failed"
-                    );
-                    let _ = ctx
-                        .store
-                        .append_event(
-                            &pump_thread_key,
-                            None,
-                            "session.stdout_pump_failed",
-                            json!({
-                                "sandbox_id": pump_key.as_str(),
-                                "error": error.to_string(),
-                            }),
-                        )
-                        .await;
-                }
-                ctx.sandbox_pipes
-                    .remove_if(&pump_key, |_sandbox_id, current| {
-                        Arc::ptr_eq(&current.stdin, &pump_pipe.stdin)
-                    });
+            spawn_stdout_pump_loop(StdoutPumpLoop {
+                ctx,
+                open_lock,
+                thread_key: pump_thread_key,
+                sandbox_id: pump_key,
+                pipe: pump_pipe,
+                stdout,
+                guard,
             });
 
-            tokio::spawn(async move {
-                if let Err(error) = drain_stderr(stderr).await {
-                    warn!(
-                        component = COMPONENT_SESSION_RUNTIME,
-                        event = "session_stderr_drain_failed",
-                        sandbox_id = %stderr_key,
-                        %error,
-                        "session stderr drain failed"
-                    );
-                }
-            });
+            spawn_stderr_drain(stderr_key, stderr);
 
             info!(
                 component = COMPONENT_SESSION_RUNTIME,
@@ -2310,13 +2304,365 @@ fn session_event_stream(
     )
 }
 
+/// How a stdout pump pass ended once the attach stream closed.
+enum StdoutPumpEnd {
+    /// The stream closed with no execution in flight, or the execution was
+    /// already terminalized by a read/codec failure.
+    Idle,
+    /// The stream closed while an execution was still active. Treat this as a
+    /// transport detach; the pump loop decides whether to recover or fail.
+    EofActiveExecution {
+        execution: Box<SessionExecution>,
+        lines_pumped: u64,
+    },
+}
+
+struct StdoutPumpLoop {
+    ctx: RuntimeContext,
+    open_lock: Arc<Mutex<()>>,
+    thread_key: ThreadKey,
+    sandbox_id: String,
+    pipe: SessionPipe,
+    stdout: SandboxRead,
+    guard: SandboxIoGuard,
+}
+
+enum ReattachOutcome {
+    Reattached {
+        pipe: SessionPipe,
+        stdout: SandboxRead,
+        guard: SandboxIoGuard,
+    },
+    /// Another pipe replaced ours; that pump now owns the sandbox stream.
+    Superseded,
+    /// A retryable attach/status failure. The caller bounds attempts.
+    Retryable(String),
+    /// The sandbox cannot serve IO anymore.
+    Dead(String),
+}
+
+fn session_pipe_from_stdin(stdin: SandboxWrite) -> SessionPipe {
+    SessionPipe {
+        stdin: Arc::new(Mutex::new(FramedWrite::new(stdin, LinesCodec::new()))),
+    }
+}
+
+fn spawn_stderr_drain(sandbox_id: String, stderr: SandboxRead) {
+    tokio::spawn(async move {
+        if let Err(error) = drain_stderr(stderr).await {
+            warn!(
+                component = COMPONENT_SESSION_RUNTIME,
+                event = "session_stderr_drain_failed",
+                sandbox_id = %sandbox_id,
+                %error,
+                "session stderr drain failed"
+            );
+        }
+    });
+}
+
+fn remove_pipe_if_current(sandbox_pipes: &SessionPipeMap, sandbox_id: &str, pipe: &SessionPipe) {
+    sandbox_pipes.remove_if(sandbox_id, |_sandbox_id, current| {
+        Arc::ptr_eq(&current.stdin, &pipe.stdin)
+    });
+}
+
+/// Runs the stdout pump and reattaches when Kubernetes closes the attach
+/// stream before the active execution emits terminal output.
+fn spawn_stdout_pump_loop(state: StdoutPumpLoop) {
+    tokio::spawn(async move {
+        let StdoutPumpLoop {
+            ctx,
+            open_lock,
+            thread_key,
+            sandbox_id,
+            mut pipe,
+            mut stdout,
+            mut guard,
+        } = state;
+        let mut reattach_attempts = 0_u32;
+        let mut last_reattach_detail = "stdout reattach attempts exhausted".to_owned();
+
+        'pump: loop {
+            let result =
+                run_stdout_pump(ctx.clone(), thread_key.clone(), &sandbox_id, stdout, guard).await;
+            let (execution, lines_pumped) = match result {
+                Ok(StdoutPumpEnd::Idle) => break,
+                Ok(StdoutPumpEnd::EofActiveExecution {
+                    execution,
+                    lines_pumped,
+                }) => (execution, lines_pumped),
+                Err(error) => {
+                    warn!(
+                        component = COMPONENT_SESSION_RUNTIME,
+                        event = "session_stdout_pump_failed",
+                        thread_key = %thread_key,
+                        sandbox_id = %sandbox_id,
+                        %error,
+                        "session stdout pump failed"
+                    );
+                    let _ = ctx
+                        .store
+                        .append_event(
+                            &thread_key,
+                            None,
+                            "session.stdout_pump_failed",
+                            json!({
+                                "sandbox_id": sandbox_id.as_str(),
+                                "error": error.to_string(),
+                            }),
+                        )
+                        .await;
+                    break;
+                }
+            };
+
+            if recover_detached_terminal_output(&ctx, &thread_key, &sandbox_id, &execution)
+                .await
+                .unwrap_or_else(|error| {
+                    warn!(
+                        component = COMPONENT_SESSION_RUNTIME,
+                        event = "session_stdout_recovery_failed",
+                        thread_key = %thread_key,
+                        sandbox_id = %sandbox_id,
+                        execution_id = %execution.execution_id,
+                        %error,
+                        "failed to recover detached stdout from recorded output"
+                    );
+                    false
+                })
+            {
+                break;
+            }
+
+            if lines_pumped > 0 {
+                reattach_attempts = 0;
+            }
+
+            loop {
+                if reattach_attempts >= SESSION_PIPE_MAX_REATTACH_ATTEMPTS {
+                    fail_detached_execution(
+                        &ctx,
+                        &thread_key,
+                        &sandbox_id,
+                        &execution.execution_id,
+                        &last_reattach_detail,
+                    )
+                    .await;
+                    break 'pump;
+                }
+                reattach_attempts += 1;
+                if reattach_attempts > 1 {
+                    sleep(SESSION_PIPE_REATTACH_DELAY).await;
+                }
+
+                match reattach_session_pipe(&ctx, &open_lock, &sandbox_id, &pipe).await {
+                    ReattachOutcome::Reattached {
+                        pipe: new_pipe,
+                        stdout: new_stdout,
+                        guard: new_guard,
+                    } => {
+                        info!(
+                            component = COMPONENT_SESSION_RUNTIME,
+                            event = "session_stdout_pump_reattached",
+                            thread_key = %thread_key,
+                            sandbox_id = %sandbox_id,
+                            execution_id = %execution.execution_id,
+                            attempt = reattach_attempts,
+                            "reattached session stdout pump after eof"
+                        );
+                        let _ = ctx
+                            .store
+                            .append_event(
+                                &thread_key,
+                                Some(&execution.execution_id),
+                                "session.stdout_pump_reattached",
+                                json!({
+                                    "sandbox_id": sandbox_id.as_str(),
+                                    "attempt": reattach_attempts,
+                                }),
+                            )
+                            .await;
+                        pipe = new_pipe;
+                        stdout = new_stdout;
+                        guard = new_guard;
+                        continue 'pump;
+                    }
+                    ReattachOutcome::Superseded => return,
+                    ReattachOutcome::Retryable(detail) => {
+                        warn!(
+                            component = COMPONENT_SESSION_RUNTIME,
+                            event = "session_stdout_pump_reattach_failed",
+                            thread_key = %thread_key,
+                            sandbox_id = %sandbox_id,
+                            execution_id = %execution.execution_id,
+                            attempt = reattach_attempts,
+                            detail = %detail,
+                            "session stdout pump reattach attempt failed"
+                        );
+                        last_reattach_detail = detail;
+                    }
+                    ReattachOutcome::Dead(detail) => {
+                        fail_detached_execution(
+                            &ctx,
+                            &thread_key,
+                            &sandbox_id,
+                            &execution.execution_id,
+                            &detail,
+                        )
+                        .await;
+                        break 'pump;
+                    }
+                }
+            }
+        }
+
+        remove_pipe_if_current(&ctx.sandbox_pipes, &sandbox_id, &pipe);
+    });
+}
+
+async fn reattach_session_pipe(
+    ctx: &RuntimeContext,
+    open_lock: &Arc<Mutex<()>>,
+    sandbox_id: &str,
+    pipe: &SessionPipe,
+) -> ReattachOutcome {
+    let _open_guard = open_lock.lock().await;
+    if ctx
+        .sandbox_pipes
+        .get(sandbox_id)
+        .is_none_or(|current| !Arc::ptr_eq(&current.stdin, &pipe.stdin))
+    {
+        return ReattachOutcome::Superseded;
+    }
+
+    let id = SandboxId::new(sandbox_id);
+    match ctx.manager.status(&id).await {
+        Ok(status) if status.can_open_io() => match ctx.manager.open_io(&id).await {
+            Ok(io) => {
+                let parts = io.into_parts();
+                let new_pipe = session_pipe_from_stdin(parts.stdin);
+                ctx.sandbox_pipes
+                    .insert(sandbox_id.to_owned(), new_pipe.clone());
+                spawn_stderr_drain(sandbox_id.to_owned(), parts.stderr);
+                ReattachOutcome::Reattached {
+                    pipe: new_pipe,
+                    stdout: parts.stdout,
+                    guard: parts.guard,
+                }
+            }
+            Err(error) => {
+                ReattachOutcome::Retryable(format!("sandbox stdout reattach failed: {error}"))
+            }
+        },
+        Ok(status) => {
+            ReattachOutcome::Dead(format!("sandbox no longer accepts io (status {status:?})"))
+        }
+        Err(SandboxError::NotFound(_)) => {
+            ReattachOutcome::Dead("sandbox no longer exists".to_owned())
+        }
+        Err(error) => ReattachOutcome::Retryable(format!("sandbox status check failed: {error}")),
+    }
+}
+
+async fn recover_detached_terminal_output(
+    ctx: &RuntimeContext,
+    thread_key: &ThreadKey,
+    sandbox_id: &str,
+    execution: &SessionExecution,
+) -> Result<bool, SessionRuntimeError> {
+    let since = execution.started_at.unwrap_or(execution.created_at);
+    let id = SandboxId::new(sandbox_id);
+    let lines = match ctx
+        .manager
+        .read_output_since(&id, Some(SystemTime::from(since)))
+        .await
+    {
+        Ok(lines) => lines,
+        Err(SandboxError::Unsupported { .. }) => return Ok(false),
+        Err(error) => {
+            warn!(
+                component = COMPONENT_SESSION_RUNTIME,
+                event = "session_stdout_recorded_output_read_failed",
+                thread_key = %thread_key,
+                execution_id = %execution.execution_id,
+                sandbox_id,
+                %error,
+                "failed to read recorded sandbox output; reattaching live"
+            );
+            return Ok(false);
+        }
+    };
+
+    let Some(terminal) = terminal_output_from_lines(&lines) else {
+        return Ok(false);
+    };
+
+    info!(
+        component = COMPONENT_SESSION_RUNTIME,
+        event = "session_stdout_pump_recovered",
+        thread_key = %thread_key,
+        execution_id = %execution.execution_id,
+        sandbox_id,
+        mode = "recorded_output",
+        "recovered detached stdout pump from recorded sandbox output"
+    );
+    let _ = ctx
+        .store
+        .append_event(
+            thread_key,
+            Some(&execution.execution_id),
+            "session.stdout_pump_recovered",
+            json!({ "sandbox_id": sandbox_id, "mode": "recorded_output" }),
+        )
+        .await;
+    record_terminal_output(
+        ctx,
+        thread_key,
+        sandbox_id,
+        &execution.execution_id,
+        terminal,
+    )
+    .await?;
+    Ok(true)
+}
+
+async fn fail_detached_execution(
+    ctx: &RuntimeContext,
+    thread_key: &ThreadKey,
+    sandbox_id: &str,
+    execution_id: &str,
+    detail: &str,
+) {
+    let error = format!("sandbox stdout closed before terminal output; {detail}");
+    if let Err(record_error) = record_terminal_output(
+        ctx,
+        thread_key,
+        sandbox_id,
+        execution_id,
+        TerminalOutput::Failed { error },
+    )
+    .await
+    {
+        warn!(
+            component = COMPONENT_SESSION_RUNTIME,
+            event = "session_stdout_detached_fail_record_failed",
+            thread_key = %thread_key,
+            execution_id,
+            sandbox_id,
+            error = %record_error,
+            "failed to record detached stdout failure"
+        );
+    }
+}
+
 async fn run_stdout_pump(
     ctx: RuntimeContext,
     thread_key: ThreadKey,
     sandbox_id: &str,
     stdout: SandboxRead,
     _guard: SandboxIoGuard,
-) -> Result<(), SessionRuntimeError> {
+) -> Result<StdoutPumpEnd, SessionRuntimeError> {
     let span = info_span!(
         "centaur.api_rs.session.stdout_pump",
         component = COMPONENT_SESSION_RUNTIME,
@@ -2326,7 +2672,13 @@ async fn run_stdout_pump(
         thread_key = %thread_key,
         sandbox_id,
     );
+    set_span_parent_trace(
+        &span,
+        &thread_trace_id(&thread_key),
+        &thread_trace_parent_span_id(&thread_key),
+    );
     async {
+        ensure_thread_trace_root_span(&thread_key);
         let mut stdout = FramedRead::new(stdout, LinesCodec::new());
         info!(
             component = COMPONENT_SESSION_RUNTIME,
@@ -2343,7 +2695,7 @@ async fn run_stdout_pump(
                 Err(error) => {
                     let message = stdout_pump_error_message(&error);
                     record_stdout_pump_failure(&ctx, &thread_key, sandbox_id, message).await?;
-                    return Ok(());
+                    return Ok(StdoutPumpEnd::Idle);
                 }
             };
             line_count += 1;
@@ -2426,33 +2778,7 @@ async fn run_stdout_pump(
                 output_state.forget(&output_execution_id);
             }
         }
-        if let Some(execution) = ctx.store.active_execution_for_thread(&thread_key).await? {
-            let execution_span = ctx
-                .execution_spans
-                .lock()
-                .await
-                .get(&execution.execution_id)
-                .cloned();
-            let output_span = output_state.stdout_span_for_execution(
-                execution_span.as_ref(),
-                &thread_key,
-                sandbox_id,
-                &execution.execution_id,
-            );
-            record_terminal_output(
-                &ctx,
-                &thread_key,
-                sandbox_id,
-                &execution.execution_id,
-                TerminalOutput::Failed {
-                    error: "sandbox stdout closed before terminal output".to_owned(),
-                },
-            )
-            .instrument(output_span)
-            .await?;
-            ctx.execution_spans.lock().await.remove(&execution.execution_id);
-            output_state.forget(&execution.execution_id);
-        }
+        let active_execution = ctx.store.active_execution_for_thread(&thread_key).await?;
         ctx.store
             .append_event(
                 &thread_key,
@@ -2471,7 +2797,13 @@ async fn run_stdout_pump(
             output_line_count = line_count,
             "session stdout pump completed"
         );
-        Ok(())
+        match active_execution {
+            Some(execution) => Ok(StdoutPumpEnd::EofActiveExecution {
+                execution: Box::new(execution),
+                lines_pumped: line_count,
+            }),
+            None => Ok(StdoutPumpEnd::Idle),
+        }
     }
     .instrument(span)
     .await
@@ -3910,12 +4242,33 @@ impl SessionTraceContext {
 
 /// Deterministic per-thread trace id: one trace identity per thread without a
 /// `thread_traces` table (derive, don't store).
-fn thread_trace_id(thread_key: &ThreadKey) -> String {
+pub fn thread_trace_id(thread_key: &ThreadKey) -> String {
     uuid::Uuid::new_v5(
         &uuid::Uuid::NAMESPACE_URL,
         format!("centaur:thread:{}", thread_key.as_str()).as_bytes(),
     )
     .to_string()
+}
+
+fn ensure_thread_trace_root_span(thread_key: &ThreadKey) {
+    let trace_id = thread_trace_id(thread_key);
+    let root_span_id = thread_trace_parent_span_id(thread_key);
+    let thread_key = thread_key.as_str().to_owned();
+    if let Ok(handle) = tokio::runtime::Handle::try_current() {
+        handle.spawn(async move {
+            let _ = export_thread_trace_root_span(&trace_id, &root_span_id, &thread_key).await;
+        });
+    }
+}
+
+pub fn thread_trace_parent_span_id(thread_key: &ThreadKey) -> String {
+    let digest = Sha256::digest(format!("centaur:thread-parent:{}", thread_key.as_str()));
+    let mut bytes = [0_u8; 8];
+    bytes.copy_from_slice(&digest[..8]);
+    if bytes.iter().all(|byte| *byte == 0) {
+        bytes[7] = 1;
+    }
+    bytes.iter().map(|byte| format!("{byte:02x}")).collect()
 }
 
 fn input_lines_with_session_context(
@@ -5413,6 +5766,16 @@ mod tests {
         assert_ne!(thread_trace_id(&thread_key), thread_trace_id(&other));
         // The wrapper parses this with uuid.UUID(...): must stay a canonical UUID.
         assert!(uuid::Uuid::parse_str(&thread_trace_id(&thread_key)).is_ok());
+        assert_eq!(
+            thread_trace_parent_span_id(&thread_key),
+            thread_trace_parent_span_id(&thread_key)
+        );
+        assert_ne!(
+            thread_trace_parent_span_id(&thread_key),
+            thread_trace_parent_span_id(&other)
+        );
+        assert_eq!(thread_trace_parent_span_id(&thread_key).len(), 16);
+        assert_ne!(thread_trace_parent_span_id(&thread_key), "0000000000000000");
     }
 
     fn session_with_sandbox(sandbox_id: &str) -> Session {
@@ -5494,7 +5857,7 @@ mod adoption_tests {
 
     struct MockBackend {
         ios: Mutex<VecDeque<SandboxIo>>,
-        recorded_output: Vec<String>,
+        recorded_output: std::sync::Mutex<Vec<String>>,
         open_count: AtomicUsize,
         status: std::sync::Mutex<SandboxStatus>,
         create_id: String,
@@ -5507,7 +5870,7 @@ mod adoption_tests {
         fn new(status: SandboxStatus, recorded_output: Vec<String>) -> Self {
             Self {
                 ios: Mutex::new(VecDeque::new()),
-                recorded_output,
+                recorded_output: std::sync::Mutex::new(recorded_output),
                 open_count: AtomicUsize::new(0),
                 status: std::sync::Mutex::new(status),
                 create_id: "mock-sbx".to_owned(),
@@ -5523,6 +5886,14 @@ mod adoption_tests {
 
         fn opens(&self) -> usize {
             self.open_count.load(Ordering::SeqCst)
+        }
+
+        fn set_recorded_output(&self, recorded_output: Vec<String>) {
+            *self.recorded_output.lock().unwrap() = recorded_output;
+        }
+
+        fn set_status(&self, status: SandboxStatus) {
+            *self.status.lock().unwrap() = status;
         }
 
         fn fail_resume(&self) {
@@ -5568,7 +5939,7 @@ mod adoption_tests {
             _id: &SandboxId,
             _since: Option<SystemTime>,
         ) -> SandboxResult<Vec<String>> {
-            Ok(self.recorded_output.clone())
+            Ok(self.recorded_output.lock().unwrap().clone())
         }
 
         async fn status(&self, _id: &SandboxId) -> SandboxResult<SandboxStatus> {
@@ -5614,6 +5985,29 @@ mod adoption_tests {
             Box::pin(stderr_near),
         );
         (io, stdout_far, stdin_far)
+    }
+
+    fn completed_output_lines(result_text: &str) -> Vec<String> {
+        vec![
+            json!({
+                "type": "item.completed",
+                "item": {
+                    "id": "msg-1",
+                    "type": "agentMessage",
+                    "text": result_text,
+                    "phase": "final_answer"
+                }
+            })
+            .to_string(),
+            json!({"type": "turn.completed", "turn": {"id": "turn-1", "status": "completed"}})
+                .to_string(),
+        ]
+    }
+
+    fn completed_output_bytes(result_text: &str) -> Vec<u8> {
+        let mut output = completed_output_lines(result_text).join("\n");
+        output.push('\n');
+        output.into_bytes()
     }
 
     async fn test_store() -> Option<PgSessionStore> {
@@ -5924,6 +6318,152 @@ mod adoption_tests {
 
         first.expect("first pipe ensure should succeed");
         second.expect("second pipe ensure should reuse the first pipe");
+        assert_eq!(backend.opens(), 1);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn stdout_eof_recovers_terminal_output_from_recorded_logs() {
+        let Some(store) = test_store().await else {
+            return;
+        };
+        let _serial = TEST_LOCK.lock().await;
+        let thread_key =
+            ThreadKey::parse(format!("test:eof-recorded-{}", uuid::Uuid::new_v4())).unwrap();
+        orphaned_execution(&store, &thread_key, Some("sbx-recorded"), true).await;
+
+        let backend = Arc::new(MockBackend::new(SandboxStatus::Running, Vec::new()));
+        let (io, stdout, _stdin) = mock_io();
+        backend.push_io(io).await;
+
+        let runtime = runtime_with(&store, backend.clone());
+        runtime
+            .ensure_session_pipe(&thread_key, "sbx-recorded")
+            .await
+            .expect("open initial pipe");
+        backend.set_recorded_output(completed_output_lines("Recovered from pod logs."));
+        drop(stdout);
+
+        wait_for_event(&store, &thread_key, "session.execution_completed").await;
+        let all = events(&store, &thread_key).await;
+        assert!(
+            all.iter()
+                .any(|event| event.event_type == "session.stdout_pump_recovered"),
+            "expected recorded-output recovery event"
+        );
+        assert!(
+            !all.iter()
+                .any(|event| event.event_type == "session.stdout_pump_reattached"),
+            "recorded terminal output should avoid a live reattach"
+        );
+        assert!(
+            !all.iter()
+                .any(|event| event.event_type == "session.execution_failed"),
+            "stdout eof should not fail an active execution when logs contain a terminal turn"
+        );
+        let completed = all
+            .iter()
+            .find(|event| event.event_type == "session.execution_completed")
+            .expect("completed event");
+        assert_eq!(
+            completed.payload["result_text"].as_str(),
+            Some("Recovered from pod logs.")
+        );
+        assert_eq!(backend.opens(), 1);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn stdout_eof_reattaches_and_delivers_late_terminal_output() {
+        let Some(store) = test_store().await else {
+            return;
+        };
+        let _serial = TEST_LOCK.lock().await;
+        let thread_key =
+            ThreadKey::parse(format!("test:eof-reattach-{}", uuid::Uuid::new_v4())).unwrap();
+        orphaned_execution(&store, &thread_key, Some("sbx-reattach"), true).await;
+
+        let backend = Arc::new(MockBackend::new(SandboxStatus::Running, Vec::new()));
+        let (first_io, mut first_stdout, _first_stdin) = mock_io();
+        let (second_io, mut second_stdout, _second_stdin) = mock_io();
+        backend.push_io(first_io).await;
+        backend.push_io(second_io).await;
+
+        let runtime = runtime_with(&store, backend.clone());
+        runtime
+            .ensure_session_pipe(&thread_key, "sbx-reattach")
+            .await
+            .expect("open initial pipe");
+        first_stdout
+            .write_all(b"{\"type\":\"thread.started\",\"thread_id\":\"mock-thread\"}\n")
+            .await
+            .unwrap();
+        drop(first_stdout);
+
+        wait_for_event(&store, &thread_key, "session.stdout_pump_reattached").await;
+        second_stdout
+            .write_all(&completed_output_bytes("Completed after reattach."))
+            .await
+            .unwrap();
+
+        wait_for_event(&store, &thread_key, "session.execution_completed").await;
+        let all = events(&store, &thread_key).await;
+        assert!(
+            !all.iter()
+                .any(|event| event.event_type == "session.execution_failed"),
+            "reattached stdout should not produce the old false failure"
+        );
+        let completed = all
+            .iter()
+            .find(|event| event.event_type == "session.execution_completed")
+            .expect("completed event");
+        assert_eq!(
+            completed.payload["result_text"].as_str(),
+            Some("Completed after reattach.")
+        );
+        assert_eq!(backend.opens(), 2);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn stdout_eof_fails_when_sandbox_no_longer_accepts_io() {
+        let Some(store) = test_store().await else {
+            return;
+        };
+        let _serial = TEST_LOCK.lock().await;
+        let thread_key =
+            ThreadKey::parse(format!("test:eof-gone-{}", uuid::Uuid::new_v4())).unwrap();
+        orphaned_execution(&store, &thread_key, Some("sbx-gone"), true).await;
+
+        let backend = Arc::new(MockBackend::new(SandboxStatus::Running, Vec::new()));
+        let (io, stdout, _stdin) = mock_io();
+        backend.push_io(io).await;
+
+        let runtime = runtime_with(&store, backend.clone());
+        runtime
+            .ensure_session_pipe(&thread_key, "sbx-gone")
+            .await
+            .expect("open initial pipe");
+        backend.set_status(SandboxStatus::Gone);
+        drop(stdout);
+
+        wait_for_event(&store, &thread_key, "session.execution_failed").await;
+        let all = events(&store, &thread_key).await;
+        let failed = all
+            .iter()
+            .find(|event| event.event_type == "session.execution_failed")
+            .expect("failed event");
+        let error = failed.payload["error"].as_str().unwrap_or_default();
+        assert!(
+            error.contains("sandbox stdout closed before terminal output"),
+            "unexpected error: {error}"
+        );
+        assert!(
+            error.contains("sandbox no longer accepts io"),
+            "expected sandbox status detail: {error}"
+        );
+        assert!(
+            !all.iter()
+                .any(|event| event.event_type == "session.stdout_pump_reattached"),
+            "gone sandbox should not reattach"
+        );
         assert_eq!(backend.opens(), 1);
     }
 

@@ -12,6 +12,28 @@ from rich.console import Console  # noqa: E402
 from centaur_sdk import Table  # noqa: E402
 
 app = typer.Typer(name="discord", help="Discord self-token CLI for AI agents")
+
+
+@app.command("health")
+def health():
+    """Assert discord connectivity and auth with a safe read-only check."""
+    from .client import _client
+
+    client = _client()
+    try:
+        details = client.get_me()
+        payload = {"ok": True, "tool": "discord", "error": None, "details": details}
+    except Exception as exc:
+        payload = {"ok": False, "tool": "discord", "error": str(exc), "details": {}}
+        print(json.dumps(payload, indent=2, ensure_ascii=False, default=str))
+        raise typer.Exit(1) from exc
+    finally:
+        close = getattr(client, "close", None)
+        if callable(close):
+            close()
+    print(json.dumps(payload, indent=2, ensure_ascii=False, default=str))
+
+
 console = Console()
 
 
@@ -80,7 +102,9 @@ def servers(
     table.add_column("ID", style="dim")
     table.add_column("Members", style="green")
     for guild in results:
-        table.add_row(guild.get("name", ""), guild.get("id", ""), str(guild.get("member_count", "")))
+        table.add_row(
+            guild.get("name", ""), guild.get("id", ""), str(guild.get("member_count", ""))
+        )
     console.print(table)
 
 
@@ -195,6 +219,9 @@ def post(
     channel: str = typer.Argument(..., help="Channel name or ID"),
     message: str = typer.Argument(..., help="Message text"),
     reply_to: str = typer.Option(None, "--reply-to", "-r", help="Message ID to reply to"),
+    suppress_embeds: bool = typer.Option(
+        False, "--suppress-embeds", help="Suppress link/embed unfurling on the message"
+    ),
     json_output: bool = typer.Option(False, "--json", help="Output as JSON"),
 ):
     """Post a message to a channel."""
@@ -202,10 +229,13 @@ def post(
         channel=channel,
         content=message,
         reply_to_message_id=reply_to,
+        suppress_embeds=suppress_embeds,
     )
     if _emit(result, json_output):
         return
-    console.print(f"[green]Sent[/] message {result.get('id')} to channel {result.get('channel_id')}")
+    console.print(
+        f"[green]Sent[/] message {result.get('id')} to channel {result.get('channel_id')}"
+    )
 
 
 @app.command("upload")

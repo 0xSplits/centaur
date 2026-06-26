@@ -15,6 +15,17 @@ from centaur_sdk import secret
 BASE_URL = "https://discord.com/api/v10"
 INVITE_RE = re.compile(r"(?:https?://)?(?:discord(?:\.gg|\.com/invite)/)?([A-Za-z0-9-]+)")
 
+# Discord asks automated clients to identify themselves with a descriptive
+# User-Agent (https://discord.com/developers/docs/reference#user-agent). When
+# this client runs under a *bot* token (Authorization: ``Bot <token>``), sending
+# a browser User-Agent trips Discord's edge anti-automation: guild/channel reads
+# come back ``403`` with body ``internal network error`` while ``/users/@me``
+# still succeeds. A proper bot UA keeps reads working under a bot token (and is
+# harmless under a user token).
+USER_AGENT = "DiscordBot (https://github.com/paradigmxyz/centaur, 0.1.0)"
+# Message flag that suppresses link/embed unfurling on a posted message (1 << 2).
+SUPPRESS_EMBEDS = 1 << 2
+
 # Discord thread channel types
 # (https://discord.com/developers/docs/resources/channel#channel-object-channel-types).
 THREAD_TYPES = {10: "announcement_thread", 11: "public_thread", 12: "private_thread"}
@@ -47,10 +58,7 @@ class DiscordClient:
         headers = {
             "Authorization": self._get_token(),
             "Content-Type": "application/json",
-            "User-Agent": (
-                "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
-                "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
-            ),
+            "User-Agent": USER_AGENT,
         }
         with httpx.Client(timeout=self.timeout) as client:
             response = client.request(method, f"{BASE_URL}{endpoint}", headers=headers, **kwargs)
@@ -194,10 +202,17 @@ class DiscordClient:
         channel: str,
         content: str,
         reply_to_message_id: str | None = None,
+        suppress_embeds: bool = False,
     ) -> dict[str, Any]:
-        """Post a message to a channel by name or ID."""
+        """Post a message to a channel by name or ID.
+
+        Set ``suppress_embeds`` to stop Discord unfurling link previews — useful
+        for status/alert posts whose URLs should stay compact.
+        """
         resolved = self._find_channel(channel)
         payload: dict[str, Any] = {"content": content}
+        if suppress_embeds:
+            payload["flags"] = SUPPRESS_EMBEDS
         if reply_to_message_id:
             payload["message_reference"] = {"message_id": reply_to_message_id}
         msg = self._request("POST", f"/channels/{resolved['id']}/messages", json=payload)
