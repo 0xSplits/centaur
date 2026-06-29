@@ -90,21 +90,17 @@ export function evaluateCi(
   };
 }
 
-/** A PR is bot-owned if the bot authored it, or it carries the managed label. */
+/**
+ * A PR is bot-owned when the bot is one of its assignees. Ownership is purely an
+ * assignment mechanism: assign the PR to the bot to have it manage the PR toward
+ * merge (and unassign to hand it back).
+ */
 export function isOwnedPr(input: {
-  author: string | undefined;
-  labels: string[];
-  managedLabel: string;
+  assignees: string[];
   userName: string;
 }): boolean {
-  if (
-    input.author &&
-    input.author.toLowerCase() === input.userName.toLowerCase()
-  ) {
-    return true;
-  }
-  const labels = input.labels.map((l) => l.toLowerCase());
-  return labels.includes(input.managedLabel.toLowerCase());
+  const target = input.userName.toLowerCase();
+  return input.assignees.some((login) => login.toLowerCase() === target);
 }
 
 export type MergeDecision =
@@ -212,7 +208,7 @@ function logger(ctx: PrManagerContext) {
 // ---------------------------------------------------------------------------
 
 type PullRequestSummary = {
-  author: string | undefined;
+  assignees: string[];
   draft: boolean;
   headRef: string;
   headSha: string;
@@ -224,6 +220,13 @@ type PullRequestSummary = {
   title: string;
 };
 
+function assigneeLogins(
+  value: ({ login?: string } | null)[] | null | undefined,
+): string[] {
+  if (!value) return [];
+  return value.map((a) => a?.login ?? "").filter(Boolean);
+}
+
 function summarizePr(pr: {
   draft?: boolean | null;
   head: { ref: string; sha: string };
@@ -233,10 +236,10 @@ function summarizePr(pr: {
   number: number;
   state: string;
   title: string;
-  user: { login: string } | null;
+  assignees?: ({ login?: string } | null)[] | null;
 }): PullRequestSummary {
   return {
-    author: pr.user?.login,
+    assignees: assigneeLogins(pr.assignees),
     draft: pr.draft === true,
     headRef: pr.head.ref,
     headSha: pr.head.sha,
@@ -303,12 +306,7 @@ export async function isPrOwned(
 }
 
 function owns(ctx: PrManagerContext, pr: PullRequestSummary): boolean {
-  return isOwnedPr({
-    author: pr.author,
-    labels: pr.labels,
-    managedLabel: ctx.options.managedLabel ?? "centaur-managed",
-    userName: ctx.userName,
-  });
+  return isOwnedPr({ assignees: pr.assignees, userName: ctx.userName });
 }
 
 /** `pull_request` lifecycle (non-review_requested actions). */
@@ -329,8 +327,17 @@ export async function handlePullRequestEvent(
 
   const pr = await fetchPr(ctx, repo.owner, repo.repo, number);
   if (!pr || !owns(ctx, pr)) return;
-  // Any state change that could flip mergeability re-evaluates the merge gate;
-  // it's deterministic and idempotent, so over-calling is harmless.
+  // Being assigned the PR is the explicit signal to take it over: evaluate CI now
+  // (forcing past the human-commit back-off — the assignment is a human handing
+  // it to us) so an already-red or already-green PR is acted on immediately,
+  // rather than only on the next lifecycle event. processCi fixes red CI or merges
+  // when green.
+  if (action === "assigned") {
+    await processCi(ctx, repo.owner, repo.repo, number, pr.headSha, true);
+    return;
+  }
+  // Any other state change that could flip mergeability re-evaluates the merge
+  // gate; it's deterministic and idempotent, so over-calling is harmless.
   await tryMerge(ctx, repo.owner, repo.repo, number);
 }
 
@@ -400,6 +407,7 @@ async function processCi(
   repo: string,
   number: number,
   headSha: string,
+  force = false,
 ): Promise<void> {
   const pr = await fetchPr(ctx, owner, repo, number);
   if (!pr || !owns(ctx, pr)) return;
@@ -430,13 +438,17 @@ async function processCi(
     return;
   }
 
-  // Red: back off if a human pushed the failing commit (don't step on them).
-  const headAuthor = await commitAuthor(ctx, owner, repo, headSha);
-  if (headAuthor && headAuthor.toLowerCase() !== ctx.userName.toLowerCase()) {
-    traceLog(ctx.options, "githubbot_ci_human_commit_skipped", trace, {
-      author: headAuthor,
-    });
-    return;
+  // Red: back off if a human pushed the failing commit (don't step on them) —
+  // unless this is a forced takeover (the PR was just assigned to us, so the
+  // human has explicitly handed it over and we fix it regardless of who pushed).
+  if (!force) {
+    const headAuthor = await commitAuthor(ctx, owner, repo, headSha);
+    if (headAuthor && headAuthor.toLowerCase() !== ctx.userName.toLowerCase()) {
+      traceLog(ctx.options, "githubbot_ci_human_commit_skipped", trace, {
+        author: headAuthor,
+      });
+      return;
+    }
   }
 
   const maxAttempts = ctx.options.ciFixMaxAttempts ?? DEFAULT_CI_FIX_MAX_ATTEMPTS;

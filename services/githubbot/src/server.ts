@@ -41,6 +41,24 @@ if (!reviewPrompt && reviewPromptFile) {
   }
 }
 
+// Full issue-work methodology override. Same precedence as the review prompt:
+// inline wins; otherwise a mounted file (the overlay's path). Unset -> the
+// bundled DEFAULT_ISSUE_PROMPT is used.
+const issuePromptInline = optionalEnv("GITHUBBOT_ISSUE_PROMPT");
+const issuePromptFile = optionalEnv("GITHUBBOT_ISSUE_PROMPT_FILE");
+let issuePrompt: string | undefined = issuePromptInline;
+if (!issuePrompt && issuePromptFile) {
+  try {
+    issuePrompt = readFileSync(issuePromptFile, "utf8");
+  } catch (error) {
+    throw new Error(
+      `GITHUBBOT_ISSUE_PROMPT_FILE (${issuePromptFile}) could not be read: ${
+        error instanceof Error ? error.message : String(error)
+      }`,
+    );
+  }
+}
+
 // Default to info: the chat adapter logs raw webhook bodies at debug, and
 // JSON-serializing those payloads on the hot path blocks the event loop.
 const LOG_LEVELS = ["debug", "info", "warn", "error"] as const;
@@ -81,7 +99,6 @@ const options: GithubbotOptions = {
   deleteBranchOnMerge: boolEnv("GITHUBBOT_DELETE_BRANCH_ON_MERGE", true),
   escalationHandle: optionalEnv("GITHUBBOT_ESCALATION_HANDLE"),
   holdLabel: optionalEnv("GITHUBBOT_HOLD_LABEL"),
-  managedLabel: optionalEnv("GITHUBBOT_MANAGED_LABEL"),
   mergeMethod: mergeMethodEnv(),
   defaultHarnessType: optionalEnv("GITHUBBOT_DEFAULT_HARNESS"),
   githubApiUrl: optionalEnv("GITHUB_API_URL"),
@@ -89,6 +106,7 @@ const options: GithubbotOptions = {
   maxDurationMs: optionalNumberEnv("SESSION_MAX_DURATION_MS"),
   postgresUrl,
   reviewPrompt,
+  issuePrompt,
   stateKeyPrefix: optionalEnv("GITHUBBOT_STATE_KEY_PREFIX"),
   token,
   userName,

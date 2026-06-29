@@ -40,8 +40,11 @@ describe("parseGithubThreadKey", () => {
     expect(parseGithubThreadKey("linear:abc:c:def")).toBeNull();
     expect(parseGithubThreadKey("github:no-repo:1")).toBeNull();
     expect(parseGithubThreadKey("github:owner/repo:notanumber")).toBeNull();
-    // The isolated review thread key is intentionally not a postable github key.
+    // The isolated review/issue-work/management thread keys are intentionally
+    // not postable github keys.
     expect(parseGithubThreadKey("github-review:0xSplits/centaur:7")).toBeNull();
+    expect(parseGithubThreadKey("github-issue:0xSplits/centaur:7")).toBeNull();
+    expect(parseGithubThreadKey("github-manage:0xSplits/centaur:7")).toBeNull();
   });
 });
 

@@ -123,6 +123,12 @@ export type GithubbotOptions = {
    */
   reviewPrompt?: string;
   /**
+   * Full issue-work methodology used when an issue is assigned to the bot.
+   * Defaults to the bundled DEFAULT_ISSUE_PROMPT; a deployment can fully replace
+   * it via GITHUBBOT_ISSUE_PROMPT(_FILE) so org playbooks override ours wholesale.
+   */
+  issuePrompt?: string;
+  /**
    * v2 PR self-management: auto-merge owned PRs when GitHub reports them
    * mergeable (branch protection is the source of truth). Defaults to true.
    */
@@ -133,8 +139,6 @@ export type GithubbotOptions = {
   deleteBranchOnMerge?: boolean;
   /** Fallback @handle to tag when the bot gives up and escalates. */
   escalationHandle?: string;
-  /** Label that marks a PR as bot-managed (in addition to author == bot). Default "centaur-managed". */
-  managedLabel?: string;
   /** Label that pauses auto-merge on a PR. Default "do-not-merge". */
   holdLabel?: string;
   /** Merge method for auto-merge: "merge" | "squash" | "rebase". Default "squash". */
