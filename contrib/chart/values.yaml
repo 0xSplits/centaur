@@ -399,6 +399,17 @@ githubbot:
   # bundled default is used. Supply the whole methodology; it's used verbatim.
   reviewPrompt: ""
   issuePrompt: ""
+  # Extra guidance prepended to owned-PR management turns (CI-fix / conflict /
+  # address-review) — the riskiest autonomous surface. Same delivery as the
+  # review/issue prompts (ConfigMap + mounted file). Empty = built-in preamble only.
+  managementPrompt: ""
+  # GitHub author_association values allowed to drive the comment-mention path.
+  # Empty = the bot's safe default (OWNER, MEMBER, COLLABORATOR). Use "*" to allow
+  # everyone (e.g. a fully-private repo). Comma-separated.
+  allowedAuthorAssociations: ""
+  # How long (seconds) to let in-flight turns finish on shutdown before the pod is
+  # killed, so a deploy doesn't drop running CI fixes / reviews / issue work.
+  terminationGracePeriodSeconds: 120
   extraEnv: {}
   resources: {}
 

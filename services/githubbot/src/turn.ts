@@ -6,6 +6,7 @@ import {
 import type { GitHubAdapter } from "@chat-adapter/github";
 import type { Thread } from "chat";
 import { buildCommentReplyBody, CommentReplyCollector } from "./comment-bot";
+import { runExclusive } from "./context";
 import {
   executeSessionTurn,
   forwardToSessionApi,
@@ -175,7 +176,20 @@ export async function reactSafe(
  * thread to post into) and the review path (which posts via the agent's own gh
  * calls) share it.
  */
-export async function runTurnStream(
+export function runTurnStream(
+  options: GithubbotOptions,
+  forwardInput: ForwardSessionInput,
+): Promise<TurnResult> {
+  // Serialize turns targeting the same session so a conversational mention and a
+  // lifecycle-driven management turn (both keyed to `github-manage:…`) can't run
+  // concurrently in one sandbox and interleave git/push operations. Different
+  // session keys still run in parallel.
+  return runExclusive(forwardInput.threadId, () =>
+    runTurnStreamInner(options, forwardInput),
+  );
+}
+
+async function runTurnStreamInner(
   options: GithubbotOptions,
   forwardInput: ForwardSessionInput,
 ): Promise<TurnResult> {

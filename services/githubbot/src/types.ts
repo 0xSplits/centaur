@@ -129,6 +129,15 @@ export type GithubbotOptions = {
    */
   issuePrompt?: string;
   /**
+   * Extra guidance prepended to every owned-PR management turn (CI-fix, conflict
+   * resolution, address-review) — the riskiest autonomous surface, where a
+   * deployment may want to constrain how the agent edits and pushes (e.g. "never
+   * force-push", "always run the suite first") without forking the per-action
+   * instructions. Unset -> just the built-in per-action preamble. Set via
+   * GITHUBBOT_MANAGEMENT_PROMPT(_FILE).
+   */
+  managementPrompt?: string;
+  /**
    * v2 PR self-management: auto-merge owned PRs when GitHub reports them
    * mergeable (branch protection is the source of truth). Defaults to true.
    */
@@ -146,6 +155,14 @@ export type GithubbotOptions = {
   /** Personal access token for the bot's GitHub teammate account. */
   token: string;
   userName?: string;
+  /**
+   * GitHub `author_association` values allowed to drive the conversational
+   * (comment-mention) path. Defaults to OWNER/MEMBER/COLLABORATOR; the sentinel
+   * "*" allows everyone (e.g. a fully-private repo where every commenter is
+   * already trusted). Lifecycle paths (assignment, review-request) are gated by
+   * GitHub permissions and are not affected by this.
+   */
+  allowedAuthorAssociations?: string[];
   /** Webhook signing secret configured on the GitHub repo/org webhook. */
   webhookSecret: string;
 };

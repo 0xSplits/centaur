@@ -23,6 +23,9 @@ function makeState() {
       values.set(key, value);
       return true;
     },
+    async delete(key: string) {
+      values.delete(key);
+    },
   };
 }
 
@@ -264,5 +267,141 @@ describe("PR management webhooks", () => {
 
     expect(associatedCommitSha).toBe("abc123");
     expect(mergeCalls).toBe(1);
+  });
+});
+
+const approvedReview = (reviewId: number) =>
+  JSON.stringify({
+    action: "submitted",
+    repository: { full_name: "base/repo" },
+    pull_request: { number: 7 },
+    review: { id: reviewId, state: "approved", user: { login: "reviewer" } },
+  });
+
+const quietLogger = { debug() {}, warn() {}, error() {}, info() {} };
+
+describe("merge claim lifecycle", () => {
+  function mergeCtx(merge: () => Promise<unknown>) {
+    return {
+      octokit: {
+        rest: {
+          pulls: {
+            get: async () => ({
+              data: prPayload({ headRepoFullName: "base/repo" }),
+            }),
+            merge,
+          },
+          git: { deleteRef: async () => ({ data: {} }) },
+        },
+      },
+      options: {
+        apiUrl: "http://localhost",
+        deleteBranchOnMerge: false,
+        logger: quietLogger,
+      },
+      state: makeState(),
+      userName: "centaur-bot",
+    } as unknown as PrManagerContext;
+  }
+
+  test("releases the claim when merge fails, so a later event retries", async () => {
+    let mergeCalls = 0;
+    const ctx = mergeCtx(async () => {
+      mergeCalls += 1;
+      if (mergeCalls === 1) throw new Error("Base branch was modified");
+      return { data: {} };
+    });
+    await handleReviewEvent(ctx, approvedReview(1));
+    await handleReviewEvent(ctx, approvedReview(2));
+    expect(mergeCalls).toBe(2);
+  });
+
+  test("keeps the claim on success, so the same head sha is not re-merged", async () => {
+    let mergeCalls = 0;
+    const ctx = mergeCtx(async () => {
+      mergeCalls += 1;
+      return { data: {} };
+    });
+    await handleReviewEvent(ctx, approvedReview(1));
+    await handleReviewEvent(ctx, approvedReview(2));
+    expect(mergeCalls).toBe(1);
+  });
+});
+
+describe("CI fix counter and escalation", () => {
+  const redCheckRun = JSON.stringify({
+    repository: { full_name: "base/repo" },
+    check_run: { head_sha: "abc123", pull_requests: [{ number: 7 }] },
+  });
+
+  function ciCtx(
+    state: ReturnType<typeof makeState>,
+    comments: string[],
+  ): PrManagerContext {
+    return {
+      octokit: {
+        rest: {
+          checks: {
+            listForRef: async () => ({
+              data: {
+                check_runs: [
+                  { name: "build", status: "completed", conclusion: "failure" },
+                ],
+              },
+            }),
+          },
+          repos: {
+            getCombinedStatusForRef: async () => ({ data: { statuses: [] } }),
+            getCommit: async () => ({
+              data: { author: { login: "centaur-bot" } },
+            }),
+          },
+          pulls: {
+            get: async () => ({
+              data: prPayload({ headRepoFullName: "base/repo" }),
+            }),
+          },
+          issues: {
+            createComment: async (input: { body: string }) => {
+              comments.push(input.body);
+              return { data: {} };
+            },
+          },
+        },
+      },
+      options: {
+        apiUrl: "http://localhost",
+        ciFixMaxAttempts: 3,
+        escalationHandle: "maintainer",
+        logger: quietLogger,
+        // Non-retryable so the backgrounded fix turn settles off the network.
+        fetch: () => Promise.resolve(new Response("no", { status: 400 })),
+      },
+      state,
+      userName: "centaur-bot",
+    } as unknown as PrManagerContext;
+  }
+
+  test("increments the consecutive-fix counter below the cap", async () => {
+    const state = makeState();
+    await handleCiEvent(ciCtx(state, []), "check_run", redCheckRun);
+    expect(await state.get("centaur-githubbot:pr:base/repo#7")).toMatchObject({
+      consecutiveCiFixes: 1,
+    });
+  });
+
+  test("escalates and fires no fix turn once the cap is reached", async () => {
+    const state = makeState();
+    await state.set("centaur-githubbot:pr:base/repo#7", {
+      consecutiveCiFixes: 3,
+    });
+    const comments: string[] = [];
+    await handleCiEvent(ciCtx(state, comments), "check_run", redCheckRun);
+    expect(comments.length).toBe(1);
+    expect(comments[0]).toContain("@maintainer");
+    // The counter is not bumped past the cap.
+    expect(await state.get("centaur-githubbot:pr:base/repo#7")).toMatchObject({
+      consecutiveCiFixes: 3,
+    });
   });
 });

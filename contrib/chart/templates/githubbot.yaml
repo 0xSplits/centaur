@@ -1,6 +1,6 @@
 {{- if .Values.githubbot.enabled }}
 {{- $apiRsName := include "centaur.componentName" (dict "root" . "component" "api-rs") -}}
-{{- if or .Values.githubbot.reviewPrompt .Values.githubbot.issuePrompt }}
+{{- if or .Values.githubbot.reviewPrompt .Values.githubbot.issuePrompt .Values.githubbot.managementPrompt }}
 # Optional review / issue-work methodology overrides, delivered as mounted files
 # the bot reads at boot via GITHUBBOT_REVIEW_PROMPT_FILE / _ISSUE_PROMPT_FILE.
 apiVersion: v1
@@ -17,6 +17,10 @@ data:
 {{- if .Values.githubbot.issuePrompt }}
   issue-prompt.md: |-
 {{- .Values.githubbot.issuePrompt | nindent 4 }}
+{{- end }}
+{{- if .Values.githubbot.managementPrompt }}
+  management-prompt.md: |-
+{{- .Values.githubbot.managementPrompt | nindent 4 }}
 {{- end }}
 ---
 {{- end }}
@@ -35,12 +39,16 @@ spec:
     metadata:
       annotations:
         checksum/infra-secrets: {{ include "centaur.infraSecretsChecksum" . }}
-{{- if or .Values.githubbot.reviewPrompt .Values.githubbot.issuePrompt }}
-        checksum/prompts: {{ dict "review" .Values.githubbot.reviewPrompt "issue" .Values.githubbot.issuePrompt | toJson | sha256sum }}
+{{- if or .Values.githubbot.reviewPrompt .Values.githubbot.issuePrompt .Values.githubbot.managementPrompt }}
+        checksum/prompts: {{ dict "review" .Values.githubbot.reviewPrompt "issue" .Values.githubbot.issuePrompt "management" .Values.githubbot.managementPrompt | toJson | sha256sum }}
 {{- end }}
       labels:
 {{ include "centaur.componentSelectorLabels" (dict "root" . "component" "githubbot") | nindent 8 }}
     spec:
+      # Give in-flight agent turns time to finish on a rollout; the bot drains
+      # background work for GITHUBBOT_SHUTDOWN_DRAIN_MS (set below from this) on
+      # SIGTERM so a deploy doesn't drop a running CI fix / review / issue turn.
+      terminationGracePeriodSeconds: {{ .Values.githubbot.terminationGracePeriodSeconds }}
       automountServiceAccountToken: false
       {{- with .Values.global.imagePullSecrets }}
       imagePullSecrets:
@@ -102,6 +110,20 @@ spec:
             - name: GITHUBBOT_ISSUE_PROMPT_FILE
               value: /etc/githubbot/prompts/issue-prompt.md
 {{- end }}
+{{- if .Values.githubbot.managementPrompt }}
+            - name: GITHUBBOT_MANAGEMENT_PROMPT_FILE
+              value: /etc/githubbot/prompts/management-prompt.md
+{{- end }}
+{{- if .Values.githubbot.allowedAuthorAssociations }}
+            # author_association allowlist for the comment-mention path; unset =
+            # the bot's safe default (OWNER, MEMBER, COLLABORATOR).
+            - name: GITHUBBOT_ALLOWED_AUTHOR_ASSOCIATIONS
+              value: {{ .Values.githubbot.allowedAuthorAssociations | quote }}
+{{- end }}
+            # Drain budget on shutdown — kept ~10s under the grace period so the
+            # final flush + exit still fit before the pod is force-killed.
+            - name: GITHUBBOT_SHUTDOWN_DRAIN_MS
+              value: {{ mul (sub (int .Values.githubbot.terminationGracePeriodSeconds) 10) 1000 | quote }}
 {{- range $name, $value := .Values.githubbot.extraEnv }}
             - name: {{ $name }}
               value: {{ $value | quote }}
@@ -123,7 +145,7 @@ spec:
 {{ toYaml .Values.containerSecurityContext | nindent 12 }}
           resources:
 {{ toYaml .Values.githubbot.resources | nindent 12 }}
-{{- if or .Values.githubbot.reviewPrompt .Values.githubbot.issuePrompt }}
+{{- if or .Values.githubbot.reviewPrompt .Values.githubbot.issuePrompt .Values.githubbot.managementPrompt }}
           volumeMounts:
             - name: prompts
               mountPath: /etc/githubbot/prompts

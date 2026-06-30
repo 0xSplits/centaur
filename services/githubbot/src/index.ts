@@ -11,6 +11,11 @@ import {
 } from "chat";
 import { Hono, type Context } from "hono";
 import pg from "pg";
+import {
+  authorAssociationFromRaw,
+  isCommentAuthorAllowed,
+} from "./authorization";
+import { handleBodyMention } from "./body-mention";
 import { backgroundWaitUntil, requestContext, waitUntil } from "./context";
 import {
   handleIssueEvent,
@@ -75,7 +80,14 @@ export function createGithubbot(options: GithubbotOptions): Githubbot {
     userName,
     adapters: { github },
     state,
-    onLockConflict: "force",
+    // Serialize handling per thread so a redelivered or near-simultaneous comment
+    // can't run two handlers at once. The conversational dedup below claims a
+    // message id via a read-modify-write on thread state, so the deprecated
+    // onLockConflict: "force" would let two concurrent deliveries both pass the
+    // claim and double-execute/double-reply. "drop" keeps the lock (one runs, the
+    // duplicate is dropped) — matching discordbot, which migrated off "force" for
+    // exactly this reason.
+    concurrency: "drop",
     // The GitHub adapter buffers a turn and posts one comment (it rate-limits
     // edits), so the SDK's post+edit streaming placeholder doesn't apply — the
     // final answer posts once when the run settles.
@@ -170,15 +182,21 @@ export function createGithubbot(options: GithubbotOptions): Githubbot {
       return new globalThis.Response("invalid signature", { status: 401 });
     }
     const handled = requestContext.run(context, () =>
-      routeLifecycleEvent(eventType, rawBody, {
-        botUserName: userName,
-        deliveryId,
-        options,
-        prManagerCtx,
-        state,
-      }),
+      Promise.all([
+        routeLifecycleEvent(eventType, rawBody, {
+          botUserName: userName,
+          deliveryId,
+          options,
+          prManagerCtx,
+          state,
+        }) ?? undefined,
+        // Orthogonal to the lifecycle routes: an @-mention in a freshly-opened
+        // issue/PR body runs a conversational turn (the adapter only sees
+        // comments, so this is the only place a body mention is caught).
+        handleBodyMention(prManagerCtx, eventType, rawBody) ?? undefined,
+      ]),
     );
-    if (handled) waitUntil(c, handled);
+    waitUntil(c, handled);
     return new globalThis.Response("ok", { status: 200 });
   };
   app.post("/api/webhooks/github", handleGithubWebhook);
@@ -213,6 +231,18 @@ async function handleMessage(
   const logger = options.logger ?? noopLogger;
   if (message.author.isMe) {
     traceLog(options, "githubbot_self_message_skipped", undefined, {
+      message_id: message.id,
+      thread_id: thread.id,
+    });
+    return;
+  }
+  // Only sufficiently-trusted authors may drive a turn: the agent runs in a
+  // write-capable sandbox and posts its transcript back, so an untrusted
+  // commenter must not be able to steer it (or read its tool output). Gates both
+  // mentions (execute) and follow-up context (append). Fails closed.
+  if (!isCommentAuthorAllowed(message.raw, options)) {
+    traceLog(options, "githubbot_unauthorized_author_skipped", undefined, {
+      association: authorAssociationFromRaw(message.raw) ?? "unknown",
       message_id: message.id,
       thread_id: thread.id,
     });

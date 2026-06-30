@@ -31,12 +31,16 @@ type PullRequestWebhookPayload = {
   };
   repository?: { full_name?: unknown };
   requested_reviewer?: { login?: unknown; type?: unknown };
+  requested_team?: { slug?: unknown; name?: unknown };
   sender?: { login?: unknown };
 };
 
 // Review-request webhooks are de-duplicated by delivery id for a week — long
 // enough to cover GitHub's redelivery window without growing state unboundedly.
 const REVIEW_DEDUP_TTL_MS = 7 * 24 * 60 * 60 * 1000;
+// Team membership is cached briefly so a flurry of team review-requests doesn't
+// hit the API for every one.
+const TEAM_MEMBERSHIP_CACHE_TTL_MS = 10 * 60 * 1000;
 
 /**
  * Review-on-request trigger. The GitHub chat adapter only surfaces comment
@@ -64,17 +68,20 @@ export function handleReviewRequest(
     return null;
   }
   if (payload.action !== "review_requested") return null;
-  const reviewer = stringValue(payload.requested_reviewer?.login);
-  if (!reviewer || reviewer.toLowerCase() !== input.botUserName.toLowerCase()) {
-    // Either a team review request (no requested_reviewer) or a different
-    // reviewer — not ours to act on.
-    return null;
-  }
   const repoFullName = stringValue(payload.repository?.full_name);
   const number = numberValue(payload.pull_request?.number);
   if (!repoFullName || number === undefined) return null;
   const [owner, repo] = repoFullName.split("/", 2);
   if (!owner || !repo) return null;
+
+  // The request is ours when the bot is the requested reviewer, or when the bot
+  // belongs to a requested team (resolved asynchronously below). A request that
+  // names a different individual reviewer and no team is not ours.
+  const reviewer = stringValue(payload.requested_reviewer?.login);
+  const directMatch =
+    !!reviewer && reviewer.toLowerCase() === input.botUserName.toLowerCase();
+  const teamSlug = stringValue(payload.requested_team?.slug);
+  if (!directMatch && !teamSlug) return null;
 
   const reviewThreadKey = `github-review:${owner}/${repo}:${number}`;
   const title = stringValue(payload.pull_request?.title) ?? `#${number}`;
@@ -96,6 +103,14 @@ export function handleReviewRequest(
 
   return (async () => {
     const logger = options.logger ?? noopLogger;
+    // A team review request only counts when the bot is actually a member of the
+    // requested team (a direct request of the bot needs no such check).
+    if (!directMatch && teamSlug && !(await isBotOnTeam(input, owner, teamSlug))) {
+      traceLog(options, "githubbot_review_team_not_member_skipped", trace, {
+        team: `${owner}/${teamSlug}`,
+      });
+      return;
+    }
     // Claim the delivery before the background run so a redelivery never
     // double-reviews. State-keyed (not Chat-thread-keyed) because the review
     // thread is synthetic and never touches the adapter.
@@ -181,6 +196,51 @@ export function handleReviewRequest(
         }),
     );
   })();
+}
+
+/**
+ * Whether the bot's account belongs to `{org}/{teamSlug}`, cached briefly. A
+ * 404 (not a member, or the team isn't visible to the token) is treated as "not
+ * ours" so an unrelated team's review request is ignored.
+ */
+async function isBotOnTeam(
+  input: ReviewHandlerInput,
+  org: string,
+  teamSlug: string,
+): Promise<boolean> {
+  const cacheKey = `${input.options.stateKeyPrefix ?? "centaur-githubbot"}:team-member:${org}/${teamSlug}:${input.botUserName.toLowerCase()}`;
+  try {
+    const cached = await input.state.get<string>(cacheKey);
+    if (cached === "1") return true;
+    if (cached === "0") return false;
+  } catch {
+    // fall through to a live lookup
+  }
+  let member = false;
+  try {
+    const { data } = await input.octokit.rest.teams.getMembershipForUserInOrg({
+      org,
+      team_slug: teamSlug,
+      username: input.botUserName,
+    });
+    member = data.state === "active";
+  } catch (error) {
+    (input.options.logger ?? noopLogger).debug(
+      "githubbot_team_membership_lookup_failed",
+      { error: errorMessage(error), team: `${org}/${teamSlug}` },
+    );
+    member = false;
+  }
+  try {
+    await input.state.set(
+      cacheKey,
+      member ? "1" : "0",
+      TEAM_MEMBERSHIP_CACHE_TTL_MS,
+    );
+  } catch {
+    // best-effort cache
+  }
+  return member;
 }
 
 /**

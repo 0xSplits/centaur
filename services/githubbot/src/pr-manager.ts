@@ -199,6 +199,19 @@ async function claim(ctx: PrManagerContext, key: string): Promise<boolean> {
   }
 }
 
+/**
+ * Release a claim so the action it guarded can be retried on a later event.
+ * Used when an irreversible side effect (the merge) fails after the claim is
+ * taken — otherwise the stale claim would suppress every future attempt.
+ */
+async function release(ctx: PrManagerContext, key: string): Promise<void> {
+  try {
+    await ctx.state.delete(key);
+  } catch {
+    // best-effort; the claim's TTL eventually expires if delete fails.
+  }
+}
+
 function logger(ctx: PrManagerContext) {
   return ctx.options.logger ?? noopLogger;
 }
@@ -495,12 +508,13 @@ async function tryMerge(
   });
 
   if (decision === "merge") {
-    if (
-      !(await claim(
-        ctx,
-        `${ctx.options.stateKeyPrefix ?? "centaur-githubbot"}:merged:${owner}/${repo}#${number}:${pr.headSha}`,
-      ))
-    ) {
+    // The claim guards against two concurrent lifecycle events both calling
+    // merge. It's released on failure (below) so a transient merge error — "Base
+    // branch was modified", a secondary rate limit, a 5xx — is retried on the
+    // next event instead of leaving a clean, approved PR permanently unmerged
+    // behind a stale claim. On success the claim stays as the "merged" marker.
+    const mergedClaimKey = `${ctx.options.stateKeyPrefix ?? "centaur-githubbot"}:merged:${owner}/${repo}#${number}:${pr.headSha}`;
+    if (!(await claim(ctx, mergedClaimKey))) {
       return;
     }
     try {
@@ -528,6 +542,9 @@ async function tryMerge(
         }
       }
     } catch (error) {
+      // Re-merging an already-merged PR is a no-op (decideMerge returns
+      // skip_closed next time), so releasing on any failure is safe.
+      await release(ctx, mergedClaimKey);
       logger(ctx).warn("githubbot_merge_failed", {
         error: errorMessage(error),
         pr: `${owner}/${repo}#${number}`,
@@ -678,10 +695,14 @@ function fireManagementTurn(
 ): void {
   const threadKey = managementThreadKey(owner, repo, pr.number);
   const trace = makeTrace(threadKey, message.id);
+  // A deployment can prepend its own constraints to the management methodology
+  // (the per-action preamble still rides underneath).
+  const guidance = ctx.options.managementPrompt;
+  const contextPreamble = guidance ? `${guidance}\n\n${preamble}` : preamble;
   let lastEventId = 0;
   const forwardInput: ForwardSessionInput = {
     afterEventId: 0,
-    contextPreamble: preamble,
+    contextPreamble,
     conversationName: `${owner}/${repo}#${pr.number}: ${pr.title}`,
     executeMessage: managementMessage(message.id, threadKey, message.text),
     messages: [],

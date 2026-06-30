@@ -1,4 +1,5 @@
 import { readFileSync } from "node:fs";
+import { drainBackgroundWork } from "./context";
 import { createGithubbot, type GithubbotOptions } from "./index";
 
 const port = numberEnv("PORT", 3001);
@@ -59,6 +60,24 @@ if (!issuePrompt && issuePromptFile) {
   }
 }
 
+// Extra guidance prepended to owned-PR management turns (CI-fix/conflict/
+// address-review). Same precedence as the review/issue prompts: inline wins;
+// otherwise a mounted file. Unset -> just the built-in per-action preamble.
+const managementPromptInline = optionalEnv("GITHUBBOT_MANAGEMENT_PROMPT");
+const managementPromptFile = optionalEnv("GITHUBBOT_MANAGEMENT_PROMPT_FILE");
+let managementPrompt: string | undefined = managementPromptInline;
+if (!managementPrompt && managementPromptFile) {
+  try {
+    managementPrompt = readFileSync(managementPromptFile, "utf8");
+  } catch (error) {
+    throw new Error(
+      `GITHUBBOT_MANAGEMENT_PROMPT_FILE (${managementPromptFile}) could not be read: ${
+        error instanceof Error ? error.message : String(error)
+      }`,
+    );
+  }
+}
+
 // Default to info: the chat adapter logs raw webhook bodies at debug, and
 // JSON-serializing those payloads on the hot path blocks the event loop.
 const LOG_LEVELS = ["debug", "info", "warn", "error"] as const;
@@ -92,6 +111,7 @@ if (!postgresUrl) {
 
 const options: GithubbotOptions = {
   apiUrl,
+  allowedAuthorAssociations: listEnv("GITHUBBOT_ALLOWED_AUTHOR_ASSOCIATIONS"),
   apiKey: optionalEnv("GITHUBBOT_API_KEY") ?? optionalEnv("CENTAUR_API_KEY"),
   autoMerge: boolEnv("GITHUBBOT_AUTO_MERGE", true),
   botUserId: optionalEnv("GITHUBBOT_USER_ID"),
@@ -107,6 +127,7 @@ const options: GithubbotOptions = {
   postgresUrl,
   reviewPrompt,
   issuePrompt,
+  managementPrompt,
   stateKeyPrefix: optionalEnv("GITHUBBOT_STATE_KEY_PREFIX"),
   token,
   userName,
@@ -122,10 +143,23 @@ log("info", "githubbot_started", {
   api_url: apiUrl,
 });
 
+// How long to let in-flight turns finish on SIGTERM before exiting. Default 25s
+// to sit under the k8s default 30s grace; the chart raises both together.
+const shutdownDrainMs = numberEnv("GITHUBBOT_SHUTDOWN_DRAIN_MS", 25_000);
+
+let shuttingDown = false;
 const shutdown = async (signal: string): Promise<void> => {
+  if (shuttingDown) return;
+  shuttingDown = true;
   log("info", "githubbot_shutdown_started", { signal });
-  await chat.shutdown().catch(() => undefined);
+  // Stop accepting new webhooks, then let running turns finish (bounded) so a
+  // deploy doesn't drop in-flight CI fixes/reviews/issue work/merges.
   server.stop();
+  const drained = await drainBackgroundWork(shutdownDrainMs);
+  if (drained > 0) {
+    log("info", "githubbot_shutdown_drained", { signal, in_flight: drained });
+  }
+  await chat.shutdown().catch(() => undefined);
   log("info", "githubbot_shutdown_complete", { signal });
   process.exit(0);
 };
@@ -151,6 +185,16 @@ function stringEnv(name: string, fallback: string): string {
 
 function numberEnv(name: string, fallback: number): number {
   return optionalNumberEnv(name) ?? fallback;
+}
+
+function listEnv(name: string): string[] | undefined {
+  const value = optionalEnv(name);
+  if (!value) return undefined;
+  const items = value
+    .split(",")
+    .map((entry) => entry.trim())
+    .filter(Boolean);
+  return items.length ? items : undefined;
 }
 
 function boolEnv(name: string, fallback: boolean): boolean {

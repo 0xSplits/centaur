@@ -680,34 +680,54 @@ function toCodexInputLines(
 ): string[] {
   const staged = new Map<GithubbotApiAttachment, string>();
   const lines: string[] = [];
-  for (const attachment of message.attachments) {
-    if (!attachment.dataBase64) continue;
-    const inlineLine = toCodexInputLineWithStaged(
-      message,
-      threadId,
-      staged,
-      model,
-      contextPreamble,
-    );
-    if (
-      inlineLine.length <= MAX_CODEX_INPUT_LINE_CHARS &&
-      attachment.dataBase64.length <= MAX_CODEX_INPUT_LINE_CHARS
-    ) {
-      continue;
-    }
+  const stage = (attachment: GithubbotApiAttachment): void => {
     const stagedAttachmentId = `att-${message.id}-${staged.size + 1}`;
     staged.set(attachment, stagedAttachmentId);
     lines.push(...stagedAttachmentInputLines(attachment, stagedAttachmentId));
+  };
+
+  // An attachment whose own payload exceeds the line cap can never ride inline,
+  // so stage it up front — a cheap per-attachment length check with no
+  // whole-message serialization (the previous loop re-serialized every
+  // attachment's full base64 once per attachment: O(n²) over the bytes).
+  for (const attachment of message.attachments) {
+    if (
+      attachment.dataBase64 &&
+      attachment.dataBase64.length > MAX_CODEX_INPUT_LINE_CHARS
+    ) {
+      stage(attachment);
+    }
   }
-  lines.push(
-    toCodexInputLineWithStaged(
-      message,
-      threadId,
-      staged,
-      model,
-      contextPreamble,
-    ),
+
+  // Serialize the single inline line once. If the attachments still riding inline
+  // overflow it, stage them largest-first until it fits — recomputed only on that
+  // rare overflow path, never once per attachment. An attachment therefore stays
+  // inline iff its own data fits and the cumulative inline line fits, which is the
+  // invariant the old loop enforced.
+  let inlineLine = toCodexInputLineWithStaged(
+    message,
+    threadId,
+    staged,
+    model,
+    contextPreamble,
   );
+  if (inlineLine.length > MAX_CODEX_INPUT_LINE_CHARS) {
+    const remaining = message.attachments
+      .filter((a) => a.dataBase64 && !staged.has(a))
+      .sort((a, b) => (b.dataBase64?.length ?? 0) - (a.dataBase64?.length ?? 0));
+    for (const attachment of remaining) {
+      stage(attachment);
+      inlineLine = toCodexInputLineWithStaged(
+        message,
+        threadId,
+        staged,
+        model,
+        contextPreamble,
+      );
+      if (inlineLine.length <= MAX_CODEX_INPUT_LINE_CHARS) break;
+    }
+  }
+  lines.push(inlineLine);
   return lines;
 }
 

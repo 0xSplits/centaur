@@ -96,3 +96,84 @@ describe("handleReviewRequest", () => {
     expect(true).toBe(true);
   });
 });
+
+function teamRequestBody(teamSlug: string | null): string {
+  return JSON.stringify({
+    action: "review_requested",
+    pull_request: {
+      number: 7,
+      title: "Add widget",
+      html_url: "https://github.com/0xSplits/centaur/pull/7",
+      head: { sha: "abc123" },
+    },
+    repository: { full_name: "0xSplits/centaur" },
+    requested_team: teamSlug ? { slug: teamSlug } : undefined,
+    sender: { login: "someone" },
+  });
+}
+
+function fullState() {
+  const m = new Map<string, unknown>();
+  return {
+    get: async (k: string) => m.get(k),
+    set: async (k: string, v: unknown) => {
+      m.set(k, v);
+    },
+    setIfNotExists: async (k: string, v: unknown) => {
+      if (m.has(k)) return false;
+      m.set(k, v);
+      return true;
+    },
+  } as never;
+}
+
+function teamInput(member: boolean, reactionSpy: { n: number }) {
+  return {
+    botUserName: "review-bot",
+    deliveryId: "delivery-team",
+    octokit: {
+      rest: {
+        reactions: {
+          createForIssue: () => {
+            reactionSpy.n += 1;
+            return Promise.resolve({ data: { id: 1 } });
+          },
+        },
+        teams: {
+          getMembershipForUserInOrg: () =>
+            member
+              ? Promise.resolve({ data: { state: "active" } })
+              : Promise.reject(new Error("404")),
+        },
+      },
+    } as never,
+    options,
+    state: fullState(),
+  };
+}
+
+describe("handleReviewRequest team requests", () => {
+  test("acts on a team request when the bot is a member", async () => {
+    const spy = { n: 0 };
+    const result = handleReviewRequest(
+      teamRequestBody("reviewers"),
+      teamInput(true, spy),
+    );
+    expect(result).not.toBeNull();
+    await result;
+    // The working-ack reaction fires only once the request is accepted.
+    expect(spy.n).toBeGreaterThanOrEqual(1);
+  });
+
+  test("ignores a team request when the bot is not a member", async () => {
+    const spy = { n: 0 };
+    await handleReviewRequest(teamRequestBody("strangers"), teamInput(false, spy));
+    expect(spy.n).toBe(0);
+  });
+
+  test("ignores a request naming neither the bot nor a team", () => {
+    expect(
+      handleReviewRequest(teamRequestBody(null), teamInput(true, { n: 0 })),
+    ).toBeNull();
+  });
+});

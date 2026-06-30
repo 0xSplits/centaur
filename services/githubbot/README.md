@@ -21,13 +21,23 @@ reviewer** like any other collaborator.
   at; for a **PR conversation thread** the agent is pointed at `gh pr view`/`gh pr diff` to fetch the
   PR itself. A 👀 reaction acks the triggering comment while the bot works, settling to 🚀 / 😕. The
   reply is one comment: the answer with the chain-of-thought folded into a collapsed `<details>`
-  section. Mention detection is the adapter's (matches the bot account's `@username`).
+  section. Mention detection is the adapter's (matches the bot account's `@username`). Only authors
+  whose GitHub `author_association` is allowed (default `OWNER` / `MEMBER` / `COLLABORATOR`) can drive
+  a turn — the agent runs in a write-capable sandbox and posts its transcript back, so untrusted
+  commenters can't steer it. Widen or open it with `GITHUBBOT_ALLOWED_AUTHOR_ASSOCIATIONS` (`*` allows
+  everyone, e.g. a fully-private repo). Lifecycle triggers (assignment, review-request) are already
+  gated by GitHub permissions, so this applies only to the comment path.
+- **`@`-mentioning the bot in the body of a newly-opened issue or PR** (the description, not a
+  comment) → the same conversational turn runs, keyed to that issue/PR thread, with the reply posted
+  as a comment. Only the `opened` event is handled — an edit that adds a mention later won't
+  re-trigger, so re-issue it as a comment. Same author gate as the comment path.
 - **Plain comments in a thread the bot is already active in** (no mention) are appended to that
   thread's session as append-only context — no execution, no reply — so a follow-up like "actually,
   hold off" is seen by the next turn. The bot's own comments are skipped (loop guard) and inactive
   threads are ignored.
 - **Requesting the bot's review on a PR** (`pull_request` / `review_requested` targeting the bot
-  account) → a review turn runs on a **dedicated, isolated session thread**
+  account — or a **team the bot belongs to**, whose membership is checked and briefly cached) → a
+  review turn runs on a **dedicated, isolated session thread**
   (`github-review:{owner}/{repo}:{prNumber}`) — kept separate from the PR conversation so reviews
   never share a sandbox with chit-chat, but persistent per PR so a re-request builds on the prior
   review. The chat adapter only surfaces comment threads, so this lifecycle event is handled
@@ -95,7 +105,11 @@ chat adapter, which verifies the `X-Hub-Signature-256` HMAC and maps them to thr
 Lifecycle events (`pull_request`, `pull_request_review`, `issues`, and the CI events) are handled by
 githubbot directly (the adapter ignores them), so githubbot verifies the signature itself before acting. Turns run in the background — webhooks are acknowledged
 immediately (cold sandbox spin-up far exceeds GitHub's webhook deadline), with a bounded retry inside
-the turn for transient cold-start failures. Multiple replicas are fine.
+the turn for transient cold-start failures. On `SIGTERM` (a deploy/rollout) the bot stops accepting
+webhooks and **drains in-flight turns** for up to `GITHUBBOT_SHUTDOWN_DRAIN_MS` before exiting, so
+running work isn't dropped (claims are taken before the work, so a dropped turn would never retry).
+It also **serializes turns targeting the same session** so two turns can't interleave git/push in one
+sandbox. Both assume the **single replica** the chart runs (`replicaCount: 1`).
 
 ## Auth
 
@@ -130,6 +144,9 @@ requests**, **Pull request reviews**, **Check runs**, **Check suites**, and **Wo
 | `GITHUBBOT_REVIEW_PROMPT_FILE` | — | Path to a file holding the review methodology (e.g. an overlay-mounted file). Used when the inline var is unset. |
 | `GITHUBBOT_ISSUE_PROMPT` | — | Full issue-work methodology, inline. Replaces the bundled default verbatim. |
 | `GITHUBBOT_ISSUE_PROMPT_FILE` | — | Path to a file holding the issue-work methodology (e.g. an overlay-mounted file). Used when the inline var is unset. |
+| `GITHUBBOT_MANAGEMENT_PROMPT` | — | Extra guidance prepended to owned-PR management turns (CI-fix / conflict / address-review), inline. The per-action preamble still rides underneath. |
+| `GITHUBBOT_MANAGEMENT_PROMPT_FILE` | — | Path to a file holding the management guidance (e.g. an overlay-mounted file). Used when the inline var is unset. |
+| `GITHUBBOT_ALLOWED_AUTHOR_ASSOCIATIONS` | — | Comma-separated `author_association` values allowed to drive the comment path. Default `OWNER,MEMBER,COLLABORATOR`; `*` allows everyone. |
 | `GITHUB_API_URL` | — | Override the GitHub REST base URL (GitHub Enterprise). |
 | `GITHUBBOT_USER_ID` | — | Bot's numeric user id for self-message detection (auto-detected otherwise). |
 | `GITHUBBOT_STATE_KEY_PREFIX` | — | Chat-SDK state key prefix, default `centaur-githubbot`. |
@@ -141,9 +158,12 @@ requests**, **Pull request reviews**, **Check runs**, **Check suites**, and **Wo
 | `GITHUBBOT_DELETE_BRANCH_ON_MERGE` | — | Delete head branch after merge. Default `true`. |
 | `GITHUBBOT_ESCALATION_HANDLE` | — | Fallback @handle (no leading @) tagged when the bot gives up. |
 | `SESSION_IDLE_TIMEOUT_MS` / `SESSION_MAX_DURATION_MS` | — | Forwarded to api-rs executes. |
+| `GITHUBBOT_SHUTDOWN_DRAIN_MS` | — | How long to let in-flight turns finish on `SIGTERM` before exiting. Default `25000`; the chart derives it from the pod's termination grace period. |
 
 ## Tests
 
 `bun test test` — unit tests for the override flag parser, the GitHub thread-key parsing / context
-preamble, the review-request trigger gating, the issue-assignment gating, and the v2 PR-manager
-decision logic (CI evaluation, assignment-based ownership, merge gating).
+preamble, the review-request trigger gating (incl. team requests), the issue-assignment gating, the
+v2 PR-manager decision logic (CI evaluation, assignment-based ownership, merge gating, the CI-fix
+counter / escalation, and the merge-claim release-on-failure), the author-association gate, body
+mentions, and the per-session serialization queue.
