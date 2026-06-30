@@ -414,6 +414,7 @@ const LIFECYCLE_EVENTS = new Set([
   "issues",
   "check_run",
   "check_suite",
+  "status",
   "workflow_run",
 ]);
 

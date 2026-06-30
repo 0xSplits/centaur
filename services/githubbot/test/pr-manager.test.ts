@@ -2,9 +2,53 @@ import { describe, expect, test } from "bun:test";
 import {
   decideMerge,
   evaluateCi,
+  handleCiEvent,
+  handleReviewEvent,
   isOwnedPr,
   type CiCheck,
+  type PrManagerContext,
 } from "../src/pr-manager";
+
+function makeState() {
+  const values = new Map<string, unknown>();
+  return {
+    async get(key: string) {
+      return values.get(key);
+    },
+    async set(key: string, value: unknown) {
+      values.set(key, value);
+    },
+    async setIfNotExists(key: string, value: unknown) {
+      if (values.has(key)) return false;
+      values.set(key, value);
+      return true;
+    },
+  };
+}
+
+function prPayload(input: {
+  assignees?: { login: string }[];
+  headRepoFullName: string;
+  headSha?: string;
+  mergeableState?: string;
+  number?: number;
+}) {
+  return {
+    assignees: input.assignees ?? [{ login: "centaur-bot" }],
+    draft: false,
+    head: {
+      ref: "feature",
+      repo: { full_name: input.headRepoFullName },
+      sha: input.headSha ?? "abc123",
+    },
+    labels: [],
+    mergeable_state: input.mergeableState ?? "clean",
+    merged: false,
+    number: input.number ?? 7,
+    state: "open",
+    title: "Test PR",
+  };
+}
 
 describe("evaluateCi", () => {
   test("not settled while any check is in progress", () => {
@@ -113,5 +157,112 @@ describe("decideMerge", () => {
     expect(decideMerge({ ...base, mergeableState: "blocked" })).toBe("wait");
     expect(decideMerge({ ...base, mergeableState: "unstable" })).toBe("wait");
     expect(decideMerge({ ...base, mergeableState: "unknown" })).toBe("wait");
+  });
+});
+
+describe("PR management webhooks", () => {
+  test("does not delete a base-repo branch after merging a fork PR", async () => {
+    let deleteRefCalls = 0;
+    let mergeCalls = 0;
+    const ctx = {
+      octokit: {
+        rest: {
+          pulls: {
+            get: async () => ({
+              data: prPayload({ headRepoFullName: "contributor/repo" }),
+            }),
+            merge: async () => {
+              mergeCalls += 1;
+              return { data: {} };
+            },
+          },
+          git: {
+            deleteRef: async () => {
+              deleteRefCalls += 1;
+              return { data: {} };
+            },
+          },
+        },
+      },
+      options: {
+        apiUrl: "http://localhost",
+        logger: { debug() {}, warn() {}, error() {}, info() {} },
+      },
+      state: makeState(),
+      userName: "centaur-bot",
+    } as unknown as PrManagerContext;
+
+    await handleReviewEvent(
+      ctx,
+      JSON.stringify({
+        action: "submitted",
+        repository: { full_name: "base/repo" },
+        pull_request: { number: 7 },
+        review: { id: 123, state: "approved", user: { login: "reviewer" } },
+      }),
+    );
+
+    expect(mergeCalls).toBe(1);
+    expect(deleteRefCalls).toBe(0);
+  });
+
+  test("routes legacy status webhooks through associated PRs", async () => {
+    let associatedCommitSha: string | undefined;
+    let mergeCalls = 0;
+    const ctx = {
+      octokit: {
+        rest: {
+          checks: {
+            listForRef: async () => ({ data: { check_runs: [] } }),
+          },
+          pulls: {
+            get: async () => ({
+              data: prPayload({
+                headRepoFullName: "base/repo",
+                headSha: "abc123",
+              }),
+            }),
+            merge: async () => {
+              mergeCalls += 1;
+              return { data: {} };
+            },
+          },
+          repos: {
+            getCombinedStatusForRef: async () => ({
+              data: { statuses: [{ state: "success", context: "legacy-ci" }] },
+            }),
+            listPullRequestsAssociatedWithCommit: async (input: {
+              commit_sha: string;
+            }) => {
+              associatedCommitSha = input.commit_sha;
+              return { data: [{ number: 7 }] };
+            },
+          },
+          git: {
+            deleteRef: async () => ({ data: {} }),
+          },
+        },
+      },
+      options: {
+        apiUrl: "http://localhost",
+        deleteBranchOnMerge: false,
+        logger: { debug() {}, warn() {}, error() {}, info() {} },
+      },
+      state: makeState(),
+      userName: "centaur-bot",
+    } as unknown as PrManagerContext;
+
+    await handleCiEvent(
+      ctx,
+      "status",
+      JSON.stringify({
+        repository: { full_name: "base/repo" },
+        sha: "abc123",
+        state: "success",
+      }),
+    );
+
+    expect(associatedCommitSha).toBe("abc123");
+    expect(mergeCalls).toBe(1);
   });
 });

@@ -211,6 +211,7 @@ type PullRequestSummary = {
   assignees: string[];
   draft: boolean;
   headRef: string;
+  headRepoFullName: string | null;
   headSha: string;
   labels: string[];
   mergeableState: string;
@@ -229,7 +230,7 @@ function assigneeLogins(
 
 function summarizePr(pr: {
   draft?: boolean | null;
-  head: { ref: string; sha: string };
+  head: { ref: string; repo?: { full_name?: string | null } | null; sha: string };
   labels: { name?: string }[];
   mergeable_state?: string;
   merged?: boolean;
@@ -242,6 +243,7 @@ function summarizePr(pr: {
     assignees: assigneeLogins(pr.assignees),
     draft: pr.draft === true,
     headRef: pr.head.ref,
+    headRepoFullName: pr.head.repo?.full_name ?? null,
     headSha: pr.head.sha,
     labels: pr.labels.map((l) => l.name ?? "").filter(Boolean),
     mergeableState: pr.mergeable_state ?? "unknown",
@@ -394,10 +396,12 @@ export async function handleCiEvent(
   if (!repo) return;
   const target = ciTarget(eventType, payload);
   if (!target) return;
+  const prNumbers =
+    target.prNumbers.length > 0
+      ? target.prNumbers
+      : await fetchPrNumbersForCommit(ctx, repo.owner, repo.repo, target.headSha);
   await Promise.all(
-    target.prNumbers.map((number) =>
-      processCi(ctx, repo.owner, repo.repo, number, target.headSha),
-    ),
+    prNumbers.map((number) => processCi(ctx, repo.owner, repo.repo, number, target.headSha)),
   );
 }
 
@@ -507,7 +511,10 @@ async function tryMerge(
         merge_method: ctx.options.mergeMethod ?? "squash",
       });
       traceLog(ctx.options, "githubbot_merged", trace, { pr: `${owner}/${repo}#${number}` });
-      if (ctx.options.deleteBranchOnMerge !== false) {
+      if (
+        ctx.options.deleteBranchOnMerge !== false &&
+        pr.headRepoFullName?.toLowerCase() === `${owner}/${repo}`.toLowerCase()
+      ) {
         try {
           await ctx.octokit.rest.git.deleteRef({
             owner,
@@ -785,6 +792,29 @@ async function commitAuthor(
   }
 }
 
+async function fetchPrNumbersForCommit(
+  ctx: PrManagerContext,
+  owner: string,
+  repo: string,
+  sha: string,
+): Promise<number[]> {
+  try {
+    const { data } =
+      await ctx.octokit.rest.repos.listPullRequestsAssociatedWithCommit({
+        owner,
+        repo,
+        commit_sha: sha,
+      });
+    return data.map((pr) => pr.number).filter((n) => typeof n === "number");
+  } catch (error) {
+    logger(ctx).debug("githubbot_commit_prs_fetch_failed", {
+      error: errorMessage(error),
+      ref: `${owner}/${repo}@${sha}`,
+    });
+    return [];
+  }
+}
+
 // ---------------------------------------------------------------------------
 // Payload parsing helpers.
 // ---------------------------------------------------------------------------
@@ -824,6 +854,10 @@ function ciTarget(
   eventType: string,
   payload: JsonRecord,
 ): { headSha: string; prNumbers: number[] } | null {
+  if (eventType === "status") {
+    const headSha = stringValue(payload.sha);
+    return headSha ? { headSha, prNumbers: [] } : null;
+  }
   const node =
     eventType === "check_run"
       ? payload.check_run
