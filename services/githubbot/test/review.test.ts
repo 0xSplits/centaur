@@ -21,9 +21,18 @@ function stubState() {
   } as never;
 }
 
+// Reactions are best-effort acks; a stub that resolves keeps the positive-path
+// tests off the network.
+const octokit = {
+  rest: {
+    reactions: { createForIssue: () => Promise.resolve({ data: { id: 1 } }) },
+  },
+} as never;
+
 const input = {
   botUserName: "review-bot",
   deliveryId: "delivery-1",
+  octokit,
   options,
   state: stubState(),
 };

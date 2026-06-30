@@ -35,6 +35,7 @@ import {
 import {
   githubContextPreamble,
   parseGithubThreadKey,
+  reactSafe,
   reviewCommentContextFromRaw,
   runSessionTurn,
 } from "./turn";
@@ -235,6 +236,10 @@ async function handleMessage(
         message.id,
       ].slice(-DEDUP_WINDOW),
     });
+    // Fire the 👀 working ack now — before subscribe, the ownership lookup, and
+    // message serialization — so it lands instantly instead of waiting on the
+    // turn's setup round-trips. Best-effort; the turn settles it to 🚀/😕.
+    void reactSafe(adapter, threadKey, message.id, "eyes", logger);
     if (input.subscribe) {
       try {
         await thread.subscribe();
@@ -434,6 +439,7 @@ function routeLifecycleEvent(
       return handleReviewRequest(rawBody, {
         botUserName: input.botUserName,
         deliveryId: input.deliveryId,
+        octokit: input.prManagerCtx.octokit,
         options: input.options,
         state: input.state,
       });

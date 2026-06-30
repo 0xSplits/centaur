@@ -1,6 +1,7 @@
 import { backgroundWaitUntil } from "./context";
 import { DEFAULT_ISSUE_PROMPT } from "./issue-prompt";
 import type { PrManagerContext } from "./pr-manager";
+import { reactWorkingOnSubject, settleSubjectReaction } from "./reactions";
 import { runTurnStream } from "./turn";
 import type {
   ForwardSessionInput,
@@ -108,6 +109,9 @@ export function handleIssueEvent(
       assigner,
       issue: `${repo.owner}/${repo.repo}#${number}`,
     });
+    // No triggering comment on an assignment, so ack on the issue itself —
+    // instant 👀, settled to 🚀/😕 when the work turn finishes.
+    await reactWorkingOnSubject(ctx.octokit, repo.owner, repo.repo, number, logger);
 
     let lastEventId = 0;
     const forwardInput: ForwardSessionInput = {
@@ -139,15 +143,31 @@ export function handleIssueEvent(
 
     backgroundWaitUntil(
       runTurnStream(options, forwardInput)
-        .then((result) => {
+        .then(async (result) => {
           traceLog(options, "githubbot_issue_turn_complete", trace, {
             failed: result.failed,
           });
+          await settleSubjectReaction(
+            ctx.octokit,
+            repo.owner,
+            repo.repo,
+            number,
+            result.failed,
+            logger,
+          );
         })
-        .catch((error) => {
+        .catch(async (error) => {
           logger.warn("githubbot_issue_turn_failed", {
             error: errorMessage(error),
           });
+          await settleSubjectReaction(
+            ctx.octokit,
+            repo.owner,
+            repo.repo,
+            number,
+            true,
+            logger,
+          );
         }),
     );
   })();
