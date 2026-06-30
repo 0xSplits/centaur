@@ -393,6 +393,12 @@ githubbot:
   mergeMethod: squash
   # Fallback @handle (no leading @) the bot tags when it gives up; empty = none.
   escalationHandle: ""
+  # Optional review / issue-work methodology overrides. When set, the chart writes
+  # each into a ConfigMap, mounts it as a file, and points the bot at it via
+  # GITHUBBOT_REVIEW_PROMPT_FILE / GITHUBBOT_ISSUE_PROMPT_FILE. Empty = the bot's
+  # bundled default is used. Supply the whole methodology; it's used verbatim.
+  reviewPrompt: ""
+  issuePrompt: ""
   extraEnv: {}
   resources: {}
 

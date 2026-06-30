@@ -1,5 +1,25 @@
 {{- if .Values.githubbot.enabled }}
 {{- $apiRsName := include "centaur.componentName" (dict "root" . "component" "api-rs") -}}
+{{- if or .Values.githubbot.reviewPrompt .Values.githubbot.issuePrompt }}
+# Optional review / issue-work methodology overrides, delivered as mounted files
+# the bot reads at boot via GITHUBBOT_REVIEW_PROMPT_FILE / _ISSUE_PROMPT_FILE.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "centaur.componentName" (dict "root" . "component" "githubbot") }}-prompts
+  labels:
+{{ include "centaur.componentLabels" (dict "root" . "component" "githubbot") | nindent 4 }}
+data:
+{{- if .Values.githubbot.reviewPrompt }}
+  review-prompt.md: |-
+{{- .Values.githubbot.reviewPrompt | nindent 4 }}
+{{- end }}
+{{- if .Values.githubbot.issuePrompt }}
+  issue-prompt.md: |-
+{{- .Values.githubbot.issuePrompt | nindent 4 }}
+{{- end }}
+---
+{{- end }}
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -15,6 +35,9 @@ spec:
     metadata:
       annotations:
         checksum/infra-secrets: {{ include "centaur.infraSecretsChecksum" . }}
+{{- if or .Values.githubbot.reviewPrompt .Values.githubbot.issuePrompt }}
+        checksum/prompts: {{ dict "review" .Values.githubbot.reviewPrompt "issue" .Values.githubbot.issuePrompt | toJson | sha256sum }}
+{{- end }}
       labels:
 {{ include "centaur.componentSelectorLabels" (dict "root" . "component" "githubbot") | nindent 8 }}
     spec:
@@ -71,6 +94,14 @@ spec:
             - name: GITHUBBOT_ESCALATION_HANDLE
               value: {{ .Values.githubbot.escalationHandle | quote }}
 {{- end }}
+{{- if .Values.githubbot.reviewPrompt }}
+            - name: GITHUBBOT_REVIEW_PROMPT_FILE
+              value: /etc/githubbot/prompts/review-prompt.md
+{{- end }}
+{{- if .Values.githubbot.issuePrompt }}
+            - name: GITHUBBOT_ISSUE_PROMPT_FILE
+              value: /etc/githubbot/prompts/issue-prompt.md
+{{- end }}
 {{- range $name, $value := .Values.githubbot.extraEnv }}
             - name: {{ $name }}
               value: {{ $value | quote }}
@@ -92,6 +123,16 @@ spec:
 {{ toYaml .Values.containerSecurityContext | nindent 12 }}
           resources:
 {{ toYaml .Values.githubbot.resources | nindent 12 }}
+{{- if or .Values.githubbot.reviewPrompt .Values.githubbot.issuePrompt }}
+          volumeMounts:
+            - name: prompts
+              mountPath: /etc/githubbot/prompts
+              readOnly: true
+      volumes:
+        - name: prompts
+          configMap:
+            name: {{ include "centaur.componentName" (dict "root" . "component" "githubbot") }}-prompts
+{{- end }}
 ---
 apiVersion: v1
 kind: Service
