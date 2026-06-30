@@ -1,5 +1,7 @@
+import type { GitHubAdapter } from "@chat-adapter/github";
 import type { StateAdapter } from "chat";
 import { backgroundWaitUntil } from "./context";
+import { reactWorkingOnSubject, settleSubjectReaction } from "./reactions";
 import { DEFAULT_REVIEW_PROMPT } from "./review-prompt";
 import { runTurnStream } from "./turn";
 import type {
@@ -13,6 +15,7 @@ import { errorMessage, noopLogger, nowMs, stringValue, traceLog } from "./utils"
 type ReviewHandlerInput = {
   botUserName: string;
   deliveryId: string;
+  octokit: GitHubAdapter["octokit"];
   options: GithubbotOptions;
   state: StateAdapter;
 };
@@ -115,6 +118,9 @@ export function handleReviewRequest(
       pr: `${owner}/${repo}#${number}`,
       requester,
     });
+    // There's no triggering comment to react to (a review request is a lifecycle
+    // event), so ack on the PR itself — instant 👀, settled to 🚀/😕 below.
+    await reactWorkingOnSubject(input.octokit, owner, repo, number, logger);
 
     let lastEventId = 0;
     const forwardInput: ForwardSessionInput = {
@@ -147,15 +153,31 @@ export function handleReviewRequest(
 
     backgroundWaitUntil(
       runTurnStream(options, forwardInput)
-        .then((result) => {
+        .then(async (result) => {
           traceLog(options, "githubbot_review_turn_complete", trace, {
             failed: result.failed,
           });
+          await settleSubjectReaction(
+            input.octokit,
+            owner,
+            repo,
+            number,
+            result.failed,
+            logger,
+          );
         })
-        .catch((error) => {
+        .catch(async (error) => {
           logger.warn("githubbot_review_turn_failed", {
             error: errorMessage(error),
           });
+          await settleSubjectReaction(
+            input.octokit,
+            owner,
+            repo,
+            number,
+            true,
+            logger,
+          );
         }),
     );
   })();

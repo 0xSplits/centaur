@@ -152,7 +152,7 @@ export function githubContextPreamble(
   );
 }
 
-async function reactSafe(
+export async function reactSafe(
   adapter: GitHubAdapter,
   threadKey: string,
   messageId: string,
@@ -274,9 +274,8 @@ export async function runSessionTurn(input: {
     trace,
   } = input;
   const logger = options.logger ?? noopLogger;
-  if (reactMessageId) {
-    await reactSafe(adapter, threadKey, reactMessageId, "eyes", logger);
-  }
+  // The 👀 working ack is fired by the caller (handleMessage) before this turn's
+  // setup so it lands instantly; here we only settle it to 🚀/😕 at the end.
   const threadState = (await thread.state) ?? {};
   let lastEventId = threadState.lastEventId ?? 0;
   const forwardInput: ForwardSessionInput = {
