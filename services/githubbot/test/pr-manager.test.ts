@@ -52,37 +52,26 @@ describe("evaluateCi", () => {
 });
 
 describe("isOwnedPr", () => {
-  test("owned when the bot authored it (case-insensitive)", () => {
+  test("owned when the bot is an assignee (case-insensitive)", () => {
     expect(
       isOwnedPr({
-        author: "Centaur-Bot",
-        labels: [],
-        managedLabel: "centaur-managed",
+        assignees: ["someone-else", "Centaur-Bot"],
         userName: "centaur-bot",
       }),
     ).toBe(true);
   });
 
-  test("owned when the managed label is present", () => {
+  test("not owned when the bot is not an assignee", () => {
     expect(
       isOwnedPr({
-        author: "someone-else",
-        labels: ["centaur-managed"],
-        managedLabel: "centaur-managed",
-        userName: "centaur-bot",
-      }),
-    ).toBe(true);
-  });
-
-  test("not owned otherwise", () => {
-    expect(
-      isOwnedPr({
-        author: "someone-else",
-        labels: ["bug"],
-        managedLabel: "centaur-managed",
+        assignees: ["someone-else"],
         userName: "centaur-bot",
       }),
     ).toBe(false);
+  });
+
+  test("not owned when there are no assignees", () => {
+    expect(isOwnedPr({ assignees: [], userName: "centaur-bot" })).toBe(false);
   });
 });
 

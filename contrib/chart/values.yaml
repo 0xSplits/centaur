@@ -386,12 +386,11 @@ githubbot:
     tag: latest
     pullPolicy: Always
   userName: ""
-  # v2 PR self-management (only acts on PRs the bot owns — authored by it or
-  # carrying the managed label). Auto-merge respects branch protection and is
-  # paused per-PR by the hold label / draft status.
+  # v2 PR self-management (only acts on PRs assigned to the bot account).
+  # Auto-merge respects branch protection and is paused per-PR by the hold label
+  # / draft status.
   autoMerge: true
   mergeMethod: squash
-  managedLabel: centaur-managed
   # Fallback @handle (no leading @) the bot tags when it gives up; empty = none.
   escalationHandle: ""
   extraEnv: {}

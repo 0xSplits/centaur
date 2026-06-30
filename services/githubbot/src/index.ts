@@ -12,6 +12,11 @@ import {
 import { Hono, type Context } from "hono";
 import pg from "pg";
 import { backgroundWaitUntil, requestContext, waitUntil } from "./context";
+import {
+  handleIssueEvent,
+  isIssueAssignedToBot,
+  issueWorkThreadKey,
+} from "./issue-manager";
 import { extractMessageOverrides } from "./overrides";
 import {
   handleCiEvent,
@@ -313,12 +318,14 @@ async function handleMessage(
 }
 
 /**
- * For a PR-conversation/review thread the bot owns, return the PR's management
- * session key (`github-manage:…`) so the turn shares the sandbox/context the bot
- * uses to fix CI and address reviews — while replies still post to this thread.
- * Returns undefined for non-PR threads, non-owned PRs, or on lookup failure (the
- * turn then runs on its own conversation session). Resolved ownership is cached
- * on the thread so follow-ups skip the lookup.
+ * When a conversation thread maps to work the bot owns, return that work's
+ * session key so the turn shares the sandbox/context the bot uses for it — while
+ * replies still post to this thread. For an owned PR that's the management
+ * session (`github-manage:…`, where it fixes CI and addresses reviews); for an
+ * issue assigned to the bot it's the issue-work session (`github-issue:…`).
+ * Returns undefined when the thread maps to neither (the turn then runs on its
+ * own conversation session) or on lookup failure. The resolved key is cached on
+ * the thread so follow-ups skip the lookup.
  */
 async function resolveManagementSession(
   thread: Thread<GithubbotThreadState>,
@@ -326,10 +333,25 @@ async function resolveManagementSession(
   input: MessageHandlerInput,
 ): Promise<string | undefined> {
   const ref = parseGithubThreadKey(threadKey);
-  if (!ref || ref.type !== "pr") return undefined;
-  let owned = false;
+  if (!ref) return undefined;
+  let sessionKey: string | undefined;
   try {
-    owned = await isPrOwned(input.prManagerCtx, ref.owner, ref.repo, ref.number);
+    if (ref.type === "pr") {
+      if (
+        await isPrOwned(input.prManagerCtx, ref.owner, ref.repo, ref.number)
+      ) {
+        sessionKey = managementThreadKey(ref.owner, ref.repo, ref.number);
+      }
+    } else if (
+      await isIssueAssignedToBot(
+        input.prManagerCtx,
+        ref.owner,
+        ref.repo,
+        ref.number,
+      )
+    ) {
+      sessionKey = issueWorkThreadKey(ref.owner, ref.repo, ref.number);
+    }
   } catch (error) {
     (input.options.logger ?? noopLogger).debug(
       "githubbot_ownership_lookup_failed",
@@ -337,8 +359,7 @@ async function resolveManagementSession(
     );
     return undefined;
   }
-  if (!owned) return undefined;
-  const sessionKey = managementThreadKey(ref.owner, ref.repo, ref.number);
+  if (!sessionKey) return undefined;
   try {
     await thread.setState({ managementSessionKey: sessionKey });
   } catch {
@@ -385,6 +406,7 @@ async function appendFollowup(
 const LIFECYCLE_EVENTS = new Set([
   "pull_request",
   "pull_request_review",
+  "issues",
   "check_run",
   "check_suite",
   "workflow_run",
@@ -420,6 +442,9 @@ function routeLifecycleEvent(
   }
   if (eventType === "pull_request_review") {
     return handleReviewEvent(input.prManagerCtx, rawBody);
+  }
+  if (eventType === "issues") {
+    return handleIssueEvent(input.prManagerCtx, rawBody, input.deliveryId);
   }
   return handleCiEvent(input.prManagerCtx, eventType, rawBody);
 }

@@ -37,6 +37,13 @@ reviewer** like any other collaborator.
   deployment can **fully replace** via `GITHUBBOT_REVIEW_PROMPT` / `GITHUBBOT_REVIEW_PROMPT_FILE`
   (the override is used verbatim, so org conventions supersede ours wholesale; for Splits this is
   where the overlay supplies its review guide). Webhook redeliveries are de-duplicated by delivery id.
+- **Assigning an issue to the bot** (`issues` / `assigned` to the bot account) → an autonomous work
+  turn runs on a **dedicated, isolated session thread** (`github-issue:{owner}/{repo}:{n}`): the agent
+  reads the issue, implements a fix in its sandbox, and opens a PR (self-assigning it so it then
+  manages that PR toward merge). Like reviews, this lifecycle event is handled directly (githubbot
+  verifies the signature) and de-duplicated by delivery id. The **issue-work methodology** is a
+  bundled, standalone default (`src/issue-prompt.ts`) that a deployment can **fully replace** via
+  `GITHUBBOT_ISSUE_PROMPT` / `GITHUBBOT_ISSUE_PROMPT_FILE` (used verbatim, like the review prompt).
 - **Per-turn context**: every turn prepends a compact header naming the PR/issue so a recycled
   sandbox always knows which subject to act on and where to reply.
 - `--claude` / `--codex` / `--amp` / `--model …` / `--opus|--sonnet|--haiku` inline flags pick the
@@ -44,16 +51,21 @@ reviewer** like any other collaborator.
 
 ## PR self-management (v2)
 
-For PRs the bot **owns** — authored by the bot account, or carrying the managed label
-(`GITHUBBOT_MANAGED_LABEL`, default `centaur-managed`) — githubbot drives the PR toward merge by
-reacting to lifecycle webhooks. It only ever acts on owned PRs, and on a dedicated management thread
-(`github-manage:{owner}/{repo}:{n}`); the agent does its GitHub writes via `gh`.
+For PRs the bot **owns** — i.e. **assigned to the bot account** — githubbot drives the PR toward merge
+by reacting to lifecycle webhooks. Ownership is purely an assignment mechanism: assign a PR to the bot
+to have it take over, and unassign to hand it back. It only ever acts on owned PRs, and on a dedicated
+management thread (`github-manage:{owner}/{repo}:{n}`); the agent does its GitHub writes via `gh`.
 
+- **Take over on assign.** Being assigned a PR is the explicit signal to take it over, so the bot
+  immediately evaluates CI (fixing red or merging green) rather than waiting for the next lifecycle
+  event.
 - **Fix CI.** When **all** checks for a head SHA are settled (not per failing job — interwoven jobs
   make early firing harmful) and red, a fix turn diagnoses and pushes a fix. Bounded to
   `GITHUBBOT_CI_FIX_MAX_ATTEMPTS` consecutive attempts (default 3, reset when CI goes green); on
-  exhaustion the bot comments tagging a human and stops. It backs off if the failing head commit was
-  authored by a human (it won't step on someone who's taken over).
+  exhaustion the bot comments tagging a human and stops. On the steady-state CI path it backs off if
+  the failing head commit was authored by a human (it won't step on someone mid-edit) — except right
+  after assignment, where being assigned is an explicit hand-off, so it fixes the PR regardless of who
+  pushed last.
 - **Address review.** A submitted review (`changes_requested` / `commented`) triggers one holistic
   turn that reads all the feedback, makes a single coherent commit, replies on each thread, resolves
   what it addressed, and re-requests review.
@@ -65,6 +77,8 @@ reacting to lifecycle webhooks. It only ever acts on owned PRs, and on a dedicat
 - **Owned-PR conversation.** An @-mention in an owned PR's conversation (or a review-comment thread)
   runs in that PR's management session too — so the bot answers with the context of the CI fixes and
   review work it's been doing on the PR — while the rendered reply still posts to the comment thread.
+  An @-mention in the conversation of an **issue assigned to the bot** likewise runs in that issue's
+  work session (`github-issue:…`), so the bot replies with the context of the work it's doing on it.
 
 > **Scope.** v2 targets **same-repo PRs on repos you control** (where you own the webhook). The
 > fork → upstream contribution flow (e.g. PRs against `paradigmxyz/centaur`) is out of scope: it
@@ -78,8 +92,8 @@ reacting to lifecycle webhooks. It only ever acts on owned PRs, and on a dedicat
 GitHub delivers **HTTP webhooks** to `POST /api/webhooks/github` (content type **must** be
 `application/json`). Comment events (`issue_comment`, `pull_request_review_comment`) are handed to the
 chat adapter, which verifies the `X-Hub-Signature-256` HMAC and maps them to thread/message events.
-The `pull_request` event is handled by githubbot directly (the adapter ignores it), so githubbot
-verifies the signature itself before acting. Turns run in the background — webhooks are acknowledged
+Lifecycle events (`pull_request`, `pull_request_review`, `issues`, and the CI events) are handled by
+githubbot directly (the adapter ignores them), so githubbot verifies the signature itself before acting. Turns run in the background — webhooks are acknowledged
 immediately (cold sandbox spin-up far exceeds GitHub's webhook deadline), with a bounded retry inside
 the turn for transient cold-start failures. Multiple replicas are fine.
 
@@ -97,9 +111,9 @@ from a separate `GITHUBBOT_TOKEN` secret key to avoid collision.
 GitHub App auth is also supported by the adapter (`GITHUB_APP_ID` / `GITHUB_PRIVATE_KEY`), but the
 PAT-teammate model is what we run.
 
-Webhook events to subscribe: **Issue comments**, **Pull request review comments**, **Pull
+Webhook events to subscribe: **Issue comments**, **Pull request review comments**, **Issues**, **Pull
 requests**, **Pull request reviews**, **Check runs**, **Check suites**, and **Workflow runs**
-(the last four drive v2 PR self-management).
+(**Issues** drives issue-work-on-assignment; the last four drive v2 PR self-management).
 
 ## Environment
 
@@ -114,13 +128,14 @@ requests**, **Pull request reviews**, **Check runs**, **Check suites**, and **Wo
 | `GITHUBBOT_DEFAULT_HARNESS` | — | Harness for new threads without an inline flag, default `codex`. |
 | `GITHUBBOT_REVIEW_PROMPT` | — | Full review methodology, inline. Replaces the bundled default verbatim. |
 | `GITHUBBOT_REVIEW_PROMPT_FILE` | — | Path to a file holding the review methodology (e.g. an overlay-mounted file). Used when the inline var is unset. |
+| `GITHUBBOT_ISSUE_PROMPT` | — | Full issue-work methodology, inline. Replaces the bundled default verbatim. |
+| `GITHUBBOT_ISSUE_PROMPT_FILE` | — | Path to a file holding the issue-work methodology (e.g. an overlay-mounted file). Used when the inline var is unset. |
 | `GITHUB_API_URL` | — | Override the GitHub REST base URL (GitHub Enterprise). |
 | `GITHUBBOT_USER_ID` | — | Bot's numeric user id for self-message detection (auto-detected otherwise). |
 | `GITHUBBOT_STATE_KEY_PREFIX` | — | Chat-SDK state key prefix, default `centaur-githubbot`. |
 | `GITHUBBOT_LOG_LEVEL` | — | `debug`/`info`/`warn`/`error`, default `info`. |
 | `GITHUBBOT_AUTO_MERGE` | — | Auto-merge owned PRs when mergeable. Default `true`. |
 | `GITHUBBOT_MERGE_METHOD` | — | `merge` / `squash` / `rebase`. Default `squash`. |
-| `GITHUBBOT_MANAGED_LABEL` | — | Label marking a PR bot-managed. Default `centaur-managed`. |
 | `GITHUBBOT_HOLD_LABEL` | — | Label that pauses auto-merge. Default `do-not-merge`. |
 | `GITHUBBOT_CI_FIX_MAX_ATTEMPTS` | — | Consecutive CI-fix attempts before escalating. Default 3. |
 | `GITHUBBOT_DELETE_BRANCH_ON_MERGE` | — | Delete head branch after merge. Default `true`. |
@@ -130,5 +145,5 @@ requests**, **Pull request reviews**, **Check runs**, **Check suites**, and **Wo
 ## Tests
 
 `bun test test` — unit tests for the override flag parser, the GitHub thread-key parsing / context
-preamble, the review-request trigger gating, and the v2 PR-manager decision logic (CI evaluation,
-ownership, merge gating).
+preamble, the review-request trigger gating, the issue-assignment gating, and the v2 PR-manager
+decision logic (CI evaluation, assignment-based ownership, merge gating).
