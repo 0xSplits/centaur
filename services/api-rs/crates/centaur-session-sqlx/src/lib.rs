@@ -1,6 +1,6 @@
 //! SQLx-backed session repository.
 
-use std::str::FromStr;
+use std::{str::FromStr, time::Duration};
 
 use centaur_session_core::{
     ExecutionStatus, HarnessType, MessageRole, SandboxCapabilities, Session, SessionEvent,
@@ -42,6 +42,7 @@ pub struct IdleSandboxCandidate {
     pub thread_key: ThreadKey,
     pub sandbox_id: String,
     pub execution_id: String,
+    pub idle_timeout: Duration,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -616,7 +617,7 @@ impl PgSessionStore {
 
     pub async fn list_idle_sandbox_candidates(
         &self,
-        idle_backstop: std::time::Duration,
+        idle_backstop: Duration,
     ) -> Result<Vec<IdleSandboxCandidate>, SessionStoreError> {
         let rows = sqlx::query_as::<_, IdleSandboxCandidateRow>(
             r#"
@@ -625,20 +626,22 @@ impl PgSessionStore {
                     execution_id,
                     thread_key,
                     status,
-                    completed_at
+                    completed_at,
+                    metadata
                 from session_executions
                 order by thread_key, created_at desc, execution_id desc
             )
             select
                 s.thread_key,
                 s.sandbox_id as sandbox_id,
-                latest.execution_id
+                latest.execution_id,
+                latest.completed_at,
+                latest.metadata
             from sessions s
             join latest on latest.thread_key = s.thread_key
             where s.sandbox_id is not null
               and latest.status in ('completed', 'failed', 'cancelled')
               and latest.completed_at is not null
-              and latest.completed_at <= now() - ($1::float8 * interval '1 second')
               and not exists (
                   select 1
                   from session_executions active
@@ -648,11 +651,13 @@ impl PgSessionStore {
             order by latest.completed_at, s.thread_key
             "#,
         )
-        .bind(idle_backstop.as_secs_f64())
         .fetch_all(&self.pool)
         .await?;
 
-        rows.into_iter().map(TryInto::try_into).collect()
+        let now = OffsetDateTime::now_utc();
+        rows.into_iter()
+            .filter_map(|row| idle_candidate_from_row(row, idle_backstop, now).transpose())
+            .collect()
     }
 
     pub async fn list_workflow_owned_sandboxes(
@@ -841,6 +846,20 @@ impl PgSessionStore {
         .fetch_one(&self.pool)
         .await?;
         Ok(count)
+    }
+
+    pub async fn list_ready_warm_sandbox_ids(&self) -> Result<Vec<String>, SessionStoreError> {
+        let sandbox_ids = sqlx::query_scalar::<_, String>(
+            r#"
+            select sandbox_id
+            from session_warm_sandboxes
+            where status = 'ready'
+            order by created_at, sandbox_id
+            "#,
+        )
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(sandbox_ids)
     }
 
     pub async fn claim_ready_warm_sandbox(
@@ -1097,18 +1116,46 @@ struct IdleSandboxCandidateRow {
     thread_key: String,
     sandbox_id: String,
     execution_id: String,
+    completed_at: OffsetDateTime,
+    metadata: Value,
 }
 
-impl TryFrom<IdleSandboxCandidateRow> for IdleSandboxCandidate {
-    type Error = SessionStoreError;
-
-    fn try_from(row: IdleSandboxCandidateRow) -> Result<Self, Self::Error> {
-        Ok(Self {
-            thread_key: parse_persisted(row.thread_key)?,
-            sandbox_id: row.sandbox_id,
-            execution_id: row.execution_id,
-        })
+fn idle_candidate_from_row(
+    row: IdleSandboxCandidateRow,
+    idle_backstop: Duration,
+    now: OffsetDateTime,
+) -> Result<Option<IdleSandboxCandidate>, SessionStoreError> {
+    let idle_timeout = effective_idle_timeout(&row.metadata, idle_backstop);
+    if !idle_deadline_elapsed(row.completed_at, idle_timeout, now) {
+        return Ok(None);
     }
+    Ok(Some(IdleSandboxCandidate {
+        thread_key: parse_persisted(row.thread_key)?,
+        sandbox_id: row.sandbox_id,
+        execution_id: row.execution_id,
+        idle_timeout,
+    }))
+}
+
+fn effective_idle_timeout(metadata: &Value, idle_backstop: Duration) -> Duration {
+    metadata
+        .get("idle_timeout_ms")
+        .and_then(Value::as_u64)
+        .filter(|value| *value > 0)
+        .map(Duration::from_millis)
+        .unwrap_or_else(|| std::cmp::max(idle_backstop, Duration::from_millis(1)))
+}
+
+fn idle_deadline_elapsed(
+    completed_at: OffsetDateTime,
+    idle_timeout: Duration,
+    now: OffsetDateTime,
+) -> bool {
+    let elapsed = now - completed_at;
+    if elapsed.is_negative() {
+        return false;
+    }
+    elapsed.whole_nanoseconds() >= idle_timeout.as_nanos() as i128
 }
 
 #[derive(Debug, FromRow)]
@@ -1230,7 +1277,26 @@ pub fn default_metadata(metadata: Option<Value>) -> Value {
 
 #[cfg(test)]
 mod tests {
-    use super::SessionEventNotification;
+    use std::time::Duration;
+
+    use centaur_session_core::{HarnessType, ThreadKey};
+    use serde_json::json;
+    use time::{Duration as TimeDuration, OffsetDateTime};
+    use uuid::Uuid;
+
+    use super::{IdleSandboxCandidateRow, PgSessionStore, SessionEventNotification};
+
+    async fn test_store() -> Option<PgSessionStore> {
+        let Ok(url) = std::env::var("SESSION_RUNTIME_TEST_DATABASE_URL") else {
+            eprintln!("skipping: SESSION_RUNTIME_TEST_DATABASE_URL not set");
+            return None;
+        };
+        let store = PgSessionStore::connect(&url)
+            .await
+            .expect("connect test db");
+        store.run_migrations().await.expect("run migrations");
+        Some(store)
+    }
 
     #[test]
     fn parses_session_event_notification_payload() {
@@ -1244,5 +1310,119 @@ mod tests {
                 event_id: 42,
             }
         );
+    }
+
+    fn idle_row(
+        metadata: serde_json::Value,
+        completed_at: OffsetDateTime,
+    ) -> IdleSandboxCandidateRow {
+        IdleSandboxCandidateRow {
+            thread_key: "test:idle-row".to_owned(),
+            sandbox_id: "sbx-idle-row".to_owned(),
+            execution_id: "exe-idle-row".to_owned(),
+            completed_at,
+            metadata,
+        }
+    }
+
+    #[test]
+    fn idle_candidate_uses_persisted_timeout_deadline() {
+        let now = OffsetDateTime::now_utc();
+        let candidate = super::idle_candidate_from_row(
+            idle_row(
+                json!({"idle_timeout_ms": 1000}),
+                now - TimeDuration::seconds(2),
+            ),
+            Duration::from_secs(3600),
+            now,
+        )
+        .unwrap()
+        .expect("candidate should use persisted timeout");
+
+        assert_eq!(candidate.idle_timeout, Duration::from_secs(1));
+    }
+
+    #[test]
+    fn idle_candidate_waits_for_persisted_timeout_even_when_backstop_elapsed() {
+        let now = OffsetDateTime::now_utc();
+        let candidate = super::idle_candidate_from_row(
+            idle_row(
+                json!({"idle_timeout_ms": 10_000}),
+                now - TimeDuration::seconds(2),
+            ),
+            Duration::from_secs(1),
+            now,
+        )
+        .unwrap();
+
+        assert!(candidate.is_none());
+    }
+
+    #[test]
+    fn idle_candidate_falls_back_to_backstop_for_missing_or_invalid_timeout() {
+        let now = OffsetDateTime::now_utc();
+        let candidate = super::idle_candidate_from_row(
+            idle_row(
+                json!({"idle_timeout_ms": "not-a-number"}),
+                now - TimeDuration::seconds(2),
+            ),
+            Duration::from_secs(1),
+            now,
+        )
+        .unwrap()
+        .expect("candidate should use backstop");
+
+        assert_eq!(candidate.idle_timeout, Duration::from_secs(1));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn idle_candidates_use_persisted_execution_idle_timeout() {
+        let Some(store) = test_store().await else {
+            return;
+        };
+        let thread_key = ThreadKey::parse(format!("test:idle-cleanup-{}", Uuid::new_v4())).unwrap();
+        let sandbox_id = format!("sbx-idle-{}", Uuid::new_v4());
+        store
+            .create_or_get_session(&thread_key, &HarnessType::Codex, None, json!({}))
+            .await
+            .expect("create session");
+        store
+            .update_sandbox_id(&thread_key, Some(&sandbox_id))
+            .await
+            .expect("set sandbox id");
+        let execution_id = store
+            .create_execution(&thread_key, None, json!({"idle_timeout_ms": 1000}))
+            .await
+            .expect("create execution")
+            .execution
+            .execution_id;
+        store
+            .complete_execution(&execution_id)
+            .await
+            .expect("complete execution");
+        sqlx::query(
+            r#"
+            update session_executions
+            set completed_at = now() - interval '2 seconds', updated_at = now()
+            where execution_id = $1
+            "#,
+        )
+        .bind(&execution_id)
+        .execute(store.pool())
+        .await
+        .expect("age execution");
+
+        let candidates = store
+            .list_idle_sandbox_candidates(Duration::from_secs(3600))
+            .await
+            .expect("list idle sandbox candidates");
+        let candidate = candidates
+            .iter()
+            .find(|candidate| candidate.thread_key == thread_key)
+            .expect("candidate should use execution idle timeout, not backstop");
+
+        assert_eq!(candidate.sandbox_id, sandbox_id);
+        assert_eq!(candidate.execution_id, execution_id);
+        assert_eq!(candidate.idle_timeout, Duration::from_secs(1));
     }
 }

@@ -529,21 +529,13 @@ struct SandboxArgs {
         value_parser = clap::value_parser!(u64).range(1..)
     )]
     warm_pool_replenish_interval_secs: u64,
-    /// Stop sandboxes that have been idle-paused longer than this. 0 disables
-    /// the idle sweep.
-    #[arg(
-        long = "session-sandbox-idle-stop-ttl-secs",
-        env = "SESSION_SANDBOX_IDLE_STOP_TTL_SECS",
-        default_value_t = 3600
-    )]
-    sandbox_idle_stop_ttl_secs: u64,
     /// Stop any sandbox older than this regardless of status; sessions replace
     /// reaped sandboxes on their next message. 0 disables the max-lifetime
     /// sweep.
     #[arg(
         long = "session-sandbox-max-lifetime-secs",
         env = "SESSION_SANDBOX_MAX_LIFETIME_SECS",
-        default_value_t = 86_400
+        default_value_t = 259_200
     )]
     sandbox_max_lifetime_secs: u64,
     #[arg(
@@ -1225,7 +1217,6 @@ impl SandboxArgs {
         let ttl = |secs: u64| (secs > 0).then(|| Duration::from_secs(secs));
         SandboxReaperConfig {
             interval: Duration::from_secs(self.sandbox_reap_interval_secs),
-            idle_ttl: ttl(self.sandbox_idle_stop_ttl_secs),
             max_lifetime: ttl(self.sandbox_max_lifetime_secs),
         }
     }
@@ -2039,6 +2030,19 @@ mod tests {
         assert_eq!(args.sandbox.k8s_namespace, "centaur-test");
         assert_eq!(args.sandbox.ready_timeout_secs, 17);
         assert_eq!(args.sandbox.k8s_context.as_deref(), Some("kind-test"));
+    }
+
+    #[test]
+    fn sandbox_reaper_defaults_delete_after_max_lifetime() {
+        let args = Args::try_parse_from([
+            "centaur-api-server",
+            "--database-url",
+            "postgres://postgres:postgres@localhost/centaur",
+        ])
+        .unwrap();
+
+        let config = args.sandbox_reaper_config();
+        assert_eq!(config.max_lifetime, Some(Duration::from_secs(259_200)));
     }
 
     #[test]
