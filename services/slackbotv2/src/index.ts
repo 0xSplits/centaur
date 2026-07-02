@@ -38,6 +38,11 @@ import {
   sessionStreamError,
   withSlackApiTimeout
 } from './session-api'
+import {
+  buildConsoleSessionContextBlock,
+  defaultModelForHarness,
+  type SlackContextBlock
+} from './console-session-link'
 import { extractMessageOverrides } from './overrides'
 import { isAllowedSlackMessage, isAllowedSlackWebhookBody } from './slack-events'
 import type {
@@ -640,6 +645,28 @@ async function syncThreadMessageToSession(
   setMessageText(serializedMessage, overrides.cleanedText)
   const stickyOverridesUpdate = stickyThreadOverrideUpdate(overrides)
   const effectiveOverrides = resolveStickyThreadOverrides(state, stickyOverridesUpdate)
+  // Slack-only "Open session in Console" link on the FIRST assistant message in
+  // a thread (the reply to the first message that starts an execution). The
+  // block is undefined when no Console base URL is configured. `thread.id`
+  // (`slack:CHANNEL:THREAD_TS`) is the exact value sent to the session API as
+  // `thread_key`, which the Console indexes by.
+  const isFirstAssistantMessage = shouldStartExecution && executedMessageIds.size === 0
+  const effectiveHarnessType =
+    effectiveOverrides.harnessType ?? input.options.defaultHarnessType ?? 'codex'
+  // Without an explicit --model/--opus/... override the harness runs its
+  // configured default (CLAUDE_MODEL/CODEX_MODEL, else the baked harness
+  // config); show and record that instead of dropping the model entirely.
+  const effectiveModel =
+    effectiveOverrides.model ??
+    defaultModelForHarness(effectiveHarnessType, input.options.harnessDefaultModels)
+  const consoleSessionBlock = isFirstAssistantMessage
+    ? buildConsoleSessionContextBlock({
+        consoleBaseUrl: input.options.consolePublicUrl,
+        threadKey: thread.id,
+        harnessType: effectiveHarnessType,
+        model: effectiveModel
+      })
+    : undefined
   if (overrides.harnessType || overrides.model || overrides.provider || overrides.reasoning) {
     traceLog(input.options, 'slackbotv2_forward_overrides_parsed', trace, {
       harness_type: overrides.harnessType,
@@ -708,6 +735,7 @@ async function syncThreadMessageToSession(
     harnessType: shouldStartExecution ? effectiveOverrides.harnessType : undefined,
     messages: messagesToAppend,
     model: shouldStartExecution ? effectiveOverrides.model : undefined,
+    metadataModel: shouldStartExecution ? effectiveModel : undefined,
     provider: shouldStartExecution ? effectiveOverrides.provider : undefined,
     reasoning: overrides.reasoning,
     onEventId: eventId => {
@@ -855,7 +883,8 @@ async function syncThreadMessageToSession(
       () => lastEventId,
       renderLease,
       assistantStatusVisible,
-      trace
+      trace,
+      consoleSessionBlock
     )
     traceLog(input.options, 'slackbotv2_forward_complete', trace, {
       last_event_id: lastEventId
@@ -921,7 +950,8 @@ function scheduleExecutionRender(
   getLastEventId: () => number,
   renderLease: { release: (() => Promise<void>) | null },
   assistantStatusVisible: boolean,
-  trace?: SlackbotV2Trace
+  trace?: SlackbotV2Trace,
+  consoleSessionBlock?: SlackContextBlock
 ): void {
   const promise = (async () => {
     slackbotMetrics.activeLiveRenders.inc()
@@ -935,7 +965,8 @@ function scheduleExecutionRender(
           input,
           getLastEventId,
           assistantStatusVisible,
-          trace
+          trace,
+          consoleSessionBlock
         )
         if (result === 'complete') return
         const delayMs = renderRetryDelayMs(attempt)
@@ -978,7 +1009,8 @@ async function renderExecutionAttempt(
   input: ForwardSessionInput,
   getLastEventId: () => number,
   assistantStatusVisible: boolean,
-  trace?: SlackbotV2Trace
+  trace?: SlackbotV2Trace,
+  consoleSessionBlock?: SlackContextBlock
 ): Promise<'complete' | 'retry'> {
   const renderStartedAtMs = nowMs()
   let outcome = 'failure'
@@ -992,7 +1024,8 @@ async function renderExecutionAttempt(
       message,
       options,
       trace,
-      assistantStatusVisible
+      assistantStatusVisible,
+      consoleSessionBlock
     )
     rendered = true
     outcome = 'complete'
@@ -1803,7 +1836,8 @@ async function renderExecutionStream(
   message: SlackbotV2ApiMessage,
   options: SlackbotV2Options,
   trace?: SlackbotV2Trace,
-  assistantStatusVisible = false
+  assistantStatusVisible = false,
+  consoleSessionBlock?: SlackContextBlock
 ): Promise<{ diverged: boolean; messageId?: string }> {
   const promptText = slackMessagePromptText(message)
   if (isPlainTextOnlyRequest(promptText)) {
@@ -1851,7 +1885,11 @@ async function renderExecutionStream(
     const sent = await thread.adapter.stream!(thread.id, visibleStream, {
       recipientTeamId: message.teamId,
       recipientUserId: message.author.userId,
-      ...(taskDisplayMode === 'none' ? {} : { taskDisplayMode })
+      ...(taskDisplayMode === 'none' ? {} : { taskDisplayMode }),
+      // stopBlocks are appended to the end of the finalized Slack message via
+      // chat.stopStream. Present only for the first assistant message so the
+      // Console link renders once per thread.
+      ...(consoleSessionBlock ? { stopBlocks: [consoleSessionBlock] } : {})
     })
     return { diverged: capture.diverged, messageId: sent?.id }
   } finally {

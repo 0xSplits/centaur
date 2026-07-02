@@ -37,6 +37,25 @@ class ApplicationController < ActionController::Base
   # and pending controllers skip this so pending users can reach the holding page
   # and sign out.
   before_action :require_active_account
+  # The sidebar thread list is global chrome (rendered by layouts/console.html.erb
+  # on every page), but populating it issues several queries against the api-rs
+  # ai_v2 sessions DB, including an unindexed sequential scan + sort of the
+  # sessions table. Running that in every console request blocked pages that only
+  # render the empty-state list (principals, roles, secrets, ...). Instead we
+  # initialize the ivars empty here and load the real list lazily via a Turbo
+  # Frame (Console::ThreadsController#sidebar), so the cross-database work happens
+  # once, out of band, and never blocks the primary page render.
+  before_action :init_console_sidebar_threads
+
+  CONSOLE_SIDEBAR_THREAD_LIMIT = 30
+  CONSOLE_SIDEBAR_SLACK_PROVIDER = Oauth::Providers::Slack::KEY
+  CONSOLE_SIDEBAR_SLACK_THREAD_OWNER_METADATA_KEYS = %w[slack_user_id actor_user_id user_id].freeze
+  CONSOLE_SIDEBAR_SLACK_THREAD_TEAM_METADATA_KEYS = %w[slack_team_id team_id home_team_id].freeze
+  CONSOLE_SIDEBAR_SLACK_CREDENTIAL_USER_LABEL_KEYS = %w[slack_user_id].freeze
+  CONSOLE_SIDEBAR_SLACK_CREDENTIAL_EMAIL_LABEL_KEYS = %w[email slack_email].freeze
+  CONSOLE_SIDEBAR_SLACK_TEAM_LABEL = "slack_team_id".freeze
+  CONSOLE_SIDEBAR_THREAD_OWNER_METADATA_KEYS = %w[actor_email user_email].freeze
+  ConsoleSidebarSlackThreadOwner = Struct.new(:user_id, :team_id, keyword_init: true)
 
   private
 
@@ -69,10 +88,34 @@ class ApplicationController < ActionController::Base
     redirect_to root_path, alert: "That page is restricted to admins." unless current_user&.admin?
   end
 
+  # Cheap default so every page renders the empty sidebar list without touching
+  # the sessions DB. The real list is filled in by #load_console_sidebar_threads,
+  # invoked only from the lazy sidebar Turbo Frame.
+  def init_console_sidebar_threads
+    @console_sidebar_threads = []
+    @console_sidebar_latest_messages = {}
+  end
+
+  def load_console_sidebar_threads
+    @console_sidebar_threads = []
+    @console_sidebar_latest_messages = {}
+    return unless current_user&.active?
+
+    threads = console_sidebar_visible_thread_scope
+      .recent_first
+      .limit(CONSOLE_SIDEBAR_THREAD_LIMIT)
+      .to_a
+    threads = console_sidebar_threads_with_direct_selection(threads)
+    @console_sidebar_threads = threads
+    @console_sidebar_latest_messages = console_sidebar_latest_messages_for(threads.map(&:thread_key))
+  rescue ActiveRecord::ActiveRecordError, PG::Error => e
+    Rails.logger.debug("console_sidebar_threads_unavailable error=#{e.class}: #{e.message}")
+  end
+
   # Establishes the console cookie session and sends the user to the right
   # post-login page. Password login re-renders for disabled accounts; SSO login
   # redirects because it is returning from an external provider.
-  def sign_in_console_user(user, disabled: :redirect)
+  def sign_in_console_user(user, disabled: :redirect, destination: nil)
     if user.disabled?
       if disabled == :render
         flash.now[:alert] = "Your account is disabled."
@@ -87,7 +130,7 @@ class ApplicationController < ActionController::Base
     session[:user_id] = user.id
     session[:return_to] = return_to if return_to.present?
     if user.active?
-      redirect_to post_login_redirect_path, notice: "Signed in as #{user.email}."
+      redirect_to(destination.presence || post_login_redirect_path, notice: "Signed in as #{user.email}.")
     else
       redirect_to pending_path, notice: "Your account is awaiting approval."
     end
@@ -99,7 +142,203 @@ class ApplicationController < ActionController::Base
     path
   end
 
+  def safe_console_return_path(default: console_principals_path)
+    raw = params[:return_to].presence || params[:next].presence
+    return default if raw.blank?
+
+    uri = URI.parse(raw.to_s)
+    return default if uri.scheme.present? || uri.host.present?
+
+    path = uri.path.presence
+    return default unless path == "/" || path&.start_with?("/console")
+
+    uri.to_s
+  rescue URI::InvalidURIError
+    default
+  end
+
   def render_not_found(e)
     render plain: e.message, status: :not_found
+  end
+
+  def console_sidebar_visible_thread_scope
+    slack_owners = console_sidebar_slack_thread_owners_for_current_user
+    conditions = [
+      console_sidebar_console_thread_owner_sql,
+      (console_sidebar_slack_thread_owner_sql(slack_owners) if slack_owners.any?)
+    ].compact
+
+    return CentaurSession.where("1=0") if conditions.empty?
+
+    CentaurSession.where(conditions.map { |condition| "(#{condition})" }.join(" OR "))
+  end
+
+  def console_sidebar_threads_with_direct_selection(threads)
+    selected = console_sidebar_direct_selected_threads(threads)
+    selected.any? ? [ *selected, *threads ] : threads
+  end
+
+  def console_sidebar_direct_selected_threads(threads)
+    thread_keys = console_sidebar_selected_thread_keys - threads.map(&:thread_key)
+    return [] if thread_keys.empty?
+
+    # Resolve through the owner scope, not a raw find_by, so a directly linked
+    # thread only surfaces in the sidebar when the current user started it. This
+    # mirrors Console::ThreadsController#selected_session.
+    console_sidebar_visible_thread_scope.where(thread_key: thread_keys).to_a
+  end
+
+  # The thread param carries up to PANEL_LIMIT comma-separated keys when the
+  # split view is open; every open thread should surface and highlight.
+  def console_sidebar_selected_thread_keys
+    return [] unless params[:controller] == "console/threads"
+
+    params[:thread].to_s.split(",").map(&:strip).reject(&:blank?).uniq
+      .first(Console::ThreadsController::PANEL_LIMIT)
+  end
+
+  def console_sidebar_console_thread_owner_sql
+    email = console_sidebar_normalize_email(current_user&.email)
+    return if email.blank?
+
+    console_source = [
+      "thread_key LIKE 'console:%'",
+      "metadata ->> 'platform' = 'console'",
+      "metadata ->> 'source' = 'console'"
+    ].join(" OR ")
+    owner_clauses = CONSOLE_SIDEBAR_THREAD_OWNER_METADATA_KEYS.map do |key|
+      "lower(metadata ->> #{console_sidebar_sql_quote(key)}) = #{console_sidebar_sql_quote(email)}"
+    end
+
+    "(#{console_source}) AND (#{owner_clauses.join(" OR ")})"
+  end
+
+  def console_sidebar_slack_thread_owners_for_current_user
+    @console_sidebar_slack_thread_owners_for_current_user ||= begin
+      subjects = console_sidebar_slack_identity_subjects_for_current_user
+      emails = console_sidebar_slack_identity_emails_for_current_user
+
+      if subjects.empty? && emails.empty?
+        []
+      else
+        credentials = BrokerCredential
+          .joins(:oauth_app)
+          .includes(:oauth_app)
+          .where(oauth_apps: { provider: CONSOLE_SIDEBAR_SLACK_PROVIDER })
+          .where(console_sidebar_slack_oauth_credential_owner_sql(subjects: subjects, emails: emails))
+
+        credentials.filter_map do |credential|
+          user_id = console_sidebar_first_present(
+            credential.provider_subject,
+            *CONSOLE_SIDEBAR_SLACK_CREDENTIAL_USER_LABEL_KEYS.map { |key| credential.labels&.[](key) }
+          )
+          next if user_id.blank?
+
+          ConsoleSidebarSlackThreadOwner.new(
+            user_id: user_id,
+            team_id: console_sidebar_first_present(
+              credential.labels&.[](CONSOLE_SIDEBAR_SLACK_TEAM_LABEL),
+              credential.oauth_app&.labels&.[](CONSOLE_SIDEBAR_SLACK_TEAM_LABEL)
+            )
+          )
+        end.uniq { |owner| [ console_sidebar_normalize_key(owner.user_id), console_sidebar_normalize_key(owner.team_id) ] }
+      end
+    end
+  end
+
+  def console_sidebar_slack_identity_subjects_for_current_user
+    current_user.user_identities
+      .where(provider: CONSOLE_SIDEBAR_SLACK_PROVIDER)
+      .pluck(:subject)
+      .filter_map { |value| console_sidebar_normalize_key(value) }
+      .uniq
+  end
+
+  def console_sidebar_slack_identity_emails_for_current_user
+    ([ current_user.email ] + current_user.user_identities.where(provider: CONSOLE_SIDEBAR_SLACK_PROVIDER).pluck(:email))
+      .filter_map { |value| console_sidebar_normalize_email(value) }
+      .uniq
+  end
+
+  def console_sidebar_slack_oauth_credential_owner_sql(subjects:, emails:)
+    clauses = []
+    if subjects.any?
+      subject_values = console_sidebar_sql_list(subjects)
+      clauses << "lower(broker_credentials.provider_subject) IN (#{subject_values})"
+      CONSOLE_SIDEBAR_SLACK_CREDENTIAL_USER_LABEL_KEYS.each do |key|
+        clauses << "lower(broker_credentials.labels ->> #{console_sidebar_sql_quote(key)}) IN (#{subject_values})"
+      end
+    end
+
+    if emails.any?
+      email_values = console_sidebar_sql_list(emails)
+      clauses << "lower(broker_credentials.provider_email) IN (#{email_values})"
+      CONSOLE_SIDEBAR_SLACK_CREDENTIAL_EMAIL_LABEL_KEYS.each do |key|
+        clauses << "lower(broker_credentials.labels ->> #{console_sidebar_sql_quote(key)}) IN (#{email_values})"
+      end
+    end
+
+    clauses.join(" OR ")
+  end
+
+  def console_sidebar_slack_thread_owner_sql(owners)
+    slack_source = [
+      "thread_key LIKE 'slack:%'",
+      "metadata ->> 'platform' = 'slack'",
+      "metadata ->> 'source' = 'slackbotv2'"
+    ].join(" OR ")
+
+    owner_clauses = owners.map do |owner|
+      user_id = console_sidebar_normalize_key(owner.user_id)
+      user_clauses = CONSOLE_SIDEBAR_SLACK_THREAD_OWNER_METADATA_KEYS.map do |key|
+        "lower(metadata ->> #{console_sidebar_sql_quote(key)}) = #{console_sidebar_sql_quote(user_id)}"
+      end
+      owner_clause = "(#{user_clauses.join(" OR ")})"
+
+      # Team scoping narrows the match only when the credential exposes a team;
+      # see Console::ThreadsController#slack_thread_owner_sql.
+      if owner.team_id.present?
+        team_id = console_sidebar_normalize_key(owner.team_id)
+        team_clauses = CONSOLE_SIDEBAR_SLACK_THREAD_TEAM_METADATA_KEYS.map do |key|
+          "lower(metadata ->> #{console_sidebar_sql_quote(key)}) = #{console_sidebar_sql_quote(team_id)}"
+        end
+        team_clauses << "lower(split_part(thread_key, ':', 2)) = #{console_sidebar_sql_quote(team_id)}"
+        owner_clause = "(#{owner_clause} AND (#{team_clauses.join(" OR ")}))"
+      end
+
+      owner_clause
+    end
+
+    "(#{slack_source}) AND (#{owner_clauses.join(" OR ")})"
+  end
+
+  def console_sidebar_latest_messages_for(keys)
+    return {} if keys.empty?
+
+    CentaurSessionMessage
+      .where(thread_key: keys)
+      .select("distinct on (thread_key) session_messages.*")
+      .order(Arel.sql("thread_key, created_at desc, message_id desc"))
+      .index_by(&:thread_key)
+  end
+
+  def console_sidebar_first_present(*values)
+    values.find(&:present?)
+  end
+
+  def console_sidebar_normalize_key(value)
+    value.to_s.strip.downcase.presence
+  end
+
+  def console_sidebar_normalize_email(value)
+    value.to_s.strip.downcase.presence
+  end
+
+  def console_sidebar_sql_list(values)
+    values.map { |value| console_sidebar_sql_quote(value) }.join(", ")
+  end
+
+  def console_sidebar_sql_quote(value)
+    ActiveRecord::Base.connection.quote(value.to_s)
   end
 end

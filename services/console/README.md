@@ -30,6 +30,43 @@ Operators manage credentials, principals, roles, and grants through the API or t
 
 All of the console's environment variables use the `CENTAUR_CONSOLE_` prefix. For backwards compatibility, every variable also resolves from the legacy `IRON_CONTROL_` name when the `CENTAUR_CONSOLE_` one is unset, so existing deployments keep working until they migrate. The `CENTAUR_CONSOLE_` name wins when both are set.
 
+The Threads tab reads api-rs session rows from the Centaur API database. Set
+`CENTAUR_CONSOLE_CENTAUR_DATABASE_URL` to that database URL when it differs from
+the console's primary database. In the Helm chart this is sourced from the
+shared `DATABASE_URL` secret key.
+
+For local development, sign in through the normal login form at
+`http://localhost:3000/login` with the seeded initial user's
+`CENTAUR_CONSOLE_INITIAL_USER_EMAIL` / `CENTAUR_CONSOLE_INITIAL_USER_PASSWORD`
+credentials, the same as every other environment.
+
+To build the Threads UX against production-shaped data without connecting the
+Console to production, create a bounded local snapshot:
+
+```bash
+export CENTAUR_PROD_DATABASE_URL=postgresql://readonly:...@.../ai_v2
+scripts/mirror-prod-threads-snapshot.sh all
+```
+
+The script exports recent `sessions`, `session_messages`,
+`session_executions`, terminal `session_events` plus reasoning
+`session.output.line` events (capped by `THINKING_EVENT_LIMIT_PER_THREAD`,
+default 200 per thread), and referenced `slack_sync_users` rows with the source
+connection forced read-only, then imports them into the local `ai_v2` database
+used by the Console dev container. The Threads surface is read-only: it does
+not render a composer and rejects POSTs server-side.
+
+Threads extras beyond the Slack surface:
+
+- Thinking traces: reasoning items the harness streamed over stdout are
+  persisted by api-rs as `session.output.line` events; the transcript renders
+  each completed reasoning block as a collapsed "Thinking" disclosure.
+- Split view: Cmd/Ctrl-click a sidebar thread to open it alongside the current
+  one, up to four threads in a grid. The `thread` param carries the open keys
+  comma-separated (`?thread=<primary>,<key2>,<key3>,<key4>`), primary first.
+  All keys resolve through the same owner scope as a single thread, and each
+  panel has a close control.
+
 ## First Boot
 
 The console requires an authenticated user and API key before any API endpoint will respond. To bootstrap a fresh deployment without a console, set the following environment variables on startup:

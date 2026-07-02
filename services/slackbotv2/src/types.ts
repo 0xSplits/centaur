@@ -106,11 +106,26 @@ export type SlackbotV2Options = {
   botToken: string
   botUserId?: string
   /**
+   * Public origin of the Console UI (same value the Console itself uses,
+   * `CENTAUR_CONSOLE_PUBLIC_URL`). When set, the first assistant message in a
+   * Slack thread gets an "Open session in Console" context link. Unset skips
+   * the block entirely.
+   */
+  consolePublicUrl?: string
+  /**
    * Harness for new threads when no --claude/--amp/--codex flag is given
    * (HarnessType wire value: codex | amp | claudecode). Defaults to codex.
    */
   defaultHarnessType?: string
   fetch?: SlackbotV2Fetch
+  /**
+   * Deployment-configured default model per harness wire value (claudecode |
+   * codex), from the CLAUDE_MODEL / CODEX_MODEL env vars the chart mirrors
+   * out of sandbox.extraEnv. Display/metadata only — never forwarded to the
+   * harness. Unset harnesses fall back to the models pinned in this repo's
+   * harness config files (see console-session-link.ts).
+   */
+  harnessDefaultModels?: Record<string, string>
   /** Milliseconds before an idle execution pauses its sandbox. Defaults to up to 3h. */
   idleTimeoutMs?: number
   logger?: Logger
@@ -191,6 +206,12 @@ export type ForwardSessionInput = {
   messages: SlackbotV2ApiMessage[]
   /** Effective model selected by sticky thread flags (--model/--opus/...). */
   model?: string
+  /**
+   * Model recorded in execute metadata for readers like the Console: the
+   * explicit override when one is set, else the configured/baked harness
+   * default. Metadata only — never forwarded to the harness (that is `model`).
+   */
+  metadataModel?: string
   /** Effective model provider selected by sticky thread flags (--bedrock); codex only. */
   provider?: string
   /** Per-turn reasoning effort parsed from the `-rsn` flag (codex only). */
