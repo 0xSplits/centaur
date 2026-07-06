@@ -295,9 +295,43 @@ pub enum SessionStatus {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct SandboxCapabilities {
+    pub repo_cache_enabled: bool,
+    pub observability_enabled: bool,
+    pub api_server_enabled: bool,
+}
+
+impl SandboxCapabilities {
+    pub const fn default_enabled() -> Self {
+        Self {
+            repo_cache_enabled: true,
+            observability_enabled: true,
+            api_server_enabled: true,
+        }
+    }
+
+    pub const fn is_default_enabled(&self) -> bool {
+        self.repo_cache_enabled && self.observability_enabled && self.api_server_enabled
+    }
+}
+
+impl Default for SandboxCapabilities {
+    fn default() -> Self {
+        Self::default_enabled()
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct Session {
     pub thread_key: ThreadKey,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
     pub sandbox_id: Option<String>,
+    /// Capabilities applied to the currently assigned sandbox. `None` means the
+    /// sandbox predates capability tracking; callers may treat it as compatible
+    /// only with the default-enabled profile.
+    #[serde(default)]
+    pub sandbox_capabilities: Option<SandboxCapabilities>,
     pub harness_type: HarnessType,
     pub harness_thread_id: Option<String>,
     pub persona_id: Option<String>,
@@ -305,6 +339,10 @@ pub struct Session {
     /// iron-control principal OID this session's egress proxy binds to,
     /// captured at registration so a resumed session can recreate its sandbox.
     pub iron_control_principal: Option<String>,
+    /// Last meaningful activity for the currently assigned sandbox. This is
+    /// the eviction signal for capacity pressure and intentionally separate
+    /// from `updated_at`, which also changes for metadata/status writes.
+    pub sandbox_last_active_at: Option<OffsetDateTime>,
     pub created_at: OffsetDateTime,
     pub updated_at: OffsetDateTime,
 }

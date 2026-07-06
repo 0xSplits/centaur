@@ -28,6 +28,10 @@ const AGENT_UID: i64 = 1001;
 
 /// Base tools path inside both the api-rs pod and the agent sandbox.
 pub(crate) const BASE_TOOL_DIR: &str = "/app/tools";
+/// Base Centaur tools baked into the sandbox image. Restricted sandboxes use
+/// this path so they keep first-party tool shims without mounting repo-cache or
+/// publishing overlay sources.
+pub(crate) const BAKED_BASE_TOOL_DIR: &str = "/opt/centaur/tools";
 /// emptyDir the `tools-bootstrap` init container publishes the tools tree into.
 const TOOLS_VOLUME: &str = "tools-root";
 /// Staging path where `tools-bootstrap` mounts the tools emptyDir. The agent
@@ -67,6 +71,9 @@ pub struct ToolsConfig {
     /// Optional PVC backing for `repo_cache_path`. This lets Autopilot clusters use
     /// repoCache without hostPath volumes.
     pub repo_cache_pvc: Option<String>,
+    /// Whether running sandboxes should watch repo-cache checkouts and refresh
+    /// local tool shims when commits change.
+    pub auto_reload: bool,
     /// Additional tool sources copied after the base tree. Duplicate tool names
     /// are skipped by the copy helper.
     pub extra_sources: Vec<ToolSource>,
@@ -98,6 +105,7 @@ impl ToolsConfig {
             github_token: None,
             repo_cache_path: None,
             repo_cache_pvc: None,
+            auto_reload: true,
             extra_sources: Vec::new(),
         }
     }
@@ -136,9 +144,21 @@ pub(crate) fn agent_tool_dirs() -> String {
     BASE_TOOL_DIR.to_owned()
 }
 
+/// `TOOL_DIRS` for restricted sandboxes that should not receive repo-cache or
+/// overlay-derived tool sources.
+pub(crate) fn baked_base_tool_dirs() -> String {
+    BAKED_BASE_TOOL_DIR.to_owned()
+}
+
 /// Agent env added for tools wiring.
 pub(crate) fn agent_env(tools: Option<&ToolsConfig>) -> Vec<(String, String)> {
     let mut env = vec![("TOOL_DIRS".to_owned(), agent_tool_dirs())];
+    if let Some(tools) = tools {
+        env.push((
+            "CENTAUR_TOOLS_AUTO_RELOAD".to_owned(),
+            tools.auto_reload.to_string(),
+        ));
+    }
     if tools
         .and_then(|tools| tools.github_token.as_ref())
         .is_some()
@@ -149,6 +169,12 @@ pub(crate) fn agent_env(tools: Option<&ToolsConfig>) -> Vec<(String, String)> {
         ));
     }
     env
+}
+
+/// Agent env for baked base tools only. No GitHub token is exposed because
+/// restricted sandboxes do not refresh from git or repo-cache.
+pub(crate) fn baked_base_agent_env() -> Vec<(String, String)> {
+    vec![("TOOL_DIRS".to_owned(), baked_base_tool_dirs())]
 }
 
 /// Routes the tools clone through the per-sandbox egress proxy. The sandbox
@@ -416,9 +442,33 @@ mod tests {
     }
 
     #[test]
+    fn baked_base_tool_dirs_point_at_image_tools() {
+        assert_eq!(baked_base_tool_dirs(), "/opt/centaur/tools");
+    }
+
+    #[test]
     fn agent_env_sets_tool_dirs() {
         let env = agent_env(None);
         assert_eq!(env, vec![("TOOL_DIRS".to_owned(), "/app/tools".to_owned())]);
+    }
+
+    #[test]
+    fn agent_env_sets_auto_reload_from_tools_config() {
+        let mut tools = ToolsConfig::new("paradigmxyz/centaur", "centaur-agent:test");
+        tools.auto_reload = false;
+
+        let env = agent_env(Some(&tools));
+
+        assert!(env.contains(&("TOOL_DIRS".to_owned(), "/app/tools".to_owned())));
+        assert!(env.contains(&("CENTAUR_TOOLS_AUTO_RELOAD".to_owned(), "false".to_owned())));
+    }
+
+    #[test]
+    fn baked_base_agent_env_sets_baked_tool_dirs() {
+        assert_eq!(
+            baked_base_agent_env(),
+            vec![("TOOL_DIRS".to_owned(), "/opt/centaur/tools".to_owned())]
+        );
     }
 
     #[test]
@@ -637,6 +687,7 @@ mod tests {
         });
 
         let env = agent_env(Some(&tools));
+        assert!(env.contains(&("CENTAUR_TOOLS_AUTO_RELOAD".to_owned(), "true".to_owned())));
         assert!(env.contains(&(
             "CENTAUR_TOOLS_GITHUB_TOKEN_FILE".to_owned(),
             "/tools-github-token/token".to_owned()
