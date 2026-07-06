@@ -11,7 +11,10 @@ use std::{
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
 
-use centaur_api_server::SandboxRuntime;
+use centaur_api_server::{
+    DiscoveredToolProxyFragment, SandboxRuntime, ToolDiscoveryConfig, discover_persona_registry,
+    discover_tool_proxy_fragment,
+};
 use centaur_iron_control::{
     IdentityInput, IronControlClient, IronControlError, RegisterError, RoleSpec, SessionRegistrar,
     register_role,
@@ -27,18 +30,14 @@ use centaur_sandbox_core::{Mount, MountKind, SandboxSpec};
 use centaur_sandbox_local::LocalSandboxBackend;
 use centaur_sandbox_manager::{SandboxReaperConfig, WarmPoolConfig};
 use centaur_session_core::HarnessType;
-use centaur_session_runtime::{PersonaRegistry, SandboxWorkloadMode, SessionSandboxCleanupConfig};
+use centaur_session_runtime::{
+    PersonaRegistry, SandboxCapacityConfig, SandboxWorkloadMode, SessionSandboxCleanupConfig,
+};
 use centaur_workflows::WorkflowHostSandboxRuntime;
 use clap::{Args as ClapArgs, Parser, ValueEnum};
-use tracing::{error, info, warn};
+use tracing::{info, warn};
 
-use crate::{
-    ServerError,
-    tool_discovery::{
-        DiscoveredToolProxyFragment, ToolDiscoveryConfig, discover_persona_registry,
-        discover_tool_proxy_fragment,
-    },
-};
+use crate::{ServerError, activity_summary::ActivitySummaryConfig};
 
 const SANDBOX_REPOS_MOUNT_PATH: &str = "/home/agent/github";
 
@@ -60,6 +59,8 @@ pub(crate) struct Args {
     pub(crate) server: ServerArgs,
     #[command(flatten)]
     sandbox: SandboxArgs,
+    #[command(flatten)]
+    activity_summary: ActivitySummaryArgs,
 }
 
 impl Args {
@@ -73,18 +74,16 @@ impl Args {
         self.sandbox.iron_control_runtime().await
     }
 
-    pub(crate) fn iron_control_tool_reconciler(
-        &self,
-    ) -> Result<Option<IronControlToolReconciler>, ServerError> {
-        self.sandbox.iron_control_tool_reconciler()
-    }
-
     pub(crate) fn persona_registry(&self) -> Result<PersonaRegistry, ServerError> {
         self.sandbox.persona_registry()
     }
 
     pub(crate) fn warm_pool_config(&self) -> Option<WarmPoolConfig> {
         self.sandbox.warm_pool_config()
+    }
+
+    pub(crate) fn sandbox_capacity_config(&self) -> Option<SandboxCapacityConfig> {
+        self.sandbox.sandbox_capacity_config()
     }
 
     pub(crate) fn sandbox_reaper_config(&self) -> SandboxReaperConfig {
@@ -103,6 +102,19 @@ impl Args {
             .workflow_host_sandbox_runtime(bootstrap_iron_control_principal)
             .await
     }
+
+    pub(crate) fn activity_summary_config(&self) -> Option<ActivitySummaryConfig> {
+        self.activity_summary.config()
+    }
+
+    pub(crate) fn shutdown_execution_drain_timeout(&self) -> Duration {
+        Duration::from_secs(self.server.shutdown_execution_drain_timeout_secs)
+    }
+
+    pub(crate) fn execution_adoption_interval(&self) -> Option<Duration> {
+        (self.server.execution_adoption_interval_secs > 0)
+            .then(|| Duration::from_secs(self.server.execution_adoption_interval_secs))
+    }
 }
 
 pub(crate) struct IronControlRuntime {
@@ -111,14 +123,80 @@ pub(crate) struct IronControlRuntime {
     pub(crate) workflow_host_principal: String,
 }
 
-pub(crate) struct IronControlToolReconciler {
-    client: IronControlClient,
-    namespace: String,
-    source_policy: SourcePolicy,
-    base_infra_fragment: ProxyFragment,
-    tool_dirs: Vec<PathBuf>,
-    tool_git_sources: Vec<ToolGitSource>,
-    interval: Duration,
+#[derive(Debug, ClapArgs)]
+struct ActivitySummaryArgs {
+    /// Enable API-side model summaries of durable Codex App Server activity.
+    #[arg(
+        long = "session-activity-summary-enabled",
+        env = "SESSION_ACTIVITY_SUMMARY_ENABLED",
+        default_value_t = false,
+        action = clap::ArgAction::Set
+    )]
+    enabled: bool,
+    #[arg(
+        long = "session-activity-summary-model",
+        env = "SESSION_ACTIVITY_SUMMARY_MODEL",
+        default_value = "gpt-5.4-nano"
+    )]
+    model: String,
+    #[arg(
+        long = "session-activity-summary-openai-base-url",
+        env = "SESSION_ACTIVITY_SUMMARY_OPENAI_BASE_URL",
+        default_value = "https://api.openai.com/v1"
+    )]
+    openai_base_url: String,
+    #[arg(
+        long = "session-activity-summary-min-interval-secs",
+        env = "SESSION_ACTIVITY_SUMMARY_MIN_INTERVAL_SECS",
+        default_value_t = 20,
+        value_parser = clap::value_parser!(u64).range(1..)
+    )]
+    min_interval_secs: u64,
+    #[arg(
+        long = "session-activity-summary-timeout-secs",
+        env = "SESSION_ACTIVITY_SUMMARY_TIMEOUT_SECS",
+        default_value_t = 5,
+        value_parser = clap::value_parser!(u64).range(1..)
+    )]
+    timeout_secs: u64,
+    #[arg(
+        long = "session-activity-summary-max-facts",
+        env = "SESSION_ACTIVITY_SUMMARY_MAX_FACTS",
+        default_value_t = 12,
+        value_parser = clap::value_parser!(u64).range(1..)
+    )]
+    max_facts: u64,
+    #[arg(
+        long = "session-activity-summary-max-output-tokens",
+        env = "SESSION_ACTIVITY_SUMMARY_MAX_OUTPUT_TOKENS",
+        default_value_t = 128,
+        value_parser = clap::value_parser!(u64).range(1..)
+    )]
+    max_output_tokens: u64,
+}
+
+impl ActivitySummaryArgs {
+    fn config(&self) -> Option<ActivitySummaryConfig> {
+        if !self.enabled {
+            return None;
+        }
+        let Some(api_key) = clean_optional_value(env::var("OPENAI_API_KEY").ok().as_deref()) else {
+            warn!(
+                "session activity summaries are enabled but no OpenAI credential is configured; \
+                 set OPENAI_API_KEY in the api-rs environment"
+            );
+            return None;
+        };
+        Some(ActivitySummaryConfig {
+            base_url: self.openai_base_url.clone(),
+            api_key,
+            max_facts: usize::try_from(self.max_facts).unwrap_or(usize::MAX),
+            max_output_tokens: u16::try_from(self.max_output_tokens).unwrap_or(u16::MAX),
+            min_interval: Duration::from_secs(self.min_interval_secs),
+            model: self.model.clone(),
+            timeout: Duration::from_secs(self.timeout_secs),
+        })
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -128,79 +206,6 @@ struct ToolGitSource {
     source_subdir: String,
     cache_dir: PathBuf,
     repo_cache_path: Option<String>,
-}
-
-impl IronControlToolReconciler {
-    pub(crate) async fn run(self) {
-        let mut interval = tokio::time::interval(self.interval);
-        // The startup path already registered once; wait a full period so this
-        // task only handles post-start git/volume updates.
-        interval.tick().await;
-        loop {
-            interval.tick().await;
-            if let Err(error) = self.reconcile_once().await {
-                error!(%error, "failed to reconcile iron-control tool secrets");
-            }
-        }
-    }
-
-    async fn reconcile_once(&self) -> Result<(), ServerError> {
-        let tool_dirs = self.tool_dirs()?;
-        let tool_fragment = self.discover_tool_proxy_fragment()?;
-        let mut infra = self.base_infra_fragment.clone();
-        if let Some(tool_fragment) = &tool_fragment {
-            merge_fragment(&mut infra, tool_fragment.fragment.clone());
-        }
-        let role_id = register_role(
-            &self.client,
-            &self.namespace,
-            &RoleSpec::infra(),
-            &infra,
-            &self.source_policy,
-        )
-        .await?;
-        info!(
-            role_id,
-            tool_dirs = ?tool_dirs,
-            tool_count = tool_fragment
-                .as_ref()
-                .map_or(0, |fragment| fragment.tool_count),
-            secret_count = tool_fragment
-                .as_ref()
-                .map_or(0, |fragment| fragment.secret_count),
-            "reconciled iron-control tool secrets"
-        );
-        Ok(())
-    }
-
-    fn discover_tool_proxy_fragment(
-        &self,
-    ) -> Result<Option<DiscoveredToolProxyFragment>, ServerError> {
-        let tool_dirs = self.tool_dirs()?;
-        let discovered = discover_tool_proxy_fragment(&tool_dirs)?;
-        if discovered.secret_count == 0 {
-            return Ok(None);
-        }
-        Ok(Some(discovered))
-    }
-
-    fn tool_dirs(&self) -> Result<Vec<PathBuf>, ServerError> {
-        if !self.tool_git_sources.is_empty() {
-            let mut dirs = Vec::with_capacity(self.tool_git_sources.len());
-            for source in &self.tool_git_sources {
-                source.sync()?;
-                let tools_dir = source.tools_dir();
-                // Skip sources without a tools tree (chart-defaulted subdirs
-                // make this a normal case for non-tool overlay repos).
-                if !tools_dir.is_dir() {
-                    continue;
-                }
-                dirs.push(tools_dir);
-            }
-            return Ok(dirs);
-        }
-        Ok(self.tool_dirs.clone())
-    }
 }
 
 impl ToolGitSource {
@@ -452,6 +457,31 @@ pub(crate) struct ServerArgs {
     pub(crate) bind_addr: SocketAddr,
     #[arg(long, env = "RUN_MIGRATIONS", default_value_t = false)]
     pub(crate) run_migrations: bool,
+    /// How long shutdown waits for in-flight executions to finish before
+    /// releasing their stdout-owner leases for adoption by a peer. Keep
+    /// below the pod's terminationGracePeriodSeconds (35s in the chart) so
+    /// the release happens before SIGKILL. 0 releases immediately.
+    #[arg(
+        long = "shutdown-execution-drain-timeout-secs",
+        env = "SHUTDOWN_EXECUTION_DRAIN_TIMEOUT_SECS",
+        default_value_t = 20,
+        value_parser = clap::value_parser!(u64).range(0..=600)
+    )]
+    shutdown_execution_drain_timeout_secs: u64,
+    /// How often to re-run the orphaned-execution adoption scan after the
+    /// startup pass. Executions orphaned while the process is already
+    /// running (e.g. a rolling deploy terminating the previous pod mid-turn
+    /// after this pod's startup scan) are only recovered by these re-scans,
+    /// so the interval bounds how long a handed-off turn stays frozen. A
+    /// steady-state tick is a single SELECT (executions with a live
+    /// stdout-owner lease are skipped before any session or sandbox reads).
+    /// 0 disables re-scans and keeps the startup-only behavior.
+    #[arg(
+        long = "session-execution-adoption-interval-secs",
+        env = "SESSION_EXECUTION_ADOPTION_INTERVAL_SECS",
+        default_value_t = 15
+    )]
+    execution_adoption_interval_secs: u64,
 }
 
 #[derive(Debug, ClapArgs)]
@@ -529,21 +559,29 @@ struct SandboxArgs {
         value_parser = clap::value_parser!(u64).range(1..)
     )]
     warm_pool_replenish_interval_secs: u64,
-    /// Stop sandboxes that have been idle-paused longer than this. 0 disables
-    /// the idle sweep.
+    /// Hard cap on observed running-like sandboxes. 0 disables capacity
+    /// admission.
     #[arg(
-        long = "session-sandbox-idle-stop-ttl-secs",
-        env = "SESSION_SANDBOX_IDLE_STOP_TTL_SECS",
-        default_value_t = 3600
+        long = "session-sandbox-running-limit",
+        env = "SESSION_SANDBOX_RUNNING_LIMIT",
+        default_value_t = 0
     )]
-    sandbox_idle_stop_ttl_secs: u64,
+    sandbox_running_limit: usize,
+    /// Do not evict assigned idle sandboxes that were active within this
+    /// window. Warm sandboxes can still be discarded first.
+    #[arg(
+        long = "session-sandbox-hot-idle-grace-secs",
+        env = "SESSION_SANDBOX_HOT_IDLE_GRACE_SECS",
+        default_value_t = 300
+    )]
+    sandbox_hot_idle_grace_secs: u64,
     /// Stop any sandbox older than this regardless of status; sessions replace
     /// reaped sandboxes on their next message. 0 disables the max-lifetime
     /// sweep.
     #[arg(
         long = "session-sandbox-max-lifetime-secs",
         env = "SESSION_SANDBOX_MAX_LIFETIME_SECS",
-        default_value_t = 86_400
+        default_value_t = 259_200
     )]
     sandbox_max_lifetime_secs: u64,
     #[arg(
@@ -580,6 +618,8 @@ struct SandboxArgs {
     centaur_api_url: Option<String>,
     #[arg(long = "repos-path", env = "REPOS_PATH")]
     repos_path: Option<String>,
+    #[arg(long = "repos-pvc", env = "REPOS_PVC")]
+    repos_pvc: Option<String>,
     #[arg(
         long = "session-sandbox-passthrough-env",
         env = "SESSION_SANDBOX_PASSTHROUGH_ENV",
@@ -620,12 +660,6 @@ struct SandboxArgs {
     kubernetes_workflow_dirs: Option<String>,
     #[command(flatten)]
     tools_source: ToolsArgs,
-    #[arg(
-        long = "tool-proxy-reconcile-interval-secs",
-        env = "TOOL_PROXY_RECONCILE_INTERVAL_SECS",
-        default_value_t = 60
-    )]
-    tool_proxy_reconcile_interval_secs: u64,
 }
 
 impl SandboxArgs {
@@ -638,8 +672,7 @@ impl SandboxArgs {
         let namespace = self.iron_control.namespace.clone();
         let role_ids = if self.iron_control_sync_infra_secrets {
             let policy = self.iron_proxy.source_policy();
-            let tool_fragment = self.discover_tool_proxy_fragment()?;
-            let roles = self.iron_proxy.roles_to_register(tool_fragment.as_ref())?;
+            let roles = self.iron_proxy.roles_to_register()?;
             let mut role_ids = Vec::with_capacity(roles.len());
             for (spec, fragment) in &roles {
                 role_ids.push(
@@ -690,39 +723,6 @@ impl SandboxArgs {
             registrar: SessionRegistrar::new(client, namespace, role_ids),
             warm_pool_bootstrap_principal: bootstrap.id,
             workflow_host_principal: workflow_host.id,
-        }))
-    }
-
-    /// Background registration for git/volume-backed tool updates. Startup
-    /// registration keeps the stable infra role current; re-upserting that role
-    /// here adds newly discovered tool secrets to principals that hold the role
-    /// without restarting api-rs or sandboxes. Session registration only seeds
-    /// this role onto brand-new principals, so operator revocations stay sticky.
-    fn iron_control_tool_reconciler(
-        &self,
-    ) -> Result<Option<IronControlToolReconciler>, ServerError> {
-        if !self.iron_control_sync_infra_secrets {
-            return Ok(None);
-        }
-        let Some(client) = self.iron_control.client() else {
-            return Ok(None);
-        };
-        if self.tool_proxy_reconcile_interval_secs == 0 {
-            return Ok(None);
-        }
-        Ok(Some(IronControlToolReconciler {
-            client,
-            namespace: self.iron_control.namespace.clone(),
-            source_policy: self.iron_proxy.source_policy(),
-            base_infra_fragment: self.iron_proxy.infra_fragment()?,
-            tool_dirs: self.tools.resolve_tool_dirs()?,
-            tool_git_sources: self
-                .tools_source
-                .to_config()
-                .as_ref()
-                .map(ToolGitSource::from_config)
-                .unwrap_or_default(),
-            interval: Duration::from_secs(self.tool_proxy_reconcile_interval_secs),
         }))
     }
 
@@ -839,13 +839,7 @@ impl SandboxArgs {
             && let Some(repos_path) = clean_optional_value(self.repos_path.as_deref())
         {
             spec = spec.mount(
-                Mount::new(
-                    MountKind::Bind {
-                        source_path: repos_path,
-                    },
-                    SANDBOX_REPOS_MOUNT_PATH,
-                )
-                .read_only(),
+                Mount::new(self.repos_mount_kind(repos_path), SANDBOX_REPOS_MOUNT_PATH).read_only(),
             );
         }
         for (name, value) in self.workflow_host_env_template()? {
@@ -920,17 +914,21 @@ impl SandboxArgs {
                 );
                 if let Some(repos_path) = clean_optional_value(self.repos_path.as_deref()) {
                     workload = workload.mount(
-                        Mount::new(
-                            MountKind::Bind {
-                                source_path: repos_path,
-                            },
-                            SANDBOX_REPOS_MOUNT_PATH,
-                        )
-                        .read_only(),
+                        Mount::new(self.repos_mount_kind(repos_path), SANDBOX_REPOS_MOUNT_PATH)
+                            .read_only(),
                     );
                 }
                 Ok(workload)
             }
+        }
+    }
+
+    fn repos_mount_kind(&self, repos_path: String) -> MountKind {
+        if let Some(claim_name) = clean_optional_value(self.repos_pvc.as_deref()) {
+            return MountKind::NamedVolume(claim_name);
+        }
+        MountKind::Bind {
+            source_path: repos_path,
         }
     }
 
@@ -1073,11 +1071,10 @@ impl SandboxArgs {
             .collect()
     }
 
-    /// Per-sandbox OTLP egress NetworkPolicy target, derived from the OTLP
-    /// endpoint the codex sandbox env will carry. Only in-cluster service DNS
-    /// endpoints (`<service>.<namespace>.svc[...]`) map to a namespace
-    /// selector; anything else gets no rule and a warning, because a silently
-    /// missing rule means harness usage/cost spans never reach the collector.
+    /// Per-sandbox proxy OTLP egress NetworkPolicy target, derived from the
+    /// OTLP endpoint the codex sandbox env will carry. Only in-cluster service
+    /// DNS endpoints (`<service>.<namespace>.svc[...]`) map to a namespace
+    /// selector.
     fn sandbox_otlp_egress_target(&self) -> Result<Option<OtlpEgressTarget>, ServerError> {
         if !matches!(self.workload, SandboxWorkloadKind::CodexAppServer) {
             return Ok(None);
@@ -1102,7 +1099,7 @@ impl SandboxArgs {
                     namespace = %target.namespace,
                     port = target.port,
                     endpoint = %endpoint,
-                    "sandbox OTLP egress enabled"
+                    "sandbox proxy OTLP egress enabled"
                 );
                 Ok(Some(target))
             }
@@ -1110,7 +1107,7 @@ impl SandboxArgs {
                 warn!(
                     endpoint = %endpoint,
                     "sandbox OTLP endpoint is not an in-cluster service DNS name; \
-                     no sandbox egress NetworkPolicy rule will be created for it"
+                     no proxy egress NetworkPolicy rule will be created for it"
                 );
                 Ok(None)
             }
@@ -1218,6 +1215,15 @@ impl SandboxArgs {
             target_size: self.warm_pool_size,
             replenish_interval: Duration::from_secs(self.warm_pool_replenish_interval_secs),
             bootstrap_iron_control_principal: None,
+            max_running_sandboxes: (self.sandbox_running_limit > 0)
+                .then_some(self.sandbox_running_limit),
+        })
+    }
+
+    fn sandbox_capacity_config(&self) -> Option<SandboxCapacityConfig> {
+        (self.sandbox_running_limit > 0).then(|| SandboxCapacityConfig {
+            max_running: self.sandbox_running_limit,
+            hot_idle_grace: Duration::from_secs(self.sandbox_hot_idle_grace_secs),
         })
     }
 
@@ -1225,7 +1231,6 @@ impl SandboxArgs {
         let ttl = |secs: u64| (secs > 0).then(|| Duration::from_secs(secs));
         SandboxReaperConfig {
             interval: Duration::from_secs(self.sandbox_reap_interval_secs),
-            idle_ttl: ttl(self.sandbox_idle_stop_ttl_secs),
             max_lifetime: ttl(self.sandbox_max_lifetime_secs),
         }
     }
@@ -1340,9 +1345,8 @@ impl TryFrom<&SandboxArgs> for AgentSandboxConfig {
         }
         config.iron_control = args.iron_control.settings();
         config.tools = args.tools_source.to_config();
-        // Direct harness OTLP export (codex usage/cost spans) needs a hole in
-        // the per-sandbox egress NetworkPolicy; derived from the sandbox's own
-        // OTLP endpoint env so there is a single source of truth.
+        // The chart label policy handles sandbox OTLP egress; keep the
+        // per-sandbox proxy's own in-cluster OTLP egress explicit.
         config.otlp_egress = args.sandbox_otlp_egress_target()?;
         // iron-control is the only proxy mode: a per-sandbox proxy syncs its
         // secrets from the control plane, so configuring iron-proxy without
@@ -1417,6 +1421,22 @@ struct ToolsArgs {
         env = "KUBERNETES_TOOLS_REPO_CACHE_PATH"
     )]
     repo_cache_path: Option<String>,
+    // Optional PVC claim backing the repo-cache root. When set, sandbox pods mount
+    // the repo cache from this PVC instead of using a hostPath.
+    #[arg(
+        id = "tools_repo_cache_pvc",
+        long = "kubernetes-tools-repo-cache-pvc",
+        env = "KUBERNETES_TOOLS_REPO_CACHE_PVC"
+    )]
+    repo_cache_pvc: Option<String>,
+    #[arg(
+        id = "tools_auto_reload",
+        long = "kubernetes-tools-auto-reload",
+        env = "KUBERNETES_TOOLS_AUTO_RELOAD",
+        default_value_t = true,
+        action = clap::ArgAction::Set
+    )]
+    auto_reload: bool,
     #[arg(
         id = "tools_extra_sources",
         long = "kubernetes-tools-extra-sources",
@@ -1469,6 +1489,8 @@ impl ToolsArgs {
             });
         }
         config.repo_cache_path = clean_optional_value(self.repo_cache_path.as_deref());
+        config.repo_cache_pvc = clean_optional_value(self.repo_cache_pvc.as_deref());
+        config.auto_reload = self.auto_reload;
         config.extra_sources = self.extra_sources();
         Some(config)
     }
@@ -1574,22 +1596,15 @@ impl IronProxyArgs {
     }
 
     /// The role to register in iron-control. The shared `infra` role contains
-    /// infra, harness, and discovered tool secrets, and every session principal
-    /// is granted that single role (see [`SessionRegistrar`]).
-    fn roles_to_register(
-        &self,
-        tool_fragment: Option<&DiscoveredToolProxyFragment>,
-    ) -> Result<Vec<(RoleSpec, ProxyFragment)>, ServerError> {
-        let mut infra = self.infra_fragment()?;
-        if let Some(tool_fragment) = tool_fragment {
-            merge_fragment(&mut infra, tool_fragment.fragment.clone());
-        }
+    /// infra and harness secrets, and every session principal is granted that
+    /// role (see [`SessionRegistrar`]).
+    fn roles_to_register(&self) -> Result<Vec<(RoleSpec, ProxyFragment)>, ServerError> {
+        let infra = self.infra_fragment()?;
         Ok(vec![(RoleSpec::infra(), infra)])
     }
 
     /// The full infra fragment: the shared infra secrets plus every available
-    /// harness auth fragment (also infra), selected by auth mode. Discovered
-    /// tool secrets are folded into the same infra role at registration time.
+    /// harness auth fragment (also infra), selected by auth mode.
     fn infra_fragment(&self) -> Result<ProxyFragment, ServerError> {
         let mut infra = infra_fragment()?;
         for fragment in self.harness.fragments()? {
@@ -1869,8 +1884,8 @@ fn parse_host_port(value: &str) -> Option<u16> {
 }
 
 /// Map an OTLP endpoint URL onto a NetworkPolicy egress target. Only
-/// in-cluster service DNS hosts (`<service>.<namespace>.svc[.<cluster-domain>]`)
-/// are mapped; the namespace label is the policy's `kubernetes.io/metadata.name`
+/// in-cluster service DNS hosts (`<service>.<namespace>.svc[...]`) are mapped;
+/// the namespace label is the policy's `kubernetes.io/metadata.name`
 /// selector. Ports default by scheme when absent.
 fn parse_otlp_egress_target(endpoint: &str) -> Option<OtlpEgressTarget> {
     let trimmed = endpoint.trim();
@@ -1994,6 +2009,55 @@ mod tests {
     }
 
     #[test]
+    fn activity_summary_uses_direct_openai_key_by_default() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let _env = EnvGuard::set(&[
+            ("OPENAI_API_KEY", "sk-test"),
+            ("FIREWALL_MANAGER_SECRET_SOURCE", "env"),
+            ("KUBERNETES_OP_CONNECT_HOST", ""),
+            ("OP_CONNECT_TOKEN", ""),
+            ("OP_VAULT", ""),
+        ]);
+        let args = Args::try_parse_from([
+            "centaur-api-server",
+            "--database-url",
+            "postgres://postgres:postgres@localhost/centaur",
+            "--session-activity-summary-enabled",
+            "true",
+        ])
+        .unwrap();
+
+        let config = args.activity_summary_config().unwrap();
+        assert_eq!(config.api_key, "sk-test");
+    }
+
+    #[test]
+    fn activity_summary_uses_mounted_openai_key_even_with_onepassword_connect_source() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let _env = EnvGuard::set(&[
+            ("OPENAI_API_KEY", "sk-mounted"),
+            ("FIREWALL_MANAGER_SECRET_SOURCE", "onepassword-connect"),
+            (
+                "KUBERNETES_OP_CONNECT_HOST",
+                "http://onepassword-connect:8080",
+            ),
+            ("OP_CONNECT_TOKEN", "op-token"),
+            ("OP_VAULT", "centaur-agent"),
+        ]);
+        let args = Args::try_parse_from([
+            "centaur-api-server",
+            "--database-url",
+            "postgres://postgres:postgres@localhost/centaur",
+            "--session-activity-summary-enabled",
+            "true",
+        ])
+        .unwrap();
+
+        let config = args.activity_summary_config().unwrap();
+        assert_eq!(config.api_key, "sk-mounted");
+    }
+
+    #[test]
     fn parses_session_sandbox_flags() {
         let args = Args::try_parse_from([
             "centaur-api-server",
@@ -2021,6 +2085,77 @@ mod tests {
         assert_eq!(args.sandbox.k8s_namespace, "centaur-test");
         assert_eq!(args.sandbox.ready_timeout_secs, 17);
         assert_eq!(args.sandbox.k8s_context.as_deref(), Some("kind-test"));
+    }
+
+    #[test]
+    fn execution_adoption_rescans_every_fifteen_seconds_by_default() {
+        let args = Args::try_parse_from([
+            "centaur-api-server",
+            "--database-url",
+            "postgres://postgres:postgres@localhost/centaur",
+        ])
+        .unwrap();
+
+        assert_eq!(
+            args.execution_adoption_interval(),
+            Some(Duration::from_secs(15))
+        );
+    }
+
+    #[test]
+    fn execution_adoption_interval_zero_disables_rescans() {
+        let args = Args::try_parse_from([
+            "centaur-api-server",
+            "--database-url",
+            "postgres://postgres:postgres@localhost/centaur",
+            "--session-execution-adoption-interval-secs",
+            "0",
+        ])
+        .unwrap();
+
+        assert_eq!(args.execution_adoption_interval(), None);
+    }
+
+    #[test]
+    fn shutdown_drain_defaults_to_twenty_seconds() {
+        let args = Args::try_parse_from([
+            "centaur-api-server",
+            "--database-url",
+            "postgres://postgres:postgres@localhost/centaur",
+        ])
+        .unwrap();
+
+        assert_eq!(
+            args.shutdown_execution_drain_timeout(),
+            Duration::from_secs(20)
+        );
+    }
+
+    #[test]
+    fn shutdown_drain_timeout_is_configurable() {
+        let args = Args::try_parse_from([
+            "centaur-api-server",
+            "--database-url",
+            "postgres://postgres:postgres@localhost/centaur",
+            "--shutdown-execution-drain-timeout-secs",
+            "0",
+        ])
+        .unwrap();
+
+        assert_eq!(args.shutdown_execution_drain_timeout(), Duration::ZERO);
+    }
+
+    #[test]
+    fn sandbox_reaper_defaults_delete_after_max_lifetime() {
+        let args = Args::try_parse_from([
+            "centaur-api-server",
+            "--database-url",
+            "postgres://postgres:postgres@localhost/centaur",
+        ])
+        .unwrap();
+
+        let config = args.sandbox_reaper_config();
+        assert_eq!(config.max_lifetime, Some(Duration::from_secs(259_200)));
     }
 
     #[test]
@@ -2106,9 +2241,34 @@ mod tests {
             tools.repo_cache_path.as_deref(),
             Some("/var/lib/centaur/repos")
         );
+        assert!(tools.auto_reload);
         let token = tools.github_token.expect("token should be Some");
         assert_eq!(token.secret_name, "centaur-repo-cache-github-token");
         assert_eq!(token.secret_key, "token");
+    }
+
+    #[test]
+    fn tools_config_reads_auto_reload_flag() {
+        let args = Args::try_parse_from([
+            "centaur-api-server",
+            "--database-url",
+            "postgres://postgres:postgres@localhost/centaur",
+            "--session-sandbox-backend",
+            "agent-k8s",
+            "--kubernetes-sandbox-iron-proxy-mode",
+            "disabled",
+            "--kubernetes-tools-repo",
+            "paradigmxyz/centaur",
+            "--kubernetes-tools-runner-image",
+            "centaur-agent:test",
+            "--kubernetes-tools-auto-reload",
+            "false",
+        ])
+        .unwrap();
+
+        let config = AgentSandboxConfig::try_from(&args.sandbox).unwrap();
+        let tools = config.tools.expect("tools should be Some");
+        assert!(!tools.auto_reload);
     }
 
     #[test]
@@ -2215,6 +2375,32 @@ mod tests {
                 "/home/agent/github/paradigmxyz/centaur/workflows:/home/agent/github/tempoxyz/centaur-tempo/workflows"
             )
         );
+    }
+
+    #[test]
+    fn agent_k8s_workflow_host_mounts_repos_pvc_read_only() {
+        let args = Args::try_parse_from([
+            "centaur-api-server",
+            "--database-url",
+            "postgres://postgres:postgres@localhost/centaur",
+            "--session-sandbox-backend",
+            "agent-k8s",
+            "--kubernetes-sandbox-iron-proxy-mode",
+            "disabled",
+            "--repos-path",
+            "/var/lib/centaur/repos",
+            "--repos-pvc",
+            "centaur-repo-cache",
+        ])
+        .unwrap();
+
+        let spec = args.sandbox.workflow_host_spec(None).unwrap();
+
+        assert!(spec.mounts.iter().any(|mount| {
+            mount.target_path == SANDBOX_REPOS_MOUNT_PATH
+                && mount.read_only
+                && mount.kind == MountKind::NamedVolume("centaur-repo-cache".to_owned())
+        }));
     }
 
     #[test]
@@ -2525,62 +2711,6 @@ mod tests {
     }
 
     #[test]
-    fn iron_control_registers_discovered_tool_secrets_on_infra_role() {
-        use centaur_iron_proxy::{Secret, SecretReplace, Transform, TransformConfig};
-
-        let args = Args::try_parse_from([
-            "centaur-api-server",
-            "--database-url",
-            "postgres://postgres:postgres@localhost/centaur",
-            "--kubernetes-iron-proxy-harness-auth-mode",
-            "api_key",
-        ])
-        .unwrap();
-        let tool_fragment = DiscoveredToolProxyFragment {
-            fragment: ProxyFragment {
-                transforms: vec![Transform {
-                    name: "secrets".to_owned(),
-                    config: TransformConfig {
-                        secrets: vec![Secret {
-                            id: Some("TOOL_API_KEY".to_owned()),
-                            replace: Some(SecretReplace {
-                                proxy_value: Some("TOOL_API_KEY".to_owned()),
-                                ..Default::default()
-                            }),
-                            rules: vec![serde_yaml::from_str("{host: api.tool.test}").unwrap()],
-                            ..Default::default()
-                        }],
-                        ..Default::default()
-                    },
-                    ..Default::default()
-                }],
-                ..Default::default()
-            },
-            tool_count: 1,
-            secret_count: 1,
-        };
-
-        let roles = args
-            .sandbox
-            .iron_proxy
-            .roles_to_register(Some(&tool_fragment))
-            .unwrap();
-
-        assert_eq!(roles.len(), 1);
-        assert_eq!(roles[0].0.foreign_id, "infra");
-        assert!(roles[0].1.transforms.iter().any(|transform| {
-            transform.config.secrets.iter().any(|secret| {
-                secret.id.as_deref() == Some("TOOL_API_KEY")
-                    && secret
-                        .replace
-                        .as_ref()
-                        .and_then(|replace| replace.proxy_value.as_deref())
-                        == Some("TOOL_API_KEY")
-            })
-        }));
-    }
-
-    #[test]
     fn iron_control_infra_secret_sync_can_be_disabled() {
         let args = Args::try_parse_from([
             "centaur-api-server",
@@ -2596,12 +2726,6 @@ mod tests {
         .unwrap();
 
         assert!(!args.sandbox.iron_control_sync_infra_secrets);
-        assert!(
-            args.sandbox
-                .iron_control_tool_reconciler()
-                .unwrap()
-                .is_none()
-        );
     }
 
     #[test]
@@ -2633,6 +2757,33 @@ mod tests {
                     == (MountKind::Bind {
                         source_path: "/var/lib/centaur/repos".to_owned(),
                     })
+        }));
+    }
+
+    #[test]
+    fn codex_workload_mounts_repos_pvc_read_only() {
+        let args = Args::try_parse_from([
+            "centaur-api-server",
+            "--database-url",
+            "postgres://postgres:postgres@localhost/centaur",
+            "--session-sandbox-workload",
+            "codex-app-server",
+            "--repos-path",
+            "/var/lib/centaur/repos",
+            "--repos-pvc",
+            "centaur-repo-cache",
+        ])
+        .unwrap();
+
+        let workload = args.sandbox.container_workload_mode().unwrap();
+        let SandboxWorkloadMode::CodexAppServer { mounts, .. } = workload else {
+            panic!("expected codex app server workload");
+        };
+
+        assert!(mounts.iter().any(|mount| {
+            mount.target_path == SANDBOX_REPOS_MOUNT_PATH
+                && mount.read_only
+                && mount.kind == MountKind::NamedVolume("centaur-repo-cache".to_owned())
         }));
     }
 
