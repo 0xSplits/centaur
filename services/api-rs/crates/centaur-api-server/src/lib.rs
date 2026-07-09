@@ -393,8 +393,73 @@ mod tests {
         let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
         let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(body["thread_key"], "slack:C123:123.456");
+        assert_eq!(body["platform"], "slack");
         assert_eq!(body["slack"]["channel_id"], "C123");
         assert_eq!(body["slack"]["thread_ts"], "123.456");
+        assert!(body.get("discord").is_none());
+        assert!(body.get("linear").is_none());
+    }
+
+    #[tokio::test]
+    async fn session_context_exposes_discord_guild_channel_and_thread() {
+        let pool =
+            PgPool::connect_lazy("postgres://postgres:postgres@localhost/centaur_test").unwrap();
+        let app = build_router_with_runtime(
+            PgSessionStore::new(pool),
+            SandboxRuntime::backend(Arc::new(TestBackend::default()), SandboxSpec::new("test")),
+        );
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/session/discord%3A111%3A222%3A333")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(body["thread_key"], "discord:111:222:333");
+        assert_eq!(body["platform"], "discord");
+        assert_eq!(body["discord"]["guild_id"], "111");
+        assert_eq!(body["discord"]["channel_id"], "222");
+        assert_eq!(body["discord"]["thread_id"], "333");
+        assert!(body.get("slack").is_none());
+        assert!(body.get("linear").is_none());
+    }
+
+    #[tokio::test]
+    async fn session_context_exposes_linear_issue_comment_and_session() {
+        let pool =
+            PgPool::connect_lazy("postgres://postgres:postgres@localhost/centaur_test").unwrap();
+        let app = build_router_with_runtime(
+            PgSessionStore::new(pool),
+            SandboxRuntime::backend(Arc::new(TestBackend::default()), SandboxSpec::new("test")),
+        );
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/session/linear%3AISSUE%3Ac%3ACMT%3As%3ASESS")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(body["thread_key"], "linear:ISSUE:c:CMT:s:SESS");
+        assert_eq!(body["platform"], "linear");
+        assert_eq!(body["linear"]["issue_id"], "ISSUE");
+        assert_eq!(body["linear"]["comment_id"], "CMT");
+        assert_eq!(body["linear"]["agent_session_id"], "SESS");
+        assert!(body.get("slack").is_none());
+        assert!(body.get("discord").is_none());
     }
 
     #[tokio::test]
@@ -420,7 +485,10 @@ mod tests {
         let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
         let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(body["thread_key"], "cli:test");
+        assert_eq!(body["platform"], "unknown");
         assert!(body.get("slack").is_none());
+        assert!(body.get("discord").is_none());
+        assert!(body.get("linear").is_none());
     }
 
     #[derive(Default)]
