@@ -1,4 +1,5 @@
 import email.message
+import io
 import json
 
 import pytest
@@ -195,6 +196,45 @@ def test_send_dm_opens_dm_and_posts_message() -> None:
     assert fake_web_client.last_kwargs is not None
     assert fake_web_client.last_kwargs["channel"] == "D123"
     assert fake_web_client.last_kwargs["unfurl_links"] is False
+
+
+def _restore_real_resolve_channel(client: SlackClient) -> None:
+    client._resolve_channel = SlackClient._resolve_channel.__get__(client)  # type: ignore[method-assign]
+
+
+def test_resolve_channel_opens_dm_for_user_id() -> None:
+    client, fake_web_client = _make_client()
+    _restore_real_resolve_channel(client)
+
+    assert client._resolve_channel("<@U123ABC>") == "D123"
+    assert fake_web_client.open_calls == [{"users": "U123ABC"}]
+
+
+def test_resolve_channel_opens_dm_for_at_username() -> None:
+    client, fake_web_client = _make_client()
+    _restore_real_resolve_channel(client)
+    client._get_user_cache = lambda: {"U123ABC": "georgios"}  # type: ignore[method-assign]
+
+    assert client._resolve_channel("@georgios") == "D123"
+    assert fake_web_client.open_calls == [{"users": "U123ABC"}]
+
+
+def test_resolve_channel_rejects_unknown_at_username() -> None:
+    client, _ = _make_client()
+    _restore_real_resolve_channel(client)
+    client._get_user_cache = lambda: {"U123ABC": "georgios"}  # type: ignore[method-assign]
+
+    with pytest.raises(RuntimeError, match="not found in workspace"):
+        client._resolve_channel("@nobody")
+
+
+def test_resolve_channel_still_resolves_channel_names() -> None:
+    client, fake_web_client = _make_client()
+    _restore_real_resolve_channel(client)
+
+    assert client._resolve_channel("paradigm-pulse") == "C123"
+    assert client._resolve_channel("C456DEF") == "C456DEF"
+    assert fake_web_client.open_calls == []
 
 
 def test_retry_on_ratelimit_honors_retry_after(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -845,6 +885,143 @@ def test_native_search_uses_dedicated_search_client() -> None:
         }
     ]
     assert fake_bot_client.api_calls == []
+
+
+def test_search_messages_proxy_uses_api_proxy_for_channel_scoped_search(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import urllib.request
+
+    import centaur_sdk.tool_sdk
+
+    client, fake_web_client = _make_client()
+    client._get_user_cache = lambda: {"U1": "alice"}  # type: ignore[method-assign]
+    monkeypatch.setenv("CENTAUR_API_URL", "http://api")
+    monkeypatch.setattr(
+        centaur_sdk.tool_sdk,
+        "current_slack_thread",
+        lambda: {"channel_id": "C777", "thread_ts": "123.456"},
+    )
+
+    def fake_urlopen(req, *args, **kwargs):
+        assert req.full_url == (
+            "http://api/api/slack/search?query=deploy+from%3A%3C%40UGZCSQTPE%3E+"
+            "in%3A%23other&channels=C777&count=5"
+        )
+        body = json.dumps(
+            {
+                "ok": True,
+                "messages": {
+                    "matches": [
+                        {
+                            "user": "U1",
+                            "text": "deploy complete",
+                            "ts": "200.000000",
+                            "permalink": "https://slack.com/archives/C777/p200000000",
+                            "channel": {"id": "C777", "name": "paradigm-pulse"},
+                        }
+                    ]
+                },
+            }
+        ).encode()
+        return _FakeHTTPResponse(body, "application/json")
+
+    monkeypatch.setattr(urllib.request, "urlopen", fake_urlopen)
+
+    result = client.search_messages_proxy(
+        "deploy from:<@UGZCSQTPE> in:#other",
+        max_results=5,
+    )
+
+    assert result[0]["text"] == "deploy complete"
+    assert fake_web_client.api_calls == []
+    assert fake_web_client.history_calls == []
+
+
+def test_search_messages_proxy_defaults_to_current_slack_channel(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import urllib.request
+
+    import centaur_sdk.tool_sdk
+
+    client, _ = _make_client()
+    client._get_user_cache = lambda: {"U1": "alice"}  # type: ignore[method-assign]
+    monkeypatch.setenv("CENTAUR_API_URL", "http://api")
+    monkeypatch.setattr(
+        centaur_sdk.tool_sdk,
+        "current_slack_thread",
+        lambda: {"channel_id": "C777", "thread_ts": "123.456"},
+    )
+
+    def fake_urlopen(req, *args, **kwargs):
+        assert req.full_url == "http://api/api/slack/search?query=deploy&channels=C777&count=5"
+        body = json.dumps({"ok": True, "messages": {"matches": []}}).encode()
+        return _FakeHTTPResponse(body, "application/json")
+
+    monkeypatch.setattr(urllib.request, "urlopen", fake_urlopen)
+
+    assert client.search_messages_proxy("deploy", max_results=5) == []
+
+
+def test_search_messages_proxy_fails_without_current_slack_channel(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import centaur_sdk.tool_sdk
+
+    client, _ = _make_client()
+    monkeypatch.setattr(
+        centaur_sdk.tool_sdk,
+        "current_slack_thread",
+        lambda: (_ for _ in ()).throw(RuntimeError("not a Slack thread")),
+    )
+
+    with pytest.raises(RuntimeError, match="not a Slack thread"):
+        client.search_messages_proxy("deploy")
+
+
+def test_search_messages_proxy_failure_does_not_fall_back_to_local_scan(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import urllib.error
+    import urllib.request
+
+    import centaur_sdk.tool_sdk
+
+    client, fake_web_client = _make_client()
+    client._get_user_cache = lambda: {"U1": "alice"}  # type: ignore[method-assign]
+    monkeypatch.setenv("CENTAUR_API_URL", "http://api")
+    monkeypatch.setattr(
+        centaur_sdk.tool_sdk,
+        "current_slack_thread",
+        lambda: {"channel_id": "C777", "thread_ts": "123.456"},
+    )
+    fake_web_client.history_pages = [
+        {"messages": [{"user": "U1", "text": "deploy fallback", "ts": "300.000000"}]}
+    ]
+
+    def fake_urlopen(req, *args, **kwargs):
+        raise urllib.error.HTTPError(
+            req.full_url,
+            403,
+            "Forbidden",
+            hdrs=None,
+            fp=io.BytesIO(b'{"error":"forbidden"}'),
+        )
+
+    monkeypatch.setattr(urllib.request, "urlopen", fake_urlopen)
+
+    with pytest.raises(RuntimeError, match="Slack search proxy failed with status 403"):
+        client.search_messages_proxy("deploy", max_results=5)
+
+    assert fake_web_client.history_calls == []
+
+
+def test_slack_search_from_filter_uses_documented_forms() -> None:
+    client, _ = _make_client()
+
+    assert client._slack_search_from_filter("<@UGZCSQTPE>") == "from:<@UGZCSQTPE>"
+    assert client._slack_search_from_filter("@deploybot") == "from:deploybot"
 
 
 def test_sync_channel_history_uses_watermark_lookback() -> None:

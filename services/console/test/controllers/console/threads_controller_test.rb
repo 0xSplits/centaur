@@ -24,7 +24,7 @@ class Console::ThreadsControllerTest < ActionDispatch::IntegrationTest
     assert_select ".console-nav-link", text: "Data Sync"
   end
 
-  test "a non-admin sees no Control or Data Sync nav items" do
+  test "a non-admin sees only the Integrations nav item, not Control or Data Sync" do
     delete logout_url
     post login_url, params: { email: users(:member_user).email, password: "password123456" }
     with_recent_first_error do
@@ -32,7 +32,7 @@ class Console::ThreadsControllerTest < ActionDispatch::IntegrationTest
     end
 
     assert_response :ok
-    assert_select ".console-nav-link", count: 0
+    assert_select ".console-nav-link", count: 1, text: /Integrations/
     assert_select ".console-thread-group-title", text: /Chats/
   end
 

@@ -41,6 +41,11 @@ Rails.application.routes.draw do
   get "console/principals/:id", to: "console#principal", as: :console_principal
   namespace :console do
     resources :threads, only: %i[index create]
+    resources :workflows, only: %i[index show] do
+      member do
+        post :run, action: :force_start
+      end
+    end
     # Lazily-loaded sidebar thread list (Turbo Frame src). Kept off the main
     # page render so the unindexed cross-database sessions query does not block
     # every console page. See ApplicationController#load_console_sidebar_threads.
@@ -85,6 +90,9 @@ Rails.application.routes.draw do
   end
   get "console/credentials/:id", to: "console#credential", as: :console_credential
   get "console/oauth_apps", to: "console#oauth_apps", as: :console_oauth_apps
+  # User-facing list of enabled OAuth apps and their consent start links. Not
+  # admin-gated: any signed-in team member connects integrations from here.
+  get "console/integrations", to: "console/integrations#index", as: :console_integrations
   get "console/etls", to: "console/etls#index", as: :console_etls
   namespace :console do
     post "etls/slack_archive_imports",
@@ -118,6 +126,9 @@ Rails.application.routes.draw do
         post :promote
       end
     end
+    # Admin self-descope ("view as operator"): pause (admin-only) and restore
+    # admin permissions. A singular resource because it's a per-session flag.
+    resource :descope, only: %i[create destroy]
   end
 
   namespace :api do
