@@ -239,10 +239,7 @@ class DiscordClient:
         # this request is issued directly, letting httpx set the multipart boundary.
         headers = {
             "Authorization": self._get_token(),
-            "User-Agent": (
-                "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
-                "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
-            ),
+            "User-Agent": USER_AGENT,
         }
         with open(file_path, "rb") as handle:
             files = {"files[0]": (os.path.basename(file_path), handle)}
