@@ -725,6 +725,74 @@ def test_download_file_proxy_returns_base64_file(
     assert urllib.parse.parse_qs(parsed.query) == {"channel_id": ["C123456789"]}
 
 
+def test_file_info_proxy_calls_centaur_api(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import urllib.parse
+    import urllib.request
+
+    client, _ = _make_client()
+    request_info: dict[str, str | None] = {}
+
+    def fake_urlopen(req, *args, **kwargs):
+        request_info["url"] = req.full_url
+        request_info["authorization"] = req.get_header("Authorization")
+        body = json.dumps(
+            {
+                "ok": True,
+                "file_id": "F123456789",
+                "channel_id": "C123456789",
+                "file": {"id": "F123456789", "name": "report.pdf"},
+            }
+        ).encode()
+        return _FakeHTTPResponse(body, "application/json")
+
+    monkeypatch.setenv("CENTAUR_API_URL", "http://api.internal:8080")
+    monkeypatch.setenv("CENTAUR_API_BEARER_TOKEN", "test-jwt")
+    monkeypatch.setattr(urllib.request, "urlopen", fake_urlopen)
+
+    result = client.file_info_proxy(file_id="F123456789", channel_id="<#C123456789|general>")
+
+    assert result["file"] == {"id": "F123456789", "name": "report.pdf"}
+    assert request_info["authorization"] == "Bearer test-jwt"
+    parsed = urllib.parse.urlparse(request_info["url"])
+    assert parsed.path == "/api/slack/files/F123456789/info"
+    assert urllib.parse.parse_qs(parsed.query) == {"channel_id": ["C123456789"]}
+
+
+def test_get_channel_members_proxy_paginates_and_resolves_names() -> None:
+    client, _ = _make_client()
+    client._get_user_cache = lambda: {"U111111111": "alice", "U222222222": "bob"}  # type: ignore[method-assign]
+    calls: list[tuple[str, dict]] = []
+
+    def fake_get_json(path, params):
+        calls.append((path, params))
+        if params["cursor"] is None:
+            return {
+                "ok": True,
+                "members": ["U111111111"],
+                "response_metadata": {"next_cursor": "next"},
+            }
+        return {
+            "ok": True,
+            "members": ["U222222222"],
+            "response_metadata": {"next_cursor": ""},
+        }
+
+    client._centaur_api_get_json = fake_get_json  # type: ignore[method-assign]
+
+    result = client.get_channel_members_proxy("<#C123456789|general>", limit=10)
+
+    assert calls == [
+        ("/api/slack/channels/C123456789/members", {"limit": 10, "cursor": None}),
+        ("/api/slack/channels/C123456789/members", {"limit": 9, "cursor": "next"}),
+    ]
+    assert result == [
+        {"id": "U111111111", "name": "alice"},
+        {"id": "U222222222", "name": "bob"},
+    ]
+
+
 def test_file_proxy_methods_validate_inputs() -> None:
     client, _ = _make_client()
 
@@ -742,6 +810,10 @@ def test_file_proxy_methods_validate_inputs() -> None:
         )
     with pytest.raises(ValueError, match="file_id"):
         client.download_file_proxy(file_id="bad", channel_id="C123456789")
+    with pytest.raises(ValueError, match="file_id"):
+        client.file_info_proxy(file_id="bad", channel_id="C123456789")
+    with pytest.raises(ValueError, match="channel_id"):
+        client.get_channel_members_proxy(channel_id="general")
 
 
 def test_search_files_uses_proxy_with_user_cache(

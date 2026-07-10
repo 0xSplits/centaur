@@ -46,10 +46,15 @@ pub(crate) fn slack_proxy_router() -> Router<AppState> {
             "/api/slack/files/{file_id}/download",
             get(download_slack_file),
         )
+        .route("/api/slack/files/{file_id}/info", get(get_slack_file_info))
         .route("/api/slack/channels", get(get_slack_channels))
         .route(
             "/api/slack/channels/{channel_id}/history",
             get(get_slack_channel_history),
+        )
+        .route(
+            "/api/slack/channels/{channel_id}/members",
+            get(get_slack_channel_members),
         )
         .route(
             "/api/slack/channels/{channel_id}/threads/{thread_ts}/replies",
@@ -81,6 +86,11 @@ struct SlackFileDownloadQuery {
 }
 
 #[derive(Debug, Deserialize)]
+struct SlackFileInfoQuery {
+    channel_id: String,
+}
+
+#[derive(Debug, Deserialize)]
 struct SlackFilesListQuery {
     #[serde(default)]
     channel_id: Option<String>,
@@ -100,6 +110,14 @@ struct SlackChannelHistoryQuery {
     inclusive: Option<bool>,
     #[serde(default)]
     include_all_metadata: Option<bool>,
+    #[serde(default)]
+    limit: Option<u16>,
+    #[serde(default)]
+    cursor: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct SlackChannelMembersQuery {
     #[serde(default)]
     limit: Option<u16>,
     #[serde(default)]
@@ -145,6 +163,14 @@ struct SlackFilesListResponse {
     page: u32,
     paging: Option<Value>,
     has_more: bool,
+}
+
+#[derive(Debug, Serialize)]
+struct SlackFileInfoResponse {
+    ok: bool,
+    file_id: String,
+    channel_id: String,
+    file: Value,
 }
 
 #[derive(Debug, Serialize)]
@@ -222,19 +248,9 @@ async fn download_slack_file(
     Path(file_id): Path<String>,
     Query(query): Query<SlackFileDownloadQuery>,
 ) -> Result<Response, ApiError> {
-    let claims = authorize_slack_file_proxy(&headers)?;
-    ensure_download_channel_allowed(&claims, &query.channel_id)?;
-    validate_slack_channel_id(&query.channel_id)?;
-    validate_slack_file_id(&file_id)?;
-
-    let config = slack_proxy_config()?;
     let client = http_client();
-    let file = slack_file_info(client, config, &file_id).await?;
-    if !slack_file_in_channel(&file, &query.channel_id) {
-        return Err(ApiError::Forbidden(
-            "file is not shared in an allowed Slack channel".to_owned(),
-        ));
-    }
+    let (config, file) =
+        authorized_slack_file_info(&headers, client, &file_id, &query.channel_id).await?;
     let download_url = file
         .get("url_private_download")
         .or_else(|| file.get("url_private"))
@@ -340,6 +356,43 @@ async fn get_slack_files(
     }))
 }
 
+async fn get_slack_file_info(
+    headers: HeaderMap,
+    Path(file_id): Path<String>,
+    Query(query): Query<SlackFileInfoQuery>,
+) -> Result<Json<SlackFileInfoResponse>, ApiError> {
+    let (_, file) =
+        authorized_slack_file_info(&headers, http_client(), &file_id, &query.channel_id).await?;
+
+    Ok(Json(SlackFileInfoResponse {
+        ok: true,
+        file_id,
+        channel_id: query.channel_id,
+        file,
+    }))
+}
+
+async fn authorized_slack_file_info(
+    headers: &HeaderMap,
+    client: &reqwest::Client,
+    file_id: &str,
+    channel_id: &str,
+) -> Result<(&'static SlackFileProxyConfig, Value), ApiError> {
+    let claims = authorize_slack_file_proxy(headers)?;
+    ensure_download_channel_allowed(&claims, channel_id)?;
+    validate_slack_channel_id(channel_id)?;
+    validate_slack_file_id(file_id)?;
+
+    let config = slack_proxy_config()?;
+    let file = slack_file_info(client, config, file_id).await?;
+    if !slack_file_in_channel(&file, channel_id) {
+        return Err(ApiError::Forbidden(
+            "file is not shared in an allowed Slack channel".to_owned(),
+        ));
+    }
+    Ok((config, file))
+}
+
 async fn get_slack_channels(headers: HeaderMap) -> Result<Json<SlackChannelsResponse>, ApiError> {
     let claims = authorize_slack_file_proxy(&headers)?;
     let channel_ids = slack_channel_ids_from_claims(&claims)?;
@@ -385,6 +438,21 @@ async fn get_slack_channel_history(
 
     let config = slack_proxy_config()?;
     let value = slack_channel_history(http_client(), config, &channel_id, &query).await?;
+    Ok(Json(value))
+}
+
+async fn get_slack_channel_members(
+    headers: HeaderMap,
+    Path(channel_id): Path<String>,
+    Query(query): Query<SlackChannelMembersQuery>,
+) -> Result<Json<Value>, ApiError> {
+    let claims = authorize_slack_file_proxy(&headers)?;
+    ensure_history_channel_allowed(&claims, &channel_id)?;
+    validate_slack_channel_id(&channel_id)?;
+    validate_slack_channel_members_query(&query)?;
+
+    let config = slack_proxy_config()?;
+    let value = slack_channel_members(http_client(), config, &channel_id, &query).await?;
     Ok(Json(value))
 }
 
@@ -551,13 +619,8 @@ async fn slack_file_info(
     config: &SlackFileProxyConfig,
     file_id: &str,
 ) -> Result<Value, ApiError> {
-    let value = slack_api_post_form(
-        client,
-        config,
-        "files.info",
-        &[("file", file_id.to_owned())],
-    )
-    .await?;
+    let value =
+        slack_api_post_form(client, config, "files.info", &slack_file_info_form(file_id)).await?;
     value.get("file").cloned().ok_or_else(|| {
         ApiError::BadRequest("Slack file info response did not include file".to_owned())
     })
@@ -618,6 +681,16 @@ async fn slack_files_list(
     slack_api_post_form(client, config, "files.list", &form).await
 }
 
+async fn slack_channel_members(
+    client: &reqwest::Client,
+    config: &SlackFileProxyConfig,
+    channel_id: &str,
+    query: &SlackChannelMembersQuery,
+) -> Result<Value, ApiError> {
+    let form = slack_channel_members_form(channel_id, query);
+    slack_api_post_form(client, config, "conversations.members", &form).await
+}
+
 fn slack_files_list_form(
     channel_id: &str,
     query: &SlackFilesListQuery,
@@ -627,6 +700,29 @@ fn slack_files_list_form(
         ("count", slack_files_list_limit(query).to_string()),
         ("page", slack_files_list_page(query).to_string()),
     ]
+}
+
+fn slack_channel_members_form(
+    channel_id: &str,
+    query: &SlackChannelMembersQuery,
+) -> Vec<(&'static str, String)> {
+    let mut form = vec![
+        ("channel", channel_id.to_owned()),
+        (
+            "limit",
+            query
+                .limit
+                .map(|value| value.to_string())
+                .unwrap_or_default(),
+        ),
+        ("cursor", query.cursor.clone().unwrap_or_default()),
+    ];
+    form.retain(|(_, value)| !value.is_empty());
+    form
+}
+
+fn slack_file_info_form(file_id: &str) -> Vec<(&'static str, String)> {
+    vec![("file", file_id.to_owned())]
 }
 
 fn slack_channel_history_form(
@@ -966,6 +1062,20 @@ fn validate_slack_channel_history_query(query: &SlackChannelHistoryQuery) -> Res
     Ok(())
 }
 
+fn validate_slack_channel_members_query(query: &SlackChannelMembersQuery) -> Result<(), ApiError> {
+    if let Some(limit) = query.limit
+        && !(1..=1000).contains(&limit)
+    {
+        return Err(ApiError::BadRequest(
+            "Slack channel members limit must be between 1 and 1000".to_owned(),
+        ));
+    }
+    if let Some(cursor) = query.cursor.as_deref() {
+        validate_slack_cursor(cursor)?;
+    }
+    Ok(())
+}
+
 fn validate_slack_files_list_query(query: &SlackFilesListQuery) -> Result<(), ApiError> {
     if let Some(limit) = query.limit
         && !(1..=MAX_SLACK_FILES_LIST_LIMIT).contains(&limit)
@@ -1213,6 +1323,31 @@ mod tests {
     }
 
     #[test]
+    fn channel_members_form_maps_proxy_query_to_slack_params() {
+        let query = SlackChannelMembersQuery {
+            limit: Some(500),
+            cursor: Some("cursor-1".to_owned()),
+        };
+
+        assert_eq!(
+            slack_channel_members_form("C123456789", &query),
+            vec![
+                ("channel", "C123456789".to_owned()),
+                ("limit", "500".to_owned()),
+                ("cursor", "cursor-1".to_owned()),
+            ]
+        );
+    }
+
+    #[test]
+    fn file_info_form_maps_proxy_query_to_slack_params() {
+        assert_eq!(
+            slack_file_info_form("F123456789"),
+            vec![("file", "F123456789".to_owned())]
+        );
+    }
+
+    #[test]
     fn files_list_has_more_reads_legacy_paging() {
         assert!(slack_files_list_has_more(&json!({
             "paging": {"page": 1, "pages": 2}
@@ -1258,6 +1393,41 @@ mod tests {
             .unwrap_err(),
             ApiError::BadRequest(_)
         ));
+    }
+
+    #[test]
+    fn validates_channel_members_query() {
+        validate_slack_channel_members_query(&SlackChannelMembersQuery {
+            limit: Some(1000),
+            cursor: Some("cursor-1".to_owned()),
+        })
+        .unwrap();
+
+        assert!(matches!(
+            validate_slack_channel_members_query(&SlackChannelMembersQuery {
+                limit: Some(1001),
+                cursor: None,
+            })
+            .unwrap_err(),
+            ApiError::BadRequest(_)
+        ));
+        assert!(matches!(
+            validate_slack_channel_members_query(&SlackChannelMembersQuery {
+                limit: Some(10),
+                cursor: Some("\n".to_owned()),
+            })
+            .unwrap_err(),
+            ApiError::BadRequest(_)
+        ));
+    }
+
+    #[tokio::test]
+    async fn file_info_authorizes_before_reading_slack_config() {
+        let headers = HeaderMap::new();
+        let result =
+            authorized_slack_file_info(&headers, http_client(), "F123456789", "C123456789").await;
+
+        assert!(matches!(result, Err(ApiError::Unauthorized(_))));
     }
 
     #[test]

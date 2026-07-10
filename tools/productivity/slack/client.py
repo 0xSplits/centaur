@@ -1512,6 +1512,43 @@ class SlackClient:
         }
         return self._centaur_api_get_json("/api/slack/files", params)
 
+    def get_channel_members_proxy(self, channel_id: str, limit: int = 1000) -> list[dict]:
+        """List Slack channel members through the Centaur API server proxy."""
+        if not self._api_server_proxy_enabled():
+            raise RuntimeError(
+                "Slack channel members proxy requires the API server sandbox capability, "
+                "but it is disabled for this principal."
+            )
+
+        requested_limit = int(limit)
+        if not 1 <= requested_limit <= 10_000:
+            raise ValueError("limit must be between 1 and 10000")
+
+        normalized_channel_id = self._normalize_explicit_channel_id(channel_id)
+        channel_path = urllib.parse.quote(normalized_channel_id, safe="")
+        user_cache = self._get_user_cache()
+        member_ids: list[str] = []
+        cursor: str | None = None
+
+        while len(member_ids) < requested_limit:
+            page_limit = min(requested_limit - len(member_ids), 1000)
+            response = self._centaur_api_get_json(
+                f"/api/slack/channels/{channel_path}/members",
+                {"limit": page_limit, "cursor": cursor},
+            )
+            member_ids.extend(str(member_id) for member_id in response.get("members", []) or [])
+            cursor = response.get("response_metadata", {}).get("next_cursor") or None
+            if not cursor:
+                break
+
+        return [
+            {
+                "id": member_id,
+                "name": user_cache.get(member_id, member_id),
+            }
+            for member_id in member_ids[:requested_limit]
+        ]
+
     def list_users(self, limit: int = 200) -> list[dict]:
         """List workspace users."""
         users = []
@@ -2063,6 +2100,20 @@ class SlackClient:
             "content_base64": base64.b64encode(body).decode(),
         }
 
+    def file_info_proxy(self, file_id: str, channel_id: str) -> dict[str, Any]:
+        """Fetch Slack file metadata through the Centaur API server proxy."""
+        if not self._api_server_proxy_enabled():
+            raise RuntimeError(
+                "Slack file info proxy requires the API server sandbox capability, "
+                "but it is disabled for this principal."
+            )
+        normalized_file_id = self._normalize_file_id(file_id)
+        normalized_channel_id = self._normalize_explicit_channel_id(channel_id)
+        return self._centaur_api_get_json(
+            f"/api/slack/files/{urllib.parse.quote(normalized_file_id, safe='')}/info",
+            {"channel_id": normalized_channel_id},
+        )
+
     def list_usergroups(self) -> list[dict]:
         """List all user groups in the workspace."""
         try:
@@ -2539,6 +2590,10 @@ def get_channel_members(*args, **kwargs):
     return _client().get_channel_members(*args, **kwargs)
 
 
+def get_channel_members_proxy(*args, **kwargs):
+    return _client().get_channel_members_proxy(*args, **kwargs)
+
+
 def get_channel_member_emails(*args, **kwargs):
     return _client().get_channel_member_emails(*args, **kwargs)
 
@@ -2565,6 +2620,10 @@ def upload_file_proxy(*args, **kwargs):
 
 def download_file_proxy(*args, **kwargs):
     return _client().download_file_proxy(*args, **kwargs)
+
+
+def file_info_proxy(*args, **kwargs):
+    return _client().file_info_proxy(*args, **kwargs)
 
 
 def list_usergroups(*args, **kwargs):

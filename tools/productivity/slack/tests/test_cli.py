@@ -167,6 +167,45 @@ def test_channels_direct_calls_direct_client(monkeypatch) -> None:
     assert "general" in result.output
 
 
+def test_channel_members_calls_proxy_client(monkeypatch) -> None:
+    calls = []
+
+    def fake_get_channel_members_proxy(*args, **kwargs):
+        calls.append((args, kwargs))
+        return [{"id": "U123456789", "name": "alice"}]
+
+    fake_client = types.SimpleNamespace(
+        get_channel_members_proxy=fake_get_channel_members_proxy
+    )
+    monkeypatch.setitem(sys.modules, "slack.client", fake_client)
+
+    result = CliRunner().invoke(
+        app,
+        ["channel-members", "C1234567890", "--limit", "25"],
+    )
+
+    assert result.exit_code == 0
+    assert calls == [(("C1234567890",), {"limit": 25})]
+    assert "alice" in result.output
+
+
+def test_channel_members_direct_calls_direct_client(monkeypatch) -> None:
+    calls = []
+
+    def fake_get_channel_members(*args, **kwargs):
+        calls.append((args, kwargs))
+        return [{"id": "U123456789", "name": "alice"}]
+
+    fake_client = types.SimpleNamespace(get_channel_members=fake_get_channel_members)
+    monkeypatch.setitem(sys.modules, "slack.client", fake_client)
+
+    result = CliRunner().invoke(app, ["channel-members-direct", "eng-ai"])
+
+    assert result.exit_code == 0
+    assert calls == [(("eng-ai",), {})]
+    assert "alice" in result.output
+
+
 def test_search_files_calls_proxy_client(monkeypatch) -> None:
     calls = []
 
@@ -379,6 +418,37 @@ def test_download_writes_file_with_proxy(monkeypatch, tmp_path: Path) -> None:
     assert result.exit_code == 0
     assert calls == [{"file_id": "F1234567890", "channel_id": "C1234567890"}]
     assert (tmp_path / "report.pdf").read_bytes() == b"%PDF"
+
+
+def test_file_info_calls_proxy_client(monkeypatch) -> None:
+    calls = []
+
+    def fake_file_info_proxy(**kwargs):
+        calls.append(kwargs)
+        return {
+            "ok": True,
+            "file_id": "F1234567890",
+            "channel_id": "C1234567890",
+            "file": {
+                "id": "F1234567890",
+                "name": "report.pdf",
+                "filetype": "pdf",
+                "size": 1234,
+            },
+        }
+
+    fake_client = types.SimpleNamespace(file_info_proxy=fake_file_info_proxy)
+    monkeypatch.setitem(sys.modules, "slack.client", fake_client)
+
+    result = CliRunner().invoke(
+        app,
+        ["file-info", "F1234567890", "C1234567890"],
+    )
+
+    assert result.exit_code == 0
+    assert calls == [{"file_id": "F1234567890", "channel_id": "C1234567890"}]
+    assert "report.pdf" in result.output
+    assert "1KB" in result.output
 
 
 def test_thread_calls_api_server_client(monkeypatch) -> None:

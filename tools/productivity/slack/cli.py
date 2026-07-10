@@ -625,18 +625,66 @@ def channels_direct(
     _render_channels(results, f"Channels ({len(results)})")
 
 
+def _render_channel_members(channel: str, members: list[dict], emails_only: bool) -> None:
+    if not members:
+        console.print("[yellow]No members found.[/]")
+        raise typer.Exit()
+
+    if emails_only:
+        for m in members:
+            if m.get("email"):
+                console.print(m["email"])
+        return
+
+    table = Table(title=f"#{channel} Members ({len(members)})")
+    table.add_column("Name", style="cyan", max_width=20)
+    table.add_column("Real Name", style="white", max_width=25)
+    table.add_column("Email", style="green", max_width=35)
+
+    for m in members:
+        table.add_row(f"@{m['name']}", m.get("real_name", ""), m.get("email", ""))
+
+    console.print(table)
+
+
+@app.command("channel-members-proxy")
 @app.command("channel-members")
 def channel_members_cmd(
+    channel_id: str = typer.Argument(..., help="Slack channel ID, e.g. C1234567890"),
+    limit: int = typer.Option(1000, "--limit", "-n", help="Max members"),
+    emails_only: bool = typer.Option(
+        False, "--emails", "-e", help="Output only email addresses (one per line)"
+    ),
+):
+    """List members of a Slack channel through the Centaur API server proxy.
+
+    Examples:
+        slack channel-members C1234567890
+        slack channel-members C1234567890 --emails
+    """
+    from .client import get_channel_members_proxy
+
+    try:
+        members = get_channel_members_proxy(channel_id, limit=limit)
+    except (RuntimeError, ValueError) as e:
+        console.print(f"[red]Error: {e}[/]")
+        raise typer.Exit(1)
+
+    _render_channel_members(channel_id, members, emails_only)
+
+
+@app.command("channel-members-direct")
+def channel_members_direct_cmd(
     channel: str = typer.Argument(..., help="Channel name (without #) or channel ID"),
     emails_only: bool = typer.Option(
         False, "--emails", "-e", help="Output only email addresses (one per line)"
     ),
 ):
-    """List all members of a Slack channel.
+    """List all members of a Slack channel directly with the Slack SDK.
 
     Examples:
-        slack channel-members eng-ai
-        slack channel-members eng-ai --emails
+        slack channel-members-direct eng-ai
+        slack channel-members-direct eng-ai --emails
     """
     from .client import get_channel_members
 
@@ -646,24 +694,7 @@ def channel_members_cmd(
         console.print(f"[red]Error: {e}[/]")
         raise typer.Exit(1)
 
-    if not members:
-        console.print("[yellow]No members found.[/]")
-        raise typer.Exit()
-
-    if emails_only:
-        for m in members:
-            if m.get("email"):
-                console.print(m["email"])
-    else:
-        table = Table(title=f"#{channel} Members ({len(members)})")
-        table.add_column("Name", style="cyan", max_width=20)
-        table.add_column("Real Name", style="white", max_width=25)
-        table.add_column("Email", style="green", max_width=35)
-
-        for m in members:
-            table.add_row(f"@{m['name']}", m.get("real_name", ""), m.get("email", ""))
-
-        console.print(table)
+    _render_channel_members(channel, members, emails_only)
 
 
 @app.command()
@@ -989,6 +1020,24 @@ def search_files_direct_cmd(
     _print_file_search_results(query, results)
 
 
+def _format_file_size(size: object) -> str:
+    try:
+        size_bytes = int(size or 0)
+    except (TypeError, ValueError):
+        return str(size)
+    if size_bytes >= 1_000_000:
+        return f"{size_bytes / 1_000_000:.1f}MB"
+    if size_bytes >= 1_000:
+        return f"{size_bytes / 1_000:.0f}KB"
+    return f"{size_bytes}B"
+
+
+def _format_file_info_value(key: str, value: object) -> str:
+    if key == "size":
+        return _format_file_size(value)
+    return str(value)
+
+
 def _print_file_search_results(query: str, results: list[dict]) -> None:
     if not results:
         console.print("[yellow]No files found.[/]")
@@ -1001,15 +1050,54 @@ def _print_file_search_results(query: str, results: list[dict]) -> None:
     table.add_column("Size", style="dim", justify="right", max_width=10)
 
     for f in results:
-        size = f["size"]
-        if size > 1_000_000:
-            size_str = f"{size / 1_000_000:.1f}MB"
-        elif size > 1000:
-            size_str = f"{size / 1000:.0f}KB"
-        else:
-            size_str = f"{size}B"
-        table.add_row(f["name"], f["filetype"], f["user"], size_str)
+        table.add_row(f["name"], f["filetype"], f["user"], _format_file_size(f["size"]))
 
+    console.print(table)
+
+
+@app.command("file-info-proxy")
+@app.command("file-info")
+def file_info(
+    file_id: str = typer.Argument(..., help="Slack file ID, e.g. F1234567890"),
+    channel_id: str = typer.Argument(
+        ..., help="Slack channel/conversation ID that the file is shared in"
+    ),
+    json_output: bool = typer.Option(False, "--json", help="Output raw metadata as JSON"),
+):
+    """Fetch Slack file metadata through the Centaur API server Slack proxy."""
+    import sys
+
+    from .client import file_info_proxy
+
+    try:
+        result = file_info_proxy(file_id=file_id, channel_id=channel_id)
+    except (RuntimeError, ValueError) as e:
+        console.print(f"[red]Error fetching Slack file info: {e}[/]")
+        raise typer.Exit(1) from e
+
+    if json_output:
+        print(json.dumps(result, indent=2, ensure_ascii=False), file=sys.stdout)
+        raise typer.Exit()
+
+    file = result.get("file", {})
+    table = Table(title=f"Slack File {result.get('file_id') or file_id}")
+    table.add_column("Field", style="cyan", max_width=18)
+    table.add_column("Value", style="white", max_width=90)
+    for key in [
+        "id",
+        "name",
+        "title",
+        "mimetype",
+        "filetype",
+        "size",
+        "user",
+        "created",
+        "permalink",
+        "url_private",
+    ]:
+        value = file.get(key)
+        if value not in (None, "", []):
+            table.add_row(key, _format_file_info_value(key, value))
     console.print(table)
 
 
@@ -1156,8 +1244,9 @@ def files(
     else:
         console.print(f"[bold]Files ({len(files_list)})[/]\n")
         for f in files_list:
-            size_kb = f["size"] / 1024
-            console.print(f"[cyan]{f['name']}[/] ({f['filetype']}, {size_kb:.1f} KB)")
+            console.print(
+                f"[cyan]{f['name']}[/] ({f['filetype']}, {_format_file_size(f['size'])})"
+            )
             console.print(f"  [dim]{f['url_private']}[/]")
 
 
