@@ -56,5 +56,50 @@ module SlackDm
     test "SyncCredentialJob is a no-op for missing credentials" do
       assert_nothing_raised { SlackDm::SyncCredentialJob.perform_now(-1) }
     end
+
+    test "SyncCredentialJob retries indexing errors before surfacing them" do
+      app = slack_app
+      credential = slack_credential(app: app)
+      calls = 0
+      original = SlackDm::SyncCredential.method(:new)
+      SlackDm::SyncCredential.define_singleton_method(:new) do |*args, **kwargs|
+        original.call(*args, **kwargs).tap do |sync|
+          sync.define_singleton_method(:call) do
+            calls += 1
+            raise SlackDm::SyncCredential::SlackApiError, "temporary indexing failure"
+          end
+        end
+      end
+
+      assert_enqueued_jobs 1 do
+        SlackDm::SyncCredentialJob.perform_now(credential.id)
+      end
+      assert_equal 1, calls
+    ensure
+      SlackDm::SyncCredential.define_singleton_method(:new, original)
+    end
+
+    test "SyncCredentialJob raises indexing errors after retries are exhausted" do
+      app = slack_app
+      credential = slack_credential(app: app)
+      calls = 0
+      original = SlackDm::SyncCredential.method(:new)
+      SlackDm::SyncCredential.define_singleton_method(:new) do |*args, **kwargs|
+        original.call(*args, **kwargs).tap do |sync|
+          sync.define_singleton_method(:call) do
+            calls += 1
+            raise SlackDm::SyncCredential::SlackApiError, "permanent indexing failure"
+          end
+        end
+      end
+
+      assert_raises(SlackDm::SyncCredential::SlackApiError) do
+        job = SlackDm::SyncCredentialJob.new(credential.id)
+        5.times { job.perform_now }
+      end
+      assert_equal 5, calls
+    ensure
+      SlackDm::SyncCredential.define_singleton_method(:new, original)
+    end
   end
 end

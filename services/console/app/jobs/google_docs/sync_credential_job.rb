@@ -3,6 +3,7 @@ module GoogleDocs
     queue_as :default
 
     limits_concurrency to: 1, key: ->(credential_id) { "google_docs_sync_#{credential_id}" }
+    retry_on StandardError, wait: :polynomially_longer, attempts: 5
 
     def perform(credential_id)
       credential = BrokerCredential.includes(:oauth_app).find_by(id: credential_id)
