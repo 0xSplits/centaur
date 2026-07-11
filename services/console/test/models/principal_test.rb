@@ -45,9 +45,9 @@ class PrincipalTest < ActiveSupport::TestCase
     assert other.valid?
   end
 
-  test "labels defaults to empty hash" do
+  test "labels include sandbox repo-cache projection by default" do
     principal = Principal.create!(default_attrs(namespace: "acme", foreign_id: "C-default-labels"))
-    assert_equal({}, principal.reload.labels)
+    assert_equal({ Principal::SANDBOX_REPO_CACHE_LABEL => "all" }, principal.reload.labels)
   end
 
   test "sandbox access defaults to enabled" do
@@ -55,26 +55,29 @@ class PrincipalTest < ActiveSupport::TestCase
     principal.reload
 
     assert_equal "all", principal.sandbox_repo_cache
-    assert_predicate principal, :sandbox_repo_cache_enabled
     assert_predicate principal, :sandbox_observability_enabled
     assert_predicate principal, :sandbox_api_server_enabled
   end
 
-  test "sandbox repo-cache enum syncs compatibility boolean" do
+  test "default sandbox repo-cache overwrites explicit label assignment" do
+    principal = Principal.new(default_attrs(namespace: "acme", foreign_id: "C-explicit-repo-cache-label"))
+
+    principal.apply_default_sandbox_capabilities!
+    principal.assign_attributes(labels: { Principal::SANDBOX_REPO_CACHE_LABEL => "none" })
+    principal.save!
+
+    assert_equal "all", principal.reload.sandbox_repo_cache
+    assert_equal({ Principal::SANDBOX_REPO_CACHE_LABEL => "all" }, principal.labels)
+  end
+
+  test "sandbox repo-cache stores canonical enum value" do
     principal = Principal.create!(default_attrs(namespace: "acme", foreign_id: "C-repo-cache-setting"))
 
     principal.update!(sandbox_repo_cache: "public")
     principal.reload
 
     assert_equal "public", principal.sandbox_repo_cache
-    assert_equal false, principal.sandbox_repo_cache_enabled
     assert_equal "public", principal.labels[Principal::SANDBOX_REPO_CACHE_LABEL]
-
-    principal.update!(sandbox_repo_cache_enabled: true)
-    principal.reload
-
-    assert_equal "all", principal.sandbox_repo_cache
-    assert_equal true, principal.sandbox_repo_cache_enabled
   end
 
   test "sandbox repo-cache enum survives labels assigned in the same update" do
@@ -88,14 +91,35 @@ class PrincipalTest < ActiveSupport::TestCase
     assert_equal "public", principal.labels[Principal::SANDBOX_REPO_CACHE_LABEL]
   end
 
-  test "sandbox repo-cache accepts pub as public alias" do
-    principal = Principal.create!(default_attrs(namespace: "acme", foreign_id: "C-repo-cache-pub-alias"))
+  test "sandbox repo-cache overwrites label with canonical value" do
+    principal = Principal.create!(default_attrs(namespace: "acme", foreign_id: "C-repo-cache-label"))
 
-    principal.update!(sandbox_repo_cache: "pub")
+    principal.update!(labels: { Principal::SANDBOX_REPO_CACHE_LABEL => "public" })
+    principal.reload
+
+    assert_equal "all", principal.sandbox_repo_cache
+    assert_equal({ Principal::SANDBOX_REPO_CACHE_LABEL => "all" }, principal.labels)
+  end
+
+  test "sandbox repo-cache param takes precedence over conflicting label" do
+    principal = Principal.create!(default_attrs(namespace: "acme", foreign_id: "C-repo-cache-param-wins"))
+
+    principal.update!(
+      sandbox_repo_cache: "public",
+      labels: { Principal::SANDBOX_REPO_CACHE_LABEL => "none" }
+    )
     principal.reload
 
     assert_equal "public", principal.sandbox_repo_cache
-    assert_equal "public", principal.labels[Principal::SANDBOX_REPO_CACHE_LABEL]
+    assert_equal({ Principal::SANDBOX_REPO_CACHE_LABEL => "public" }, principal.labels)
+  end
+
+  test "sandbox repo-cache rejects invalid enum values" do
+    principal = Principal.new(default_attrs(namespace: "acme", foreign_id: "C-repo-cache-invalid"))
+    principal.sandbox_repo_cache = "pub"
+
+    assert_not principal.valid?
+    assert_includes principal.errors[:sandbox_repo_cache], "is not included in the list"
   end
 
   test "labels accepts arbitrary string map" do
@@ -104,7 +128,14 @@ class PrincipalTest < ActiveSupport::TestCase
       foreign_id: "C-labels",
       labels: { "env" => "prod", "team" => "platform" }
     ))
-    assert_equal({ "env" => "prod", "team" => "platform" }, principal.reload.labels)
+    assert_equal(
+      {
+        "env" => "prod",
+        "team" => "platform",
+        Principal::SANDBOX_REPO_CACHE_LABEL => "all"
+      },
+      principal.reload.labels
+    )
   end
 
   test "effective_config adds api server JWT from Slack channel permission rows" do
@@ -256,7 +287,13 @@ class PrincipalTest < ActiveSupport::TestCase
   test "labels remain mutable after creation" do
     principal = principals(:acme_channel)
     principal.update!(labels: { "changed" => "yes" })
-    assert_equal({ "changed" => "yes" }, principal.reload.labels)
+    assert_equal(
+      {
+        "changed" => "yes",
+        Principal::SANDBOX_REPO_CACHE_LABEL => "all"
+      },
+      principal.reload.labels
+    )
   end
 
   test "name is editable after creation" do
