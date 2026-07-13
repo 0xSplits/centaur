@@ -95,8 +95,7 @@ def current_thread_key() -> str:
         thread_key = None
     if not thread_key:
         raise RuntimeError(
-            "this operation must run inside a scoped thread: no thread_key "
-            "in the tool context."
+            "this operation must run inside a scoped thread: no thread_key in the tool context."
         )
     return thread_key
 
@@ -200,6 +199,30 @@ def current_chat_destination() -> dict[str, str]:
     raise RuntimeError(
         f"current thread is not a recognized chat surface: {context.get('thread_key')!r}"
     )
+
+
+def current_chat_source_attribution() -> str:
+    """Return a Markdown source-attribution line for user-created artifacts.
+
+    Use this when creating tasks or documents from the current chat thread. The
+    returned text is safe to paste into Linear issue descriptions.
+    """
+    destination = current_chat_destination()
+    platform = destination["platform"]
+    if platform == "discord":
+        guild_id = destination["guild_id"]
+        target_id = destination.get("thread_id") or destination["channel_id"]
+        return (
+            f"Requested from [Discord thread](https://discord.com/channels/{guild_id}/{target_id})."
+        )
+    if platform == "slack":
+        return (
+            "Requested from Slack thread "
+            f"{destination['thread_ts']} in channel {destination['channel_id']}."
+        )
+    if platform == "linear":
+        return f"Requested from Linear issue {destination['issue_id']}."
+    raise RuntimeError(f"current thread is not a recognized chat surface: {platform!r}")
 
 
 def _sandbox_uploads_dir() -> Path | None:

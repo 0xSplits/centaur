@@ -8,6 +8,7 @@ import pytest
 from centaur_sdk import (
     ToolContext,
     current_chat_destination,
+    current_chat_source_attribution,
     current_discord_thread,
     current_linear_thread,
     current_session_context,
@@ -38,9 +39,7 @@ class MappingBackend(SecretBackend):
 
 def test_secret_prefers_tool_context_over_backend(monkeypatch: pytest.MonkeyPatch):
     monkeypatch.setattr(registry, "_backend", MappingBackend({"TOKEN": "backend"}))
-    token = set_tool_context(
-        ToolContext(name="fake-tool", secrets={"TOKEN": "from-context"})
-    )
+    token = set_tool_context(ToolContext(name="fake-tool", secrets={"TOKEN": "from-context"}))
     try:
         assert secret("TOKEN") == "from-context"
     finally:
@@ -218,6 +217,45 @@ def test_current_chat_destination_tags_platform(monkeypatch: pytest.MonkeyPatch)
         reset_tool_context(token)
 
 
+def test_current_chat_source_attribution_links_discord_thread(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    token = _discord_context("discord:111:222:333", monkeypatch)
+    try:
+        assert (
+            current_chat_source_attribution()
+            == "Requested from [Discord thread](https://discord.com/channels/111/333)."
+        )
+    finally:
+        reset_tool_context(token)
+
+
+def test_current_chat_source_attribution_links_discord_channel_root(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    payload = (
+        b'{"thread_key":"discord:111:222","platform":"discord",'
+        b'"discord":{"guild_id":"111","channel_id":"222"}}'
+    )
+    monkeypatch.setattr(
+        "urllib.request.urlopen", lambda _request, timeout: _fake_context_response(payload)()
+    )
+    token = set_tool_context(
+        ToolContext(
+            name="fake-tool",
+            thread_key="discord:111:222",
+            secrets={"CENTAUR_API_URL": "http://api:8000", "CENTAUR_API_KEY": ""},
+        )
+    )
+    try:
+        assert (
+            current_chat_source_attribution()
+            == "Requested from [Discord thread](https://discord.com/channels/111/222)."
+        )
+    finally:
+        reset_tool_context(token)
+
+
 def _linear_context(thread_key: str, monkeypatch: pytest.MonkeyPatch):
     payload = (
         b'{"thread_key":"' + thread_key.encode() + b'","platform":"linear",'
@@ -258,6 +296,42 @@ def test_current_chat_destination_tags_linear_platform(monkeypatch: pytest.Monke
             "comment_id": "CMT",
             "agent_session_id": "SESS",
         }
+    finally:
+        reset_tool_context(token)
+
+
+def test_current_chat_source_attribution_keeps_linear_text(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    token = _linear_context("linear:ISSUE:c:CMT:s:SESS", monkeypatch)
+    try:
+        assert current_chat_source_attribution() == "Requested from Linear issue ISSUE."
+    finally:
+        reset_tool_context(token)
+
+
+def test_current_chat_source_attribution_keeps_slack_text(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    payload = (
+        b'{"thread_key":"slack:C123:123.456","platform":"slack",'
+        b'"slack":{"channel_id":"C123","thread_ts":"123.456"}}'
+    )
+    monkeypatch.setattr(
+        "urllib.request.urlopen", lambda _request, timeout: _fake_context_response(payload)()
+    )
+    token = set_tool_context(
+        ToolContext(
+            name="fake-tool",
+            thread_key="slack:C123:123.456",
+            secrets={"CENTAUR_API_URL": "http://api:8000", "CENTAUR_API_KEY": ""},
+        )
+    )
+    try:
+        assert (
+            current_chat_source_attribution()
+            == "Requested from Slack thread 123.456 in channel C123."
+        )
     finally:
         reset_tool_context(token)
 
@@ -306,9 +380,7 @@ def test_current_discord_thread_rejects_slack_thread(monkeypatch: pytest.MonkeyP
         reset_tool_context(token)
 
 
-def test_save_attachment_writes_to_sandbox_uploads_dir(
-    monkeypatch: pytest.MonkeyPatch, tmp_path
-):
+def test_save_attachment_writes_to_sandbox_uploads_dir(monkeypatch: pytest.MonkeyPatch, tmp_path):
     def fail_urlopen(*_args, **_kwargs):
         raise AssertionError("save_attachment should not call the API in sandbox mode")
 
