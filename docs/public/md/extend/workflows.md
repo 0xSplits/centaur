@@ -70,9 +70,7 @@ async def handler(inp: Input, ctx: WorkflowContext) -> dict[str, Any]:
 | `ctx.sleep(name, duration)` | Suspend and resume later. |
 | `ctx.sleep_until(name, when)` | Resume at a specific time. |
 | `ctx.wait_for_event(name, event_type, correlation_id)` | Wait for an external event. |
-| `ctx.start_workflow(...)` | Start a child workflow and continue immediately. |
-| `ctx.wait_for_workflow(...)` | Wait for a child workflow to finish. |
-| `ctx.run_workflow(...)` | Start and wait in one call. |
+| `ctx.start_workflow(workflow_name, input, idempotency_key=...)` | Queue a child workflow and continue immediately; returns its durable task/run identifiers. |
 | `ctx.start_agent(...)` | Start an agent turn. |
 | `ctx.run_agent(...)` | Start an agent turn and wait for the result. |
 
@@ -97,9 +95,8 @@ These primitives compose into larger automations:
 Create a run through the API:
 
 ```bash
-curl -s "$CENTAUR_API_URL/workflows/runs" \
+curl -s "$CENTAUR_API_URL/api/workflows/runs" \
   -H "Content-Type: application/json" \
-  -H "X-Api-Key: $WORKFLOW_API_KEY" \
   -d '{
     "workflow_name": "nightly_report",
     "input": {"channel": "ops", "topic": "open incidents"},
@@ -110,8 +107,7 @@ curl -s "$CENTAUR_API_URL/workflows/runs" \
 Inspect it:
 
 ```bash
-curl -s "$CENTAUR_API_URL/workflows/runs/$RUN_ID" \
-  -H "X-Api-Key: $WORKFLOW_API_KEY" | jq
+curl -s "$CENTAUR_API_URL/api/workflows/runs/$RUN_ID" | jq
 ```
 
 ## Schedule a workflow
