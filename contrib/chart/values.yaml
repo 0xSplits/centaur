@@ -106,6 +106,12 @@ console:
   # When set, the slackbotv2 deployment also links the first assistant message
   # in a Slack thread to the Console session view; leave empty to omit the link.
   publicUrl: ""
+  # Break-glass email/password login. Disable when console is reachable from
+  # the public internet and SSO is configured.
+  passwordLoginEnabled: true
+  # Optional SSO admission policy. When non-empty, only identities whose email
+  # domain matches this list can sign in through Google or Slack.
+  ssoEmailDomains: []
   image:
     repository: centaur-console
     tag: latest
@@ -371,6 +377,7 @@ apiRs:
       syncIntervalSeconds: 3600
       syncBackfillLookbackDays: 30
       syncThreadLookbackDays: 3
+      indexPrivateChannels: false
       excludedChannelPatterns: ""
       attachments:
         enabled: true
@@ -398,6 +405,7 @@ apiRs:
       enabled: true
       intervalSeconds: 14400
       maxWindowSeconds: 21600
+      batchSize: 50
   # Reaper: stop sandboxes older than the max lifetime, regardless of whether
   # they are running or suspended. 0 disables the sweep. Interval must be >= 1.
   sandboxMaxLifetimeSecs: 259200 # 3 days
@@ -625,10 +633,11 @@ networkPolicy:
   # on clusters whose API server endpoint already listens on 443.
   apiServerPort: 6443
   # Egress to an in-cluster OTLP trace collector (e.g. Laminar) in another
-  # namespace. api-rs needs this to export its own spans; sandboxes get their
-  # equivalent per-sandbox rule from api-rs, derived from the OTLP endpoint in
-  # sandbox.extraEnv. The collector's own namespace must also admit ingress
-  # from this namespace's pods.
+  # namespace. The policy selects only pods labeled
+  # centaur.ai/observability-enabled=true, matching observabilityEgress. api-rs
+  # always receives that label; sandboxes and proxy pods receive it only when
+  # their principal has observability enabled. The collector's own namespace
+  # must also admit ingress from this namespace's pods.
   otlpEgress:
     enabled: false
     # kubernetes.io/metadata.name of the collector's namespace, e.g. "laminar".

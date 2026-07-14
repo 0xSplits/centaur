@@ -277,6 +277,7 @@
                 "syncIntervalSeconds": { "type": "integer" },
                 "syncBackfillLookbackDays": { "type": "integer" },
                 "syncThreadLookbackDays": { "type": "integer" },
+                "indexPrivateChannels": { "type": "boolean" },
                 "excludedChannelPatterns": { "type": "string" },
                 "attachments": {
                   "type": "object",
@@ -331,7 +332,8 @@
               "properties": {
                 "enabled": { "type": "boolean" },
                 "intervalSeconds": { "type": "integer" },
-                "maxWindowSeconds": { "type": "integer" }
+                "maxWindowSeconds": { "type": "integer" },
+                "batchSize": { "type": "integer", "minimum": 1 }
               }
             }
           }

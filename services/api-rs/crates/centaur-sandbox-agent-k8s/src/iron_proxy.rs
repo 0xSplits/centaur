@@ -50,6 +50,7 @@ const PROXY_LOG_LEVEL: &str = "info";
 // DSN. These are the deploy-level env vars iron-proxy reads for that listener.
 const PG_LISTENER_PORT: u16 = 5432;
 const CENTAUR_POSTGRES_DSN_ENV: &str = "CENTAUR_POSTGRES_DSN";
+const CENTAUR_CONSOLE_URL_ENV: &str = "CENTAUR_CONSOLE_URL";
 const PG_LISTEN_ENV: &str = "IRON_PROXY_PG_LISTEN";
 const PG_CLIENT_USER_ENV: &str = "IRON_PROXY_PG_CLIENT_USER";
 const PG_CLIENT_PASSWORD_ENV: &str = "IRON_PROXY_PG_CLIENT_PASSWORD";
@@ -123,6 +124,7 @@ pub(crate) struct ResolvedIronProxy {
     proxy_host: String,
     proxy_pod_name: String,
     proxy_port: u16,
+    console_url: String,
     // iron-control principal OID this sandbox's proxy binds to.
     principal_id: String,
     // The single Postgres listener the proxy multiplexes all upstreams through,
@@ -319,6 +321,12 @@ impl AgentSandboxBackend {
             proxy_host: iron_proxy_service_name(id),
             proxy_pod_name: new_iron_proxy_pod_name(id),
             proxy_port: PROXY_TUNNEL_PORT,
+            console_url: self
+                .config
+                .iron_control
+                .as_ref()
+                .map(|settings| settings.control_url.clone())
+                .unwrap_or_default(),
             principal_id,
             pg,
             replace_placeholders,
@@ -1096,13 +1104,7 @@ pub(crate) fn apply_proxy_env(spec: &mut SandboxSpec, resolved: &ResolvedIronPro
     // collector; routing them through iron-proxy fails (plain-HTTP forwards
     // are rejected), so the endpoint host always bypasses the proxy.
     no_proxy_extra.extend(otlp_endpoint_hosts(spec));
-    let api_host = env_value(spec, "CENTAUR_API_URL").and_then(host_from_url);
-    for (name, value) in proxy_env(
-        &resolved.proxy_host,
-        resolved.proxy_port,
-        api_host.as_deref(),
-        &no_proxy_extra,
-    ) {
+    for (name, value) in proxy_env(&resolved.proxy_host, resolved.proxy_port, &no_proxy_extra) {
         set_env(spec, &name, &value);
     }
     // Operator-granted replace placeholders: the sandbox sends the proxy_value
@@ -1120,6 +1122,9 @@ pub(crate) fn apply_proxy_env(spec: &mut SandboxSpec, resolved: &ResolvedIronPro
             pg.user, pg.password, resolved.proxy_host, pg.port,
         );
         set_missing_env(spec, CENTAUR_POSTGRES_DSN_ENV, &value);
+    }
+    if !resolved.console_url.is_empty() {
+        set_missing_env(spec, CENTAUR_CONSOLE_URL_ENV, &resolved.console_url);
     }
 }
 
@@ -1530,11 +1535,10 @@ fn control_plane_egress_target(
 fn proxy_env(
     proxy_host: &str,
     proxy_port: u16,
-    api_host: Option<&str>,
     no_proxy_extra: &[String],
 ) -> BTreeMap<String, String> {
     let proxy_url = format!("http://{proxy_host}:{proxy_port}");
-    let no_proxy = no_proxy_value(proxy_host, api_host, no_proxy_extra);
+    let no_proxy = no_proxy_value(proxy_host, no_proxy_extra);
     BTreeMap::from([
         ("FIREWALL_HOST".to_owned(), proxy_host.to_owned()),
         ("FIREWALL_PROXY_PORT".to_owned(), proxy_port.to_string()),
@@ -1564,19 +1568,15 @@ fn proxy_env(
     ])
 }
 
-fn no_proxy_value(proxy_host: &str, api_host: Option<&str>, extra_values: &[String]) -> String {
+fn no_proxy_value(proxy_host: &str, extra_values: &[String]) -> String {
     let mut hosts = BTreeSet::<String>::from([
         "localhost".to_owned(),
         "127.0.0.1".to_owned(),
         "::1".to_owned(),
         proxy_host.to_owned(),
-        "api".to_owned(),
         "victoriametrics".to_owned(),
         "victorialogs".to_owned(),
     ]);
-    if let Some(api_host) = api_host.filter(|value| !value.is_empty()) {
-        hosts.insert(api_host.to_owned());
-    }
     for value in extra_values {
         hosts.extend(
             value
@@ -1950,6 +1950,7 @@ mod tests {
             proxy_host: "asbx-test-iron-proxy".to_owned(),
             proxy_pod_name: "asbx-test-iron-proxy-1".to_owned(),
             proxy_port: 8080,
+            console_url: "http://console:3000".to_owned(),
             principal_id: "principal".to_owned(),
             pg: None,
             replace_placeholders: BTreeMap::new(),
@@ -2071,6 +2072,48 @@ mod tests {
             Some("true")
         );
         assert!(!iron_proxy_labels(&id, false).contains_key(API_SERVER_ENABLED_LABEL));
+    }
+
+    #[test]
+    fn iron_proxy_resources_carry_api_server_capability_label() {
+        let id = SandboxId::new("asbx-test");
+        let iron_proxy = IronProxyConfig::new("proxy:test", "ca-cert", "ca-key");
+        let resolved = resolved();
+        let sync = ProxySyncEnv {
+            proxy_id: "iprx_test".to_owned(),
+            control_url: "http://console:3000".to_owned(),
+            token: "proxy-token".to_owned(),
+        };
+
+        let pod = build_iron_proxy_pod(&id, &iron_proxy, &resolved, &sync);
+        assert_eq!(
+            pod.metadata
+                .labels
+                .as_ref()
+                .and_then(|labels| labels.get(API_SERVER_ENABLED_LABEL))
+                .map(String::as_str),
+            Some("true")
+        );
+
+        let service = build_iron_proxy_service(&id, &resolved);
+        assert_eq!(
+            service
+                .metadata
+                .labels
+                .as_ref()
+                .and_then(|labels| labels.get(API_SERVER_ENABLED_LABEL))
+                .map(String::as_str),
+            Some("true")
+        );
+        assert_eq!(
+            service
+                .spec
+                .as_ref()
+                .and_then(|spec| spec.selector.as_ref())
+                .and_then(|selector| selector.get(API_SERVER_ENABLED_LABEL))
+                .map(String::as_str),
+            Some("true")
+        );
     }
 
     #[test]
@@ -2550,6 +2593,32 @@ mod tests {
     }
 
     #[test]
+    fn apply_proxy_env_does_not_add_api_host_to_no_proxy() {
+        let mut spec = SandboxSpec::new("centaur-agent:latest")
+            .env("CENTAUR_API_URL", "http://api:8080")
+            .env("NO_PROXY", "custom.internal");
+
+        apply_proxy_env(&mut spec, &resolved());
+
+        for name in ["NO_PROXY", "no_proxy"] {
+            let value = spec
+                .env
+                .iter()
+                .find(|env| env.name == name)
+                .map(|env| env.value.clone())
+                .unwrap();
+            assert!(
+                !value.split(',').any(|host| host == "api"),
+                "{name} should not contain the API host: {value}"
+            );
+            assert!(
+                value.split(',').any(|host| host == "custom.internal"),
+                "{name} should preserve explicit NO_PROXY extras: {value}"
+            );
+        }
+    }
+
+    #[test]
     fn proxy_fallback_delay_subtracts_elapsed_probe_time() {
         assert_eq!(
             proxy_fallback_delay_remaining(Duration::from_secs(2)),
@@ -2584,5 +2653,21 @@ mod tests {
                 "{name} should contain the OTLP endpoint host: {value}"
             );
         }
+    }
+
+    #[test]
+    fn apply_proxy_env_adds_console_url() {
+        let mut spec = SandboxSpec::new("centaur-agent:latest");
+        let mut resolved = resolved();
+        resolved.console_url = "http://console:3000/".to_owned();
+
+        apply_proxy_env(&mut spec, &resolved);
+
+        let value = spec
+            .env
+            .iter()
+            .find(|env| env.name == CENTAUR_CONSOLE_URL_ENV)
+            .map(|env| env.value.as_str());
+        assert_eq!(value, Some("http://console:3000/"));
     }
 }
