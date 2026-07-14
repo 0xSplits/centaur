@@ -1,6 +1,8 @@
 require "test_helper"
 
 class PrincipalSyncConfigSnapshotTest < ActiveSupport::TestCase
+  include ActiveSupport::Testing::TimeHelpers
+
   setup do
     @principal = principals(:acme_channel)
   end
@@ -43,6 +45,67 @@ class PrincipalSyncConfigSnapshotTest < ActiveSupport::TestCase
     refreshed = PrincipalSyncConfigSnapshot.fetch_for(@principal)
     assert_equal snapshot.id, refreshed.id
     assert refreshed.fresh?
+  end
+
+  test "fetch_for rebuilds api server JWT snapshots when the jwt window advances" do
+    with_env(
+      "CENTAUR_JWT_SIGNING_SECRET" => "test-secret",
+      "CENTAUR_API_URL" => "http://api.internal:8080"
+    ) do
+      SlackChannelPermission.create!(
+        principal: @principal,
+        channel_id: "C0123456789",
+        upload_enabled: true
+      )
+      boundary = 1_700_001_000 + ApiServer::Jwt.rotation_offset(@principal)
+      current_time = Time.zone.at(boundary + 60)
+      previous_window_time = Time.zone.at(boundary - 60)
+      proxy = proxies(:acme_proxy)
+
+      snapshot = PrincipalSyncConfigSnapshot.fetch_for(@principal)
+      original_hash = proxy.sync_config_snapshot.fetch(:config_hash)
+      original_token = snapshot.payload.fetch("secrets").find do |secret|
+        secret.dig("inject", "header") == "Authorization"
+      end.dig("source", "value")
+      snapshot.update_columns(updated_at: previous_window_time)
+
+      travel_to current_time do
+        refreshed = PrincipalSyncConfigSnapshot.fetch_for(@principal)
+        refreshed_token = refreshed.payload.fetch("secrets").find do |secret|
+          secret.dig("inject", "header") == "Authorization"
+        end.dig("source", "value")
+
+        assert_equal snapshot.id, refreshed.id
+        assert refreshed.fresh?
+        refute_equal original_token, refreshed_token
+        refute_equal original_hash, proxy.reload.sync_config_snapshot.fetch(:config_hash)
+      end
+    end
+  end
+
+  test "fetch_for does not rebuild api server JWT snapshots when sandbox api access is disabled" do
+    with_env("CENTAUR_JWT_SIGNING_SECRET" => "test-secret") do
+      @principal.update!(
+        sandbox_api_server_enabled: false
+      )
+      SlackChannelPermission.create!(
+        principal: @principal,
+        channel_id: "C0123456789",
+        upload_enabled: true
+      )
+      boundary = 1_700_001_000 + ApiServer::Jwt.rotation_offset(@principal)
+      current_time = Time.zone.at(boundary + 60)
+      previous_window_time = Time.zone.at(boundary - 60)
+
+      snapshot = PrincipalSyncConfigSnapshot.fetch_for(@principal)
+      snapshot.update_columns(updated_at: previous_window_time)
+
+      travel_to current_time do
+        assert_no_changes -> { snapshot.reload.updated_at } do
+          assert_equal snapshot, PrincipalSyncConfigSnapshot.fetch_for(@principal)
+        end
+      end
+    end
   end
 
   test "fetch_for builds a new snapshot after a cache version bump" do
@@ -107,6 +170,18 @@ class PrincipalSyncConfigSnapshotTest < ActiveSupport::TestCase
 
     assert_no_difference -> { PrincipalSyncConfigSnapshot.count } do
       assert_equal snapshot, PrincipalSyncConfigSnapshot.try_build_for(@principal)
+    end
+  end
+
+  def with_env(values)
+    previous = values.keys.to_h { |key| [ key, ENV[key] ] }
+    values.each do |key, value|
+      value.nil? ? ENV.delete(key) : ENV[key] = value
+    end
+    yield
+  ensure
+    previous.each do |key, value|
+      value.nil? ? ENV.delete(key) : ENV[key] = value
     end
   end
 end

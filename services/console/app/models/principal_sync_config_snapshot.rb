@@ -26,7 +26,7 @@ class PrincipalSyncConfigSnapshot < ApplicationRecord
   def self.fetch_for(principal)
     version = principal.sync_config_cache_version
     snapshot = find_by(principal: principal, principal_cache_version: version)
-    return snapshot if snapshot&.fresh?
+    return snapshot if snapshot&.fresh_for?(principal)
 
     try_build_for(principal) || snapshot || latest_for(principal) || build_for(principal)
   end
@@ -37,6 +37,10 @@ class PrincipalSyncConfigSnapshot < ApplicationRecord
 
   def fresh?
     updated_at >= TTL.ago
+  end
+
+  def fresh_for?(principal)
+    fresh? && !api_server_jwt_window_stale?(principal)
   end
 
   # Most recent snapshot at any cache version; the stale fallback while
@@ -70,7 +74,7 @@ class PrincipalSyncConfigSnapshot < ApplicationRecord
   def self.build_within_lock(principal)
     version = principal.sync_config_cache_version
     snapshot = find_or_initialize_by(principal: principal, principal_cache_version: version)
-    return snapshot if snapshot.persisted? && snapshot.fresh?
+    return snapshot if snapshot.persisted? && snapshot.fresh_for?(principal)
 
     snapshot.payload = principal.effective_config(redact_secrets: false)
     if snapshot.changed?
@@ -82,5 +86,14 @@ class PrincipalSyncConfigSnapshot < ApplicationRecord
       snapshot.touch
     end
     snapshot
+  end
+
+  def api_server_jwt_window_stale?(principal)
+    return false unless principal.sandbox_api_server_enabled?
+
+    return false if principal.slack_jwt_channel_ids.empty?
+    return false if ENV["CENTAUR_JWT_SIGNING_SECRET"].to_s.blank?
+
+    updated_at.to_i < ApiServer::Jwt.window_start_for(principal, Time.current.to_i)
   end
 end

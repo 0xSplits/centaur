@@ -9,21 +9,17 @@ module Oauth
   # BrokerCredential linked to the OauthApp, then sends the user back to the
   # console Integrations page (or renders a result page on failure).
   #
-  # Deliberately unauthenticated -- a team member connects an integration by
-  # clicking a well-known link; there is no external app to integrate with, so
-  # there is no return_to or user key. Safety comes from: a credential is only
-  # minted after a successful consent + code exchange, and re-consent for the
-  # same (app, provider account) upserts the existing credential. All
-  # provider-specific behavior comes from the strategy (Oauth::Providers), which
-  # is derived from the app.
+  # Authenticated console consent flow. A team member connects an integration by
+  # clicking a console link; a credential is only minted after an active console
+  # session, successful consent, and code exchange. Re-consent for the same (app,
+  # provider account) upserts the existing credential. All provider-specific
+  # behavior comes from the strategy (Oauth::Providers), which is derived from
+  # the app.
   #
   # SECURITY: never logs the code, tokens, client_secret, or response bodies --
   # only oids and error codes, like the rest of the Broker/Oauth subsystem.
   class FlowsController < ApplicationController
     layout "auth"
-
-    skip_before_action :require_login
-    skip_before_action :require_active_account
 
     # The message_verifier purpose binding the signed state to this flow, the
     # state/cookie lifetime, and the encrypted cookie that ties a callback back to
@@ -156,18 +152,17 @@ module Oauth
     end
 
     # Upserts one credential per (app, provider account). A new record gets its
-    # identity/endpoint fixed (and an auto-generated external_user_key, since the
-    # flow has no caller-supplied user); every consent (re)applies the rotating
-    # blob, including the freshly-exchanged access token so the credential is live
-    # immediately, and revives a dead credential.
+    # identity/endpoint fixed (and an auto-generated external_user_key); every
+    # consent (re)applies the rotating blob, including the freshly-exchanged
+    # access token so the credential is live immediately, and revives a dead
+    # credential.
     def upsert_credential(state, result, identity)
       BrokerCredential.transaction do
         credential = BrokerCredential.find_or_initialize_by(oauth_app: @app, provider_subject: identity[:subject])
-        # When the consenting browser carries a signed-in console session,
-        # remember which user connected this account. The Integrations page
-        # matches on it, so the card flips to "Connected" even when the
-        # provider account's email differs from the console login email.
-        # Never overwritten: the first linked user keeps the credential.
+        # Remember which user connected this account. The Integrations page
+        # matches on it, so the card flips to "Connected" even when the provider
+        # account's email differs from the console login email. Never
+        # overwritten: the first linked user keeps the credential.
         credential.created_by ||= current_user
         if credential.new_record?
           credential.namespace = @app.credential_namespace
@@ -183,6 +178,7 @@ module Oauth
           provider_email: identity[:email],
           # Store exactly what the IdP granted, so the refresh POST re-requests it.
           scopes: granted_scopes(result, state),
+          labels: credential_labels(credential, identity),
           refresh_token: result.refresh_token,
           access_token: result.access_token,
           expires_at: now + expires_in,
@@ -201,16 +197,28 @@ module Oauth
       @provider.parse_granted_scopes(result.scope)
     end
 
+    def credential_labels(credential, identity)
+      labels = credential.labels || {}
+      return labels unless @app.provider == Oauth::Providers::Slack::KEY
+      return labels if identity[:team_id].blank?
+
+      labels.merge("slack_team_id" => identity[:team_id])
+    end
+
     def identity_display_name(identity)
       identity[:name].presence || identity[:email].presence || identity[:subject]
     end
 
     def enqueue_identity_enrichment(credential)
       case @app.provider
+      when Oauth::Providers::Attio::KEY
+        Oauth::EnrichAttioCredentialIdentityJob.perform_later(credential.id)
       when Oauth::Providers::Slack::KEY
         Oauth::EnrichCredentialIdentityJob.perform_later(credential.id)
       when Oauth::Providers::Github::KEY
         Oauth::EnrichGithubCredentialIdentityJob.perform_later(credential.id)
+      when Oauth::Providers::Linear::KEY
+        Oauth::EnrichLinearCredentialIdentityJob.perform_later(credential.id)
       end
     end
 
