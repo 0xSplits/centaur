@@ -9,6 +9,7 @@ from centaur_sdk import (
     ToolContext,
     current_chat_destination,
     current_discord_thread,
+    current_github_thread,
     current_linear_thread,
     current_session_context,
     current_slack_thread,
@@ -258,6 +259,77 @@ def test_current_chat_destination_tags_linear_platform(monkeypatch: pytest.Monke
             "comment_id": "CMT",
             "agent_session_id": "SESS",
         }
+    finally:
+        reset_tool_context(token)
+
+
+def _github_context(thread_key: str, monkeypatch: pytest.MonkeyPatch):
+    payload = (
+        b'{"thread_key":"' + thread_key.encode() + b'","platform":"github",'
+        b'"github":{"owner":"0xSplits","repo":"centaur","number":704,'
+        b'"kind":"pr","review_comment_id":99}}'
+    )
+    monkeypatch.setattr(
+        "urllib.request.urlopen", lambda _request, timeout: _fake_context_response(payload)()
+    )
+    return set_tool_context(
+        ToolContext(
+            name="fake-tool",
+            thread_key=thread_key,
+            secrets={"CENTAUR_API_URL": "http://api:8000", "CENTAUR_API_KEY": ""},
+        )
+    )
+
+
+def test_current_github_thread_returns_api_github_destination(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    token = _github_context("github:0xSplits/centaur:704:rc:99", monkeypatch)
+    try:
+        assert current_github_thread() == {
+            "owner": "0xSplits",
+            "repo": "centaur",
+            "number": 704,
+            "kind": "pr",
+            "review_comment_id": 99,
+        }
+    finally:
+        reset_tool_context(token)
+
+
+def test_current_chat_destination_tags_github_platform(monkeypatch: pytest.MonkeyPatch):
+    token = _github_context("github:0xSplits/centaur:704:rc:99", monkeypatch)
+    try:
+        assert current_chat_destination() == {
+            "platform": "github",
+            "owner": "0xSplits",
+            "repo": "centaur",
+            "number": 704,
+            "kind": "pr",
+            "review_comment_id": 99,
+        }
+    finally:
+        reset_tool_context(token)
+
+
+def test_current_github_thread_rejects_slack_thread(monkeypatch: pytest.MonkeyPatch):
+    payload = (
+        b'{"thread_key":"slack:C123:123.456","platform":"slack",'
+        b'"slack":{"channel_id":"C123","thread_ts":"123.456"}}'
+    )
+    monkeypatch.setattr(
+        "urllib.request.urlopen", lambda _request, timeout: _fake_context_response(payload)()
+    )
+    token = set_tool_context(
+        ToolContext(
+            name="fake-tool",
+            thread_key="slack:C123:123.456",
+            secrets={"CENTAUR_API_URL": "http://api:8000", "CENTAUR_API_KEY": ""},
+        )
+    )
+    try:
+        with pytest.raises(RuntimeError, match="not a GitHub thread"):
+            current_github_thread()
     finally:
         reset_tool_context(token)
 

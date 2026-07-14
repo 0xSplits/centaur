@@ -6148,7 +6148,7 @@ fn merge_session_context(
 }
 
 /// Build the structured per-turn session context for a thread, mirroring the
-/// `/api/session` response shape (`{ platform, <slack|discord|linear>: { .. } }`).
+/// `/api/session` response shape (`{ platform, <slack|discord|linear|github>: { .. } }`).
 ///
 /// Resolved from the same [`ChatDestination`] the session-context route uses, so
 /// the structured context the agent sees in its input is consistent with what
@@ -6201,6 +6201,26 @@ fn session_context_for_thread(thread_key: &ThreadKey) -> Option<serde_json::Map<
                 );
             }
             ("linear", linear)
+        }
+        ChatDestination::Github {
+            owner,
+            repo,
+            number,
+            kind,
+            review_comment_id,
+        } => {
+            let mut github = serde_json::Map::new();
+            github.insert("owner".to_owned(), Value::String(owner));
+            github.insert("repo".to_owned(), Value::String(repo));
+            github.insert("number".to_owned(), Value::Number(number.into()));
+            github.insert("kind".to_owned(), Value::String(kind.as_str().to_owned()));
+            if let Some(review_comment_id) = review_comment_id {
+                github.insert(
+                    "review_comment_id".to_owned(),
+                    Value::Number(review_comment_id.into()),
+                );
+            }
+            ("github", github)
         }
     };
     context.insert(platform_key.to_owned(), Value::Object(block));
@@ -7751,6 +7771,22 @@ mod tests {
     }
 
     #[test]
+    fn input_line_with_session_context_adds_github_thread_context() {
+        let thread_key = ThreadKey::parse("github:0xSplits/centaur:704:rc:99").unwrap();
+        let trace = SessionTraceContext::new(&thread_key, None);
+
+        let line = input_line_with_session_context(&thread_key, &trace, r#"{"type":"user"}"#);
+        let value: Value = serde_json::from_str(&line).unwrap();
+
+        assert_eq!(value["session_context"]["platform"], "github");
+        assert_eq!(value["session_context"]["github"]["owner"], "0xSplits");
+        assert_eq!(value["session_context"]["github"]["repo"], "centaur");
+        assert_eq!(value["session_context"]["github"]["number"], 704);
+        assert_eq!(value["session_context"]["github"]["kind"], "pr");
+        assert_eq!(value["session_context"]["github"]["review_comment_id"], 99);
+    }
+
+    #[test]
     fn input_line_with_session_context_preserves_existing_session_context() {
         let thread_key = ThreadKey::parse("slack:T123:C123:1780000000.000000").unwrap();
         let trace = SessionTraceContext::new(&thread_key, None);
@@ -7853,6 +7889,26 @@ mod tests {
         let note = content[0]["text"].as_str().unwrap();
         assert!(note.contains("Linear"));
         assert!(note.contains("ISSUE"));
+        assert_eq!(content[1]["text"], "hi");
+    }
+
+    #[test]
+    fn input_line_prepends_github_chat_surface_note_to_user_content() {
+        let thread_key = ThreadKey::parse("github:0xSplits/centaur:issue:12").unwrap();
+        let trace = SessionTraceContext::new(&thread_key, None);
+
+        let line = input_line_with_session_context(
+            &thread_key,
+            &trace,
+            r#"{"type":"user","message":{"role":"user","content":[{"type":"text","text":"hi"}]}}"#,
+        );
+        let value: Value = serde_json::from_str(&line).unwrap();
+        let content = value["message"]["content"].as_array().unwrap();
+
+        assert_eq!(content.len(), 2);
+        let note = content[0]["text"].as_str().unwrap();
+        assert!(note.contains("GitHub"));
+        assert!(note.contains("0xSplits/centaur#12"));
         assert_eq!(content[1]["text"], "hi");
     }
 

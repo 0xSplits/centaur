@@ -469,6 +469,40 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn session_context_exposes_github_repo_number_and_review_comment() {
+        let pool =
+            PgPool::connect_lazy("postgres://postgres:postgres@localhost/centaur_test").unwrap();
+        let app = build_router_with_runtime(
+            PgSessionStore::new(pool),
+            SandboxRuntime::backend(Arc::new(TestBackend::default()), SandboxSpec::new("test")),
+        );
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/session/github%3A0xSplits%2Fcentaur%3A704%3Arc%3A99")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(body["thread_key"], "github:0xSplits/centaur:704:rc:99");
+        assert_eq!(body["platform"], "github");
+        assert_eq!(body["github"]["owner"], "0xSplits");
+        assert_eq!(body["github"]["repo"], "centaur");
+        assert_eq!(body["github"]["number"], 704);
+        assert_eq!(body["github"]["kind"], "pr");
+        assert_eq!(body["github"]["review_comment_id"], 99);
+        assert!(body.get("slack").is_none());
+        assert!(body.get("discord").is_none());
+        assert!(body.get("linear").is_none());
+    }
+
+    #[tokio::test]
     async fn session_context_omits_slack_for_non_slack_thread_key() {
         let pool =
             PgPool::connect_lazy("postgres://postgres:postgres@localhost/centaur_test").unwrap();

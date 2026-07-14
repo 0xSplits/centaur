@@ -60,7 +60,7 @@ use crate::{
     types::{
         AppendMessagesRequest, AppendMessagesResponse, CreateSessionRequest, CreateSessionResponse,
         DiscordThreadContext, EmitWorkflowEventRequest, EventsQuery, ExecuteSessionRequest,
-        ExecuteSessionResponse, InterruptSessionExecutionRequest,
+        ExecuteSessionResponse, GithubThreadContext, InterruptSessionExecutionRequest,
         InterruptSessionExecutionResponse, LinearThreadContext, ListWorkflowRunsQuery,
         OnHarnessConflict, SessionContextResponse, SessionSseEvent, SlackThreadContext,
         stream_error_sse,
@@ -469,7 +469,7 @@ async fn get_session_context(
         .map(ChatDestination::platform)
         .unwrap_or("unknown")
         .to_owned();
-    let (slack, discord, linear) = match destination {
+    let (slack, discord, linear, github) = match destination {
         Some(ChatDestination::Slack {
             channel_id,
             thread_ts,
@@ -478,6 +478,7 @@ async fn get_session_context(
                 channel_id,
                 thread_ts,
             }),
+            None,
             None,
             None,
         ),
@@ -493,6 +494,7 @@ async fn get_session_context(
                 thread_id,
             }),
             None,
+            None,
         ),
         Some(ChatDestination::Linear {
             issue_id,
@@ -506,8 +508,27 @@ async fn get_session_context(
                 comment_id,
                 agent_session_id,
             }),
+            None,
         ),
-        None => (None, None, None),
+        Some(ChatDestination::Github {
+            owner,
+            repo,
+            number,
+            kind,
+            review_comment_id,
+        }) => (
+            None,
+            None,
+            None,
+            Some(GithubThreadContext {
+                owner,
+                repo,
+                number,
+                kind: kind.as_str().to_owned(),
+                review_comment_id,
+            }),
+        ),
+        None => (None, None, None, None),
     };
     let title = match runtime.session_title(&thread_key).await {
         Ok(title) => title,
@@ -527,6 +548,7 @@ async fn get_session_context(
         slack,
         discord,
         linear,
+        github,
     }))
 }
 

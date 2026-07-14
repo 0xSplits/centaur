@@ -179,15 +179,45 @@ def current_linear_thread() -> dict[str, str]:
     return destination
 
 
-def current_chat_destination() -> dict[str, str]:
+def current_github_thread() -> dict[str, str | int]:
+    """Return the current GitHub destination.
+
+    ``{"owner": ..., "repo": ..., "number": ..., "kind": ..., "review_comment_id": ...}``
+    where ``kind`` is ``"issue"`` or ``"pr"`` and the optional
+    ``review_comment_id`` is omitted when the turn is not pinned to a PR
+    review-comment thread. Raises if the current thread is not a GitHub thread.
+    """
+    context = current_session_context()
+    github = context.get("github")
+    if (
+        not isinstance(github, dict)
+        or not github.get("owner")
+        or not github.get("repo")
+        or not github.get("number")
+    ):
+        raise RuntimeError(f"current thread is not a GitHub thread: {context.get('thread_key')!r}")
+    destination: dict[str, str | int] = {
+        "owner": str(github["owner"]),
+        "repo": str(github["repo"]),
+        "number": int(github["number"]),
+        "kind": str(github.get("kind") or "pr"),
+    }
+    if github.get("review_comment_id"):
+        destination["review_comment_id"] = int(github["review_comment_id"])
+    return destination
+
+
+def current_chat_destination() -> dict[str, str | int]:
     """Return the current chat surface in a platform-agnostic shape.
 
-    Always includes ``platform`` (``"slack"`` / ``"discord"`` / ``"linear"``)
-    plus that platform's destination ids (Slack: ``channel_id``/``thread_ts``;
-    Discord: ``guild_id``/``channel_id``/``thread_id``; Linear:
-    ``issue_id``/``comment_id``/``agent_session_id``). Prefer this over the
-    platform-specific helpers when writing tooling that should work on any chat
-    surface. Raises if the current thread is not a recognized chat surface.
+    Always includes ``platform`` (``"slack"`` / ``"discord"`` / ``"linear"`` /
+    ``"github"``) plus that platform's destination ids (Slack:
+    ``channel_id``/``thread_ts``; Discord: ``guild_id``/``channel_id``/``thread_id``;
+    Linear: ``issue_id``/``comment_id``/``agent_session_id``; GitHub:
+    ``owner``/``repo``/``number``/``kind``/``review_comment_id``). Prefer this
+    over the platform-specific helpers when writing tooling that should work on
+    any chat surface. Raises if the current thread is not a recognized chat
+    surface.
     """
     context = current_session_context()
     platform = context.get("platform")
@@ -197,6 +227,8 @@ def current_chat_destination() -> dict[str, str]:
         return {"platform": "discord", **current_discord_thread()}
     if platform == "linear":
         return {"platform": "linear", **current_linear_thread()}
+    if platform == "github":
+        return {"platform": "github", **current_github_thread()}
     raise RuntimeError(
         f"current thread is not a recognized chat surface: {context.get('thread_key')!r}"
     )

@@ -117,11 +117,12 @@ fn validate_thread_key(value: &str) -> Result<(), ThreadKeyError> {
 
 /// The chat surface a thread is delivered to, parsed from its thread key.
 ///
-/// Slack, Discord, and Linear all encode the destination — where a reply (and,
-/// where the surface supports it, an uploaded file) lands — directly in the key.
-/// Resolving it in one place lets the API session context, the per-turn context
-/// line the agent reads, and any caller that needs a posting destination share a
-/// single parser instead of each re-deriving the platform from the key shape.
+/// Slack, Discord, Linear, and GitHub all encode the destination — where a reply
+/// (and, where the surface supports it, an uploaded file) lands — directly in the
+/// key. Resolving it in one place lets the API session context, the per-turn
+/// context line the agent reads, and any caller that needs a posting destination
+/// share a single parser instead of each re-deriving the platform from the key
+/// shape.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ChatDestination {
     Slack {
@@ -141,16 +142,44 @@ pub enum ChatDestination {
         comment_id: Option<String>,
         agent_session_id: Option<String>,
     },
+    /// A GitHub issue or pull-request thread. The reply lands as a comment on
+    /// the issue/PR (pinned to `review_comment_id` when the turn came in on a
+    /// PR review-comment thread). Like Linear, GitHub has no file-upload
+    /// surface — comments are markdown.
+    Github {
+        owner: String,
+        repo: String,
+        number: u64,
+        kind: GithubThreadKind,
+        review_comment_id: Option<u64>,
+    },
+}
+
+/// Whether a GitHub thread maps to an issue or a pull request.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum GithubThreadKind {
+    Issue,
+    Pr,
+}
+
+impl GithubThreadKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Issue => "issue",
+            Self::Pr => "pr",
+        }
+    }
 }
 
 impl ChatDestination {
     /// The platform identifier surfaced to the agent (`slack` / `discord` /
-    /// `linear`).
+    /// `linear` / `github`).
     pub fn platform(&self) -> &'static str {
         match self {
             Self::Slack { .. } => "slack",
             Self::Discord { .. } => "discord",
             Self::Linear { .. } => "linear",
+            Self::Github { .. } => "github",
         }
     }
 
@@ -198,6 +227,26 @@ impl ChatDestination {
                      Linear replies are markdown comments with no file-upload surface; share artifacts inline or as a link.]"
                 )
             }
+            Self::Github {
+                owner,
+                repo,
+                number,
+                kind,
+                review_comment_id,
+            } => {
+                let subject = match kind {
+                    GithubThreadKind::Issue => "issue",
+                    GithubThreadKind::Pr => "pull request",
+                };
+                let review_comment = review_comment_id
+                    .map(|id| format!(" · review comment {id}"))
+                    .unwrap_or_default();
+                format!(
+                    "[chat surface: GitHub · {subject} {owner}/{repo}#{number}{review_comment}. \
+                     Centaur posts your reply as a comment on this GitHub thread automatically — do not repost it with `gh`. \
+                     GitHub replies are markdown comments with no file-upload surface; share artifacts inline or as a link.]"
+                )
+            }
         }
     }
 }
@@ -207,13 +256,43 @@ impl ThreadKey {
     /// a recognized platform destination.
     ///
     /// Returns `None` for keys that are not platform-addressable (e.g. `api:`
-    /// threads). The Slack arms are kept byte-for-byte compatible with the
-    /// historical session-context parser so existing Slack behavior is preserved;
-    /// Discord keys are `discord:<guild>:<channel>[:<thread>]`, and Linear keys
-    /// are `linear:<issue>[:c:<comment>][:s:<agent_session>]` (mirroring the
-    /// linearbot chat-SDK `encodeThreadId` shape).
+    /// threads, or githubbot's synthetic `github-review:` sessions). The Slack
+    /// arms are kept byte-for-byte compatible with the historical
+    /// session-context parser so existing Slack behavior is preserved; Discord
+    /// keys are `discord:<guild>:<channel>[:<thread>]`, Linear keys are
+    /// `linear:<issue>[:c:<comment>][:s:<agent_session>]` (mirroring the
+    /// linearbot chat-SDK `encodeThreadId` shape), and GitHub keys are
+    /// `github:<owner>/<repo>:<pr>[:rc:<review_comment>]` or
+    /// `github:<owner>/<repo>:issue:<issue>` (mirroring githubbot's
+    /// `parseGithubThreadKey`).
     pub fn chat_destination(&self) -> Option<ChatDestination> {
         let key = self.as_str();
+        if let Some(rest) = key.strip_prefix("github:") {
+            let (repo_path, thread) = rest.split_once(':')?;
+            let (owner, repo) = repo_path.split_once('/')?;
+            if owner.is_empty() || repo.is_empty() || repo.contains('/') {
+                return None;
+            }
+            let segments = thread.split(':').collect::<Vec<_>>();
+            let (kind, number, review_comment_id) = match segments.as_slice() {
+                ["issue", number] => (GithubThreadKind::Issue, *number, None),
+                [number] => (GithubThreadKind::Pr, *number, None),
+                [number, "rc", comment] => (GithubThreadKind::Pr, *number, Some(*comment)),
+                _ => return None,
+            };
+            let number = number.parse::<u64>().ok()?;
+            let review_comment_id = match review_comment_id {
+                Some(comment) => Some(comment.parse::<u64>().ok()?),
+                None => None,
+            };
+            return Some(ChatDestination::Github {
+                owner: owner.to_owned(),
+                repo: repo.to_owned(),
+                number,
+                kind,
+                review_comment_id,
+            });
+        }
         if let Some(rest) = key.strip_prefix("discord:") {
             let mut segments = rest.split(':').map(str::trim);
             let guild_id = segments.next().filter(|s| !s.is_empty())?;
@@ -464,7 +543,7 @@ pub fn empty_object() -> Value {
 mod tests {
     use std::str::FromStr;
 
-    use super::{ChatDestination, HarnessType, ThreadKey};
+    use super::{ChatDestination, GithubThreadKind, HarnessType, ThreadKey};
 
     #[test]
     fn chat_destination_resolves_slack_keys() {
@@ -598,6 +677,56 @@ mod tests {
     }
 
     #[test]
+    fn chat_destination_resolves_github_keys() {
+        // A bare number is a PR conversation thread.
+        let pr = ThreadKey::parse("github:0xSplits/centaur:704")
+            .unwrap()
+            .chat_destination()
+            .unwrap();
+        assert_eq!(
+            pr,
+            ChatDestination::Github {
+                owner: "0xSplits".to_owned(),
+                repo: "centaur".to_owned(),
+                number: 704,
+                kind: GithubThreadKind::Pr,
+                review_comment_id: None,
+            }
+        );
+        assert_eq!(pr.platform(), "github");
+
+        let issue = ThreadKey::parse("github:0xSplits/centaur:issue:12")
+            .unwrap()
+            .chat_destination()
+            .unwrap();
+        assert_eq!(
+            issue,
+            ChatDestination::Github {
+                owner: "0xSplits".to_owned(),
+                repo: "centaur".to_owned(),
+                number: 12,
+                kind: GithubThreadKind::Issue,
+                review_comment_id: None,
+            }
+        );
+
+        let review_comment = ThreadKey::parse("github:0xSplits/centaur:704:rc:99")
+            .unwrap()
+            .chat_destination()
+            .unwrap();
+        assert_eq!(
+            review_comment,
+            ChatDestination::Github {
+                owner: "0xSplits".to_owned(),
+                repo: "centaur".to_owned(),
+                number: 704,
+                kind: GithubThreadKind::Pr,
+                review_comment_id: Some(99),
+            }
+        );
+    }
+
+    #[test]
     fn chat_destination_is_none_for_unaddressable_keys() {
         // No channel id → not a postable Discord destination.
         assert!(
@@ -616,6 +745,27 @@ mod tests {
         );
         assert!(
             ThreadKey::parse("linear:ISSUE:x:Y")
+                .unwrap()
+                .chat_destination()
+                .is_none()
+        );
+        // A GitHub key without a numeric thread number, or with an unrecognized
+        // shape, is not addressable — and githubbot's synthetic review sessions
+        // deliberately stay unaddressable, matching its own parser.
+        assert!(
+            ThreadKey::parse("github:0xSplits/centaur:abc")
+                .unwrap()
+                .chat_destination()
+                .is_none()
+        );
+        assert!(
+            ThreadKey::parse("github:no-repo-part:704")
+                .unwrap()
+                .chat_destination()
+                .is_none()
+        );
+        assert!(
+            ThreadKey::parse("github-review:0xSplits/centaur:704")
                 .unwrap()
                 .chat_destination()
                 .is_none()
@@ -660,6 +810,24 @@ mod tests {
         // Linear has no upload command, so the line must not promise a
         // `linear upload` analog of the Slack/Discord upload tools.
         assert!(!linear.contains("linear upload"));
+
+        let github = ThreadKey::parse("github:0xSplits/centaur:704:rc:99")
+            .unwrap()
+            .chat_destination()
+            .unwrap()
+            .context_line();
+        assert!(github.contains("GitHub"));
+        assert!(github.contains("pull request 0xSplits/centaur#704"));
+        assert!(github.contains("review comment 99"));
+        // GitHub has no upload command either.
+        assert!(!github.contains("github upload"));
+
+        let github_issue = ThreadKey::parse("github:0xSplits/centaur:issue:12")
+            .unwrap()
+            .chat_destination()
+            .unwrap()
+            .context_line();
+        assert!(github_issue.contains("issue 0xSplits/centaur#12"));
     }
 
     #[test]
