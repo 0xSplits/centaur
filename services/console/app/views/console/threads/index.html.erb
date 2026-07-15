@@ -9,13 +9,15 @@
 
 <div class="flex min-h-0 flex-1 overflow-hidden bg-ink-950/15">
   <% if @thread_panels.size > 1 %>
+    <%# On phones the multi-pane grid can't fit side by side, so it stacks into
+        a single scrolling column; the md+ tracks below restore the split grid. %>
     <% grid_classes =
          case @thread_panels.size
-         when 2 then "grid-cols-2"
-         when 3 then "grid-cols-3"
-         else "grid-cols-2 grid-rows-2"
+         when 2 then "grid-cols-1 md:grid-cols-2"
+         when 3 then "grid-cols-1 md:grid-cols-3"
+         else "grid-cols-1 md:grid-cols-2 md:grid-rows-2"
          end %>
-    <section class="grid min-h-0 min-w-0 flex-1 gap-3 overflow-hidden pb-3 <%= grid_classes %>">
+    <section class="grid min-h-0 min-w-0 flex-1 gap-3 overflow-y-auto overflow-x-hidden pb-3 md:overflow-hidden <%= grid_classes %>">
       <% @thread_panels.each do |panel| %>
         <%= render "console/threads/thread_panel", panel: panel, panels: @thread_panels %>
       <% end %>

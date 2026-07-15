@@ -225,6 +225,8 @@ module ApplicationHelper
         classes,
         "M9.75 10.5a3.75 3.75 0 1 1 7.5 0 3.75 3.75 0 0 1-7.5 0ZM4.5 18.75a6.75 6.75 0 0 1 13.5 0M18 8.25a3 3 0 0 1 0 6M19.5 18.75a5.25 5.25 0 0 0-2.25-4.307"
       )
+    when "menu"
+      outline_icon(classes, "M3.75 6.75h16.5M3.75 12h16.5M3.75 17.25h16.5")
     end
   end
 
