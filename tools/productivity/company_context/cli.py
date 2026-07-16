@@ -15,7 +15,34 @@ from .client import CompanyContextClient
 
 load_dotenv()
 
-app = typer.Typer(name="company_context", help="Search indexed company history.")
+app = typer.Typer(
+    name="company_context",
+    help="Search indexed company history, Slack DMs, Google Docs, and Granola notes.",
+)
+
+
+@app.command("health")
+def health():
+    """Assert company-context connectivity and auth with a safe read-only check."""
+    from .client import _client
+
+    client = _client()
+    try:
+        details = client.latest_date()
+        if isinstance(details, dict) and details.get("status") == "error":
+            raise RuntimeError(str(details.get("error") or "company-context health check failed"))
+        payload = {"ok": True, "tool": "company-context", "error": None, "details": details}
+    except Exception as exc:
+        payload = {"ok": False, "tool": "company-context", "error": str(exc), "details": {}}
+        print(json.dumps(payload, indent=2, ensure_ascii=False, default=str))
+        raise typer.Exit(1) from exc
+    finally:
+        close = getattr(client, "close", None)
+        if callable(close):
+            close()
+    print(json.dumps(payload, indent=2, ensure_ascii=False, default=str))
+
+
 console = Console()
 
 
@@ -45,7 +72,11 @@ def _add_result_rows(table: Table, results: list[dict[str, Any]]) -> None:
 def search(
     query: str = typer.Argument(..., help="Search query."),
     limit: int = typer.Option(10, "--limit", "-n", help="Max results."),
-    source: str | None = typer.Option(None, "--source", help="Filter by source."),
+    source: str | None = typer.Option(
+        None,
+        "--source",
+        help="Filter by source. Use 'docs' for Google Docs or 'granola' for Granola notes.",
+    ),
     source_type: str | None = typer.Option(None, "--source-type", help="Filter by source type."),
     occurred_after: str | None = typer.Option(
         None, "--after", help="Only results on/after this time."
@@ -55,7 +86,7 @@ def search(
     ),
     json_output: bool = typer.Option(False, "--json", help="Output raw JSON."),
 ) -> None:
-    """Search indexed company context documents."""
+    """Search indexed company context, including Google Docs and Granola notes."""
     result = CompanyContextClient().search(
         query=query,
         limit=limit,
@@ -177,7 +208,11 @@ def search_dms(
 @app.command("list")
 def list_documents(
     limit: int = typer.Option(10, "--limit", "-n", help="Max documents."),
-    source: str | None = typer.Option(None, "--source", help="Filter by source."),
+    source: str | None = typer.Option(
+        None,
+        "--source",
+        help="Filter by source. Use 'docs' for Google Docs or 'granola' for Granola notes.",
+    ),
     source_type: str | None = typer.Option(None, "--source-type", help="Filter by source type."),
     occurred_after: str | None = typer.Option(
         None, "--after", help="Only documents on/after this time."
@@ -187,7 +222,7 @@ def list_documents(
     ),
     json_output: bool = typer.Option(False, "--json", help="Output raw JSON."),
 ) -> None:
-    """List indexed company context documents."""
+    """List indexed company context documents, including Google Docs and Granola notes."""
     result = CompanyContextClient().list_documents(
         limit=limit,
         source=source,
@@ -228,7 +263,7 @@ def read_document(
     ),
     json_output: bool = typer.Option(False, "--json", help="Output raw JSON."),
 ) -> None:
-    """Read a company context document."""
+    """Read a company context document returned by search, including Granola notes."""
     result = CompanyContextClient().read_document(
         document_id=document_id,
         max_chars=max_chars,
@@ -253,10 +288,14 @@ def read_document(
 
 @app.command("latest-date")
 def latest_date(
-    source: str | None = typer.Option(None, "--source", help="Filter by source."),
+    source: str | None = typer.Option(
+        None,
+        "--source",
+        help="Filter by source. Use 'docs' for Google Docs or 'granola' for Granola notes.",
+    ),
     source_type: str | None = typer.Option(None, "--source-type", help="Filter by source type."),
 ) -> None:
-    """Show the latest indexed timestamp."""
+    """Show the latest indexed timestamp as JSON."""
     result = CompanyContextClient().latest_date(source=source, source_type=source_type)
     _require_ok(result)
     _print_json(result)

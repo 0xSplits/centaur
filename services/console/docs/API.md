@@ -1,6 +1,6 @@
 # iron-control API
 
-`iron-control` exposes a JSON API under `/api/v1`. Every resource endpoint requires API key authentication. The single exception is `POST /api/v1/proxy/sync`, which `iron-proxy` instances call with a proxy bearer token.
+`iron-control` exposes a JSON API under `/api/v1`. Resource endpoints require API key authentication. `POST /api/v1/proxy/sync` uses proxy bearer authentication, and sandbox read endpoints use the sandbox entitlement JWT injected by `iron-proxy`.
 
 - [Authentication](#authentication)
 - [Conventions](#conventions)
@@ -913,10 +913,10 @@ Password-grant providers use the same endpoint with `grant: "password"`:
 {
   "data": {
     "namespace": "default",
-    "foreign_id": "alphasense",
-    "name": "AlphaSense",
+    "foreign_id": "password-provider",
+    "name": "Password Provider",
     "grant": "password",
-    "token_endpoint": "https://api.alpha-sense.com/auth",
+    "token_endpoint": "https://auth.example.com/token",
     "client_id": "client-id",
     "client_secret": "client-secret",
     "username": "user@example.com",
@@ -926,7 +926,7 @@ Password-grant providers use the same endpoint with `grant: "password"`:
 }
 ```
 
-For AlphaSense API calls, grant static secrets alongside the broker token so the proxy also injects the required `x-api-key` and `clientid` headers on `api.alpha-sense.com`. The broker credential itself only supplies the current bearer token through a `token_broker` source.
+For API calls that require static headers alongside the broker token, grant static secrets with the broker credential so the proxy also injects headers such as `x-api-key` and `clientid`. The broker credential itself only supplies the current bearer token through a `token_broker` source.
 
 Preqin Operational API credentials use the provider-specific `preqin` grant. iron-control submits Preqin's multipart `username` and `apikey` form, stores any returned `refresh_token`, and later uses Preqin's refresh endpoint when possible:
 
@@ -1062,6 +1062,53 @@ Returns `201`. The `client_secret` is never echoed back:
 | `PUT`/`PATCH` | `/api/v1/oauth_apps/:id` | [Upsert](#upsert-put--patch) by OID or slug. Omitted fields are preserved; `client_secret` is only changed when supplied. |
 | `DELETE` | `/api/v1/oauth_apps/:id` | Delete. Returns `204`; `404` if missing. Returns `409` while the app still has minted credentials (delete or unlink them first). |
 
+### Sandbox Start URLs
+
+`GET /api/v1/sandbox/oauth_apps`
+
+Returns enabled OAuth apps and the console URLs a sandbox user can open to start consent. Authenticate with the same sandbox entitlement JWT as `GET /api/v1/sandbox/permissions`. The token signature, issuer, audience, and expiry are verified. Proxy and principal claims are not checked because these URLs are not sensitive.
+
+```json
+{
+  "data": [
+    {
+      "id": "oap_...",
+      "slug": "google",
+      "description": "Gmail",
+      "labels": {},
+      "provider": "google",
+      "allowed_scopes": ["https://www.googleapis.com/auth/gmail.readonly"],
+      "start_url": "https://<iron-control>/oauth/google/start"
+    }
+  ]
+}
+```
+
+### Sandbox OAuth Credential Metadata
+
+`GET /api/v1/sandbox/permissions`
+
+The sandbox permissions response includes an `oauth_credentials` array with non-secret metadata for OAuth-flow credentials currently granted to the sandbox principal. Use it to confirm that a user completed consent for the expected app and personal email.
+
+```json
+{
+  "data": {
+    "oauth_credentials": [
+      {
+        "id": "bcr_...",
+        "oauth_app_id": "oap_...",
+        "slug": "google",
+        "provider": "google",
+        "provider_email": "person@example.com",
+        "provider_subject": "google-subject",
+        "status": "live",
+        "scopes": ["https://www.googleapis.com/auth/gmail.readonly"]
+      }
+    ]
+  }
+}
+```
+
 ## OAuth consent flow
 
 The consent flow turns a team member's OAuth consent into a managed broker credential. It runs on iron-control's own domain and is deliberately unauthenticated: the member reaches it with a single well-known link keyed by the app's `slug`. There is no external app to integrate with, so the start endpoint takes no `user` or `return_to`: after consent the member lands on an iron-control result page, and the credential's `external_user_key` is generated automatically. Safety comes from the consent itself (a credential is only created after a successful code exchange) and upsert-on-reconsent (re-consenting for the same provider account updates the existing credential instead of creating a new one).
@@ -1107,7 +1154,7 @@ A tampered, expired, or missing flow state or cookie renders an error page with 
 | Google   | `google`         |
 | Slack    | `slack`          |
 
-Slack OAuth apps should have token rotation enabled so the callback receives a refresh token for the broker refresh loop.
+Slack OAuth apps may use token rotation or long-lived tokens. When token rotation is enabled, the callback stores the returned refresh token and the broker refresh loop keeps the access token fresh. When Slack returns a long-lived token without a refresh token or expiry, the credential is stored without scheduling broker refresh.
 Slack OAuth apps should use normal Slack API scopes such as `channels:history`, not Sign in with Slack scopes such as `openid`, `email`, or `profile`.
 
 ## Principals
