@@ -29,7 +29,7 @@ use centaur_sandbox_agent_k8s::{
 use centaur_sandbox_core::{Mount, MountKind, SandboxSpec};
 use centaur_sandbox_local::LocalSandboxBackend;
 use centaur_sandbox_manager::{SandboxReaperConfig, WarmPoolConfig};
-use centaur_session_core::HarnessType;
+use centaur_session_core::{HarnessType, SandboxRepoCacheAccess};
 use centaur_session_runtime::{
     PersonaRegistry, SandboxCapacityConfig, SandboxWorkloadMode, SessionSandboxCleanupConfig,
 };
@@ -38,6 +38,12 @@ use clap::{Args as ClapArgs, Parser, ValueEnum};
 use tracing::{info, warn};
 
 use crate::{ServerError, activity_summary::ActivitySummaryConfig};
+
+/// clap value parser for `SESSION_SANDBOX_DEFAULT_REPO_CACHE_ACCESS`.
+fn parse_repo_cache_access(value: &str) -> Result<SandboxRepoCacheAccess, String> {
+    SandboxRepoCacheAccess::parse(value)
+        .ok_or_else(|| format!("invalid repo-cache access `{value}` (expected: none, public, all)"))
+}
 
 const SANDBOX_REPOS_MOUNT_PATH: &str = "/home/agent/github";
 const GITHUB_TOKEN_ENV: &str = "GITHUB_TOKEN";
@@ -86,6 +92,10 @@ impl Args {
 
     pub(crate) fn sandbox_capacity_config(&self) -> Option<SandboxCapacityConfig> {
         self.sandbox.sandbox_capacity_config()
+    }
+
+    pub(crate) fn default_repo_cache_access(&self) -> SandboxRepoCacheAccess {
+        self.sandbox.default_repo_cache_access()
     }
 
     pub(crate) fn sandbox_reaper_config(&self) -> SandboxReaperConfig {
@@ -562,6 +572,19 @@ struct SandboxArgs {
         value_parser = clap::value_parser!(u64).range(1..)
     )]
     warm_pool_replenish_interval_secs: u64,
+    /// Repo-cache access for session sandboxes whose iron-control principal has
+    /// no (or an unrecognized) `centaur.sandbox_repo_cache` label. `none`
+    /// (default) preserves upstream opt-in behavior; single-tenant deployments
+    /// set `all` so every session gets the repo-cache overlay + skills. A
+    /// principal may still override per-session via the label. One of: `none`,
+    /// `public`, `all`.
+    #[arg(
+        long = "session-sandbox-default-repo-cache-access",
+        env = "SESSION_SANDBOX_DEFAULT_REPO_CACHE_ACCESS",
+        default_value = "none",
+        value_parser = parse_repo_cache_access
+    )]
+    default_repo_cache_access: SandboxRepoCacheAccess,
     /// Hard cap on observed running-like sandboxes. 0 disables capacity
     /// admission.
     #[arg(
@@ -1239,6 +1262,10 @@ impl SandboxArgs {
             max_running: self.sandbox_running_limit,
             hot_idle_grace: Duration::from_secs(self.sandbox_hot_idle_grace_secs),
         })
+    }
+
+    fn default_repo_cache_access(&self) -> SandboxRepoCacheAccess {
+        self.default_repo_cache_access.clone()
     }
 
     fn sandbox_reaper_config(&self) -> SandboxReaperConfig {

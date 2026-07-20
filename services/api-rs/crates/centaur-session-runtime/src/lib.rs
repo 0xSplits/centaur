@@ -109,6 +109,11 @@ pub struct SessionRuntime {
     session_title_in_flight: SessionTitleThreadSet,
     session_title_rerun_requested: SessionTitleThreadSet,
     capacity: Option<Arc<SandboxCapacityController>>,
+    /// Repo-cache access applied to session sandboxes whose iron-control
+    /// principal lacks (or carries an unrecognized) `centaur.sandbox_repo_cache`
+    /// label. Defaults to `None` (upstream opt-in); set via
+    /// `SESSION_SANDBOX_DEFAULT_REPO_CACHE_ACCESS`.
+    default_repo_cache_access: SessionRepoCacheAccess,
     stdout_owner_id: String,
     /// Set once a shutdown handoff begins; fences new stdout-owner claims
     /// so an execution cannot start on a control plane that is about to
@@ -805,9 +810,18 @@ impl SessionRuntime {
             session_title_in_flight: Arc::new(DashSet::new()),
             session_title_rerun_requested: Arc::new(DashSet::new()),
             capacity: None,
+            default_repo_cache_access: SessionRepoCacheAccess::None,
             stdout_owner_id: format!("api-rs-{}", uuid::Uuid::new_v4().simple()),
             shutting_down: Arc::new(AtomicBool::new(false)),
         }
+    }
+
+    /// Sets the repo-cache access used for session sandboxes whose iron-control
+    /// principal does not carry an explicit `centaur.sandbox_repo_cache` label.
+    #[must_use]
+    pub fn with_default_repo_cache_access(mut self, access: SessionRepoCacheAccess) -> Self {
+        self.default_repo_cache_access = access;
+        self
     }
 
     pub fn with_session_title_generator<F, Fut>(mut self, generator: F) -> Self
@@ -1360,7 +1374,10 @@ impl SessionRuntime {
                     let principal = registrar
                         .register_session(thread_key.as_str(), Some(&session_metadata))
                         .await?;
-                    let desired_capabilities = sandbox_capabilities_from_principal(&principal);
+                    let desired_capabilities = sandbox_capabilities_from_principal(
+                        &principal,
+                        self.default_repo_cache_access.clone(),
+                    );
                     (Some(principal), desired_capabilities)
                 } else {
                     (None, SessionSandboxCapabilities::default_enabled())
@@ -2706,7 +2723,10 @@ impl SessionRuntime {
             return Ok(SessionSandboxCapabilities::default_enabled());
         };
         let principal = registrar.get_principal(principal_id).await?;
-        Ok(sandbox_capabilities_from_principal(&principal))
+        Ok(sandbox_capabilities_from_principal(
+            &principal,
+            self.default_repo_cache_access.clone(),
+        ))
     }
 
     async fn record_sandbox_ready(&self, observation: SandboxReadyObservation<'_>) {
@@ -5472,6 +5492,7 @@ fn sandbox_capabilities_match(
 
 fn sandbox_repo_cache_access_from_principal(
     principal: &centaur_iron_control::Principal,
+    default_access: SessionRepoCacheAccess,
 ) -> SessionRepoCacheAccess {
     match principal
         .labels
@@ -5480,16 +5501,22 @@ fn sandbox_repo_cache_access_from_principal(
     {
         Some(value) if value == "all" => SessionRepoCacheAccess::All,
         Some(value) if value == "public" => SessionRepoCacheAccess::Public,
-        Some(_) => SessionRepoCacheAccess::None,
-        None => SessionRepoCacheAccess::None,
+        Some(value) if value == "none" => SessionRepoCacheAccess::None,
+        // Absent (or unrecognized) label: fall back to the deployment default
+        // from `SESSION_SANDBOX_DEFAULT_REPO_CACHE_ACCESS`. Upstream keeps this
+        // `None` (repo-cache is opt-in per principal); single-tenant
+        // deployments set `all` so every session gets the repo-cache-backed
+        // overlay + skills instead of a bare sandbox.
+        Some(_) | None => default_access,
     }
 }
 
 fn sandbox_capabilities_from_principal(
     principal: &centaur_iron_control::Principal,
+    default_repo_cache_access: SessionRepoCacheAccess,
 ) -> SessionSandboxCapabilities {
     SessionSandboxCapabilities {
-        repo_cache: sandbox_repo_cache_access_from_principal(principal),
+        repo_cache: sandbox_repo_cache_access_from_principal(principal, default_repo_cache_access),
         observability_enabled: principal.sandbox_observability_enabled,
         api_server_enabled: principal.sandbox_api_server_enabled,
     }
@@ -6664,41 +6691,88 @@ mod tests {
 
     #[test]
     fn sandbox_repo_cache_label_controls_access() {
+        // With the default access left at `None` (upstream behavior), an absent
+        // or unrecognized label resolves to `None`.
         assert_eq!(
-            sandbox_repo_cache_access_from_principal(&test_principal(
-                std::collections::BTreeMap::new()
-            )),
+            sandbox_repo_cache_access_from_principal(
+                &test_principal(std::collections::BTreeMap::new()),
+                SessionRepoCacheAccess::None,
+            ),
             SessionRepoCacheAccess::None
         );
         for value in ["none", "private", "bogus"] {
             assert_eq!(
-                sandbox_repo_cache_access_from_principal(&test_principal(
-                    std::collections::BTreeMap::from([(
+                sandbox_repo_cache_access_from_principal(
+                    &test_principal(std::collections::BTreeMap::from([(
                         SANDBOX_REPO_CACHE_LABEL.to_owned(),
                         value.to_owned(),
-                    )])
-                )),
+                    )])),
+                    SessionRepoCacheAccess::None,
+                ),
                 SessionRepoCacheAccess::None
             );
         }
         assert_eq!(
-            sandbox_repo_cache_access_from_principal(&test_principal(
-                std::collections::BTreeMap::from([(
+            sandbox_repo_cache_access_from_principal(
+                &test_principal(std::collections::BTreeMap::from([(
                     SANDBOX_REPO_CACHE_LABEL.to_owned(),
                     "public".to_owned(),
-                )])
-            )),
+                )])),
+                SessionRepoCacheAccess::None,
+            ),
             SessionRepoCacheAccess::Public
         );
         assert_eq!(
-            sandbox_repo_cache_access_from_principal(&test_principal(
-                std::collections::BTreeMap::from([(
+            sandbox_repo_cache_access_from_principal(
+                &test_principal(std::collections::BTreeMap::from([(
                     SANDBOX_REPO_CACHE_LABEL.to_owned(),
                     "all".to_owned(),
-                )])
-            )),
+                )])),
+                SessionRepoCacheAccess::None,
+            ),
             SessionRepoCacheAccess::All
         );
+    }
+
+    #[test]
+    fn absent_or_unknown_label_falls_back_to_configured_default() {
+        // Absent label uses the configured default...
+        assert_eq!(
+            sandbox_repo_cache_access_from_principal(
+                &test_principal(std::collections::BTreeMap::new()),
+                SessionRepoCacheAccess::All,
+            ),
+            SessionRepoCacheAccess::All
+        );
+        // ...as does an unrecognized value.
+        assert_eq!(
+            sandbox_repo_cache_access_from_principal(
+                &test_principal(std::collections::BTreeMap::from([(
+                    SANDBOX_REPO_CACHE_LABEL.to_owned(),
+                    "bogus".to_owned(),
+                )])),
+                SessionRepoCacheAccess::All,
+            ),
+            SessionRepoCacheAccess::All
+        );
+        // An explicit, recognized label always wins over the default, including
+        // an explicit opt-out to `none`.
+        for (label, expected) in [
+            ("none", SessionRepoCacheAccess::None),
+            ("public", SessionRepoCacheAccess::Public),
+            ("all", SessionRepoCacheAccess::All),
+        ] {
+            assert_eq!(
+                sandbox_repo_cache_access_from_principal(
+                    &test_principal(std::collections::BTreeMap::from([(
+                        SANDBOX_REPO_CACHE_LABEL.to_owned(),
+                        label.to_owned(),
+                    )])),
+                    SessionRepoCacheAccess::All,
+                ),
+                expected
+            );
+        }
     }
 
     #[test]
