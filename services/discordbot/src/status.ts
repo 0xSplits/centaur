@@ -114,7 +114,9 @@ export async function collectStatus(input: {
                 e.created_at,
                 extract(epoch FROM (e.completed_at - e.started_at)) AS duration_seconds,
                 e.metadata ->> 'user_name' AS user_name,
-                coalesce(s.title, s.metadata ->> 'discord_conversation_name') AS title
+                coalesce(s.title, s.metadata ->> 'discord_conversation_name',
+                         s.metadata ->> 'linear_conversation_name',
+                         s.metadata ->> 'slack_conversation_name') AS title
          FROM session_executions e
          LEFT JOIN sessions s ON s.thread_key = e.thread_key
          ORDER BY e.created_at DESC
@@ -132,7 +134,9 @@ export async function collectStatus(input: {
         `SELECT e.thread_key, e.status, '' AS error, e.created_at,
                 NULL AS duration_seconds,
                 e.metadata ->> 'user_name' AS user_name,
-                coalesce(s.title, s.metadata ->> 'discord_conversation_name') AS title
+                coalesce(s.title, s.metadata ->> 'discord_conversation_name',
+                         s.metadata ->> 'linear_conversation_name',
+                         s.metadata ->> 'slack_conversation_name') AS title
          FROM session_executions e
          LEFT JOIN sessions s ON s.thread_key = e.thread_key
          WHERE e.status IN ('queued', 'running')
