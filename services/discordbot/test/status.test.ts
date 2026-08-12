@@ -208,8 +208,13 @@ describe("formatStatus", () => {
     expect(text).toContain("24h: 41 ok · 2 FAIL");
     // Column headings above the turn table.
     expect(text).toMatch(/THREAD\s+WHO\s+AGE\s+TOOK/);
-    // 7-day histogram: full-width bar on the busiest day, "-" for zero
-    // failures, zero-run days barless, and a failure-rate stat line.
+    // 7-day histogram in its OWN code block, after the live view: full-width
+    // bar on the busiest day, "-" for zero failures, zero-run days barless,
+    // and a failure-rate stat line.
+    expect(text.split("```")).toHaveLength(5);
+    expect(text.indexOf("LAST 7 DAYS")).toBeGreaterThan(
+      text.indexOf("sandboxes:"),
+    );
     expect(text).toMatch(/LAST 7 DAYS\s+RUNS FAIL/);
     expect(text).toMatch(/Tue {2}█{16}\s+40\s+3/);
     expect(text).toMatch(/Wed {2}█+\s+20\s+-/);

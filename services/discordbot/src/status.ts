@@ -260,32 +260,6 @@ export function formatStatus(report: StatusReport): string {
     lines.push("");
   }
 
-  // 7-day histogram: the bar encodes ONE measure (runs); failures get their
-  // own labeled column rather than a second scale or color-alone marking, and
-  // the failure rate is a plain stat line.
-  const week = report.daily;
-  const totalRuns = week.reduce((sum, day) => sum + day.runs, 0);
-  if (totalRuns > 0) {
-    const totalFailed = week.reduce((sum, day) => sum + day.failed, 0);
-    const maxRuns = Math.max(...week.map((day) => day.runs));
-    lines.push(`     ${"LAST 7 DAYS".padEnd(BAR_WIDTH + 1)}RUNS FAIL`);
-    for (const day of week) {
-      const bar = "█".repeat(
-        day.runs === 0 ? 0 : Math.max(1, Math.round((day.runs / maxRuns) * BAR_WIDTH)),
-      );
-      const fail = day.failed > 0 ? String(day.failed) : "-";
-      lines.push(
-        `${weekdayLabel(day.day)}  ${bar.padEnd(BAR_WIDTH + 1)}` +
-          `${String(day.runs).padStart(4)} ${fail.padStart(4)}`,
-      );
-    }
-    const rate = totalRuns > 0 ? (totalFailed / totalRuns) * 100 : 0;
-    lines.push(
-      `7d: ${totalRuns} runs · ${totalFailed} failed (${rate.toFixed(1)}%)`,
-    );
-    lines.push("");
-  }
-
   const tableRow = (
     tag: string,
     thread: string,
@@ -348,14 +322,49 @@ export function formatStatus(report: StatusReport): string {
     lines.push("! session database unreachable — turn history unavailable");
   }
 
-  if (lines.length === 0) return header;
+  // 7-day histogram, in its OWN code block below the live view: the bar
+  // encodes ONE measure (runs); failures get their own labeled column rather
+  // than a second scale or color-alone marking; the failure rate is a plain
+  // stat line.
+  const histogramLines: string[] = [];
+  const week = report.daily;
+  const totalRuns = week.reduce((sum, day) => sum + day.runs, 0);
+  if (totalRuns > 0) {
+    const totalFailed = week.reduce((sum, day) => sum + day.failed, 0);
+    const maxRuns = Math.max(...week.map((day) => day.runs));
+    histogramLines.push(`     ${"LAST 7 DAYS".padEnd(BAR_WIDTH + 1)}RUNS FAIL`);
+    for (const day of week) {
+      const bar = "█".repeat(
+        day.runs === 0
+          ? 0
+          : Math.max(1, Math.round((day.runs / maxRuns) * BAR_WIDTH)),
+      );
+      const fail = day.failed > 0 ? String(day.failed) : "-";
+      histogramLines.push(
+        `${weekdayLabel(day.day)}  ${bar.padEnd(BAR_WIDTH + 1)}` +
+          `${String(day.runs).padStart(4)} ${fail.padStart(4)}`,
+      );
+    }
+    const rate = (totalFailed / totalRuns) * 100;
+    histogramLines.push(
+      `7d: ${totalRuns} runs · ${totalFailed} failed (${rate.toFixed(1)}%)`,
+    );
+  }
+  const histogram = histogramLines.join("\n");
+  const histogramBlock = histogram ? `\n\`\`\`\n${histogram}\n\`\`\`` : "";
+
+  if (lines.length === 0 && !histogramBlock) return header;
   const body = lines.join("\n");
-  const budget = STATUS_MAX_CHARS - header.length - 20;
+  // The histogram block is small and fixed-size; give the live view whatever
+  // budget remains under Discord's cap.
+  const budget =
+    STATUS_MAX_CHARS - header.length - histogramBlock.length - 20;
   const bounded =
     body.length <= budget
       ? body
       : `${sliceSurrogateSafe(body, budget - 12).trimEnd()}\n[truncated]`;
-  return `${header}\n\`\`\`\n${bounded}\n\`\`\``;
+  const liveBlock = lines.length > 0 ? `\n\`\`\`\n${bounded}\n\`\`\`` : "";
+  return `${header}${liveBlock}${histogramBlock}`;
 }
 
 /**
