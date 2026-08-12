@@ -60,6 +60,8 @@ function fullDb(): StatusDb {
           error: "",
           status: "running",
           thread_key: "discord:1:2:3",
+          title: "fix the deploy pipeline",
+          user_name: "oliver",
         },
       ];
     }
@@ -71,6 +73,8 @@ function fullDb(): StatusDb {
           error: "",
           status: "completed",
           thread_key: "github-manage:0xSplits/splits-teams:1799",
+          title: null,
+          user_name: "0xdiid",
         },
         {
           created_at: new Date(NOW - 1_900_000),
@@ -78,6 +82,8 @@ function fullDb(): StatusDb {
           error: "sandbox spawn timeout after 120s",
           status: "failed",
           thread_key: "discord:1:2:9",
+          title: null,
+          user_name: "jaan",
         },
       ];
     }
@@ -184,14 +190,17 @@ describe("formatStatus", () => {
     expect(text.startsWith("**gerard status** · api-rs ✅")).toBe(true);
     expect(text).toContain("```");
     expect(text).toContain("24h: 41 ok · 2 FAIL");
-    // In-flight row first, no duration yet.
+    // Column headings above the turn table.
+    expect(text).toMatch(/THREAD\s+WHO\s+AGE\s+TOOK/);
+    // In-flight row first: session title, requester, no duration yet.
     const lines = text.split("\n");
     const runLine = lines.find((line) => line.startsWith("run"));
-    expect(runLine).toContain("discord 1:2:3");
+    expect(runLine).toContain("fix the deploy pipeline");
+    expect(runLine).toContain("oliver");
     expect(runLine?.trimEnd().endsWith("-")).toBe(true);
-    // Settled rows keep the platform on over-wide keys and carry age+duration.
-    expect(text).toContain("github-manage …");
-    expect(text).toMatch(/ok\s+github-manage .*\s5m\s+1m/);
+    // Untitled management turn falls back to the friendly PR label.
+    expect(text).toContain("GH PR splits-teams#1799");
+    expect(text).toMatch(/ok\s+GH PR splits-teams#1799\s+0xdiid\s+5m\s+1m/);
     // Errors land on their own indented line.
     expect(text).toContain("└ sandbox spawn timeout");
     expect(text).toContain("sandboxes: 1 active · warm: 2 ready");
@@ -207,13 +216,18 @@ describe("formatStatus", () => {
         error: "",
         status: "completed",
         threadKey: `discord:${"9".repeat(60)}`,
+        title: "",
+        who: "someone-with-a-long-name",
       },
     ];
     const text = formatStatus(report);
     const row = text.split("\n").find((line) => line.startsWith("ok"));
     expect(row).toBeDefined();
-    expect(row).toContain("discord …");
-    expect(row?.length ?? 0).toBeLessThanOrEqual(50);
+    // Middle ellipsis keeps the platform head and the id tail.
+    expect(row).toContain("Discord 9");
+    expect(row).toContain("…");
+    expect(row).toContain("someone…");
+    expect(row?.length ?? 0).toBeLessThanOrEqual(52);
   });
 
   it("marks a down api-rs and unreachable DB honestly", () => {
@@ -235,6 +249,8 @@ describe("formatStatus", () => {
       error: "x".repeat(150),
       status: "failed",
       threadKey: `discord:${"y".repeat(80)}:${index}`,
+      title: "",
+      who: "someone",
     }));
     const text = formatStatus(report);
     expect(text.length).toBeLessThanOrEqual(2000);

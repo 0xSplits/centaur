@@ -38,6 +38,10 @@ export type ExecutionRow = {
   error: string;
   status: string;
   threadKey: string;
+  /** Session title (the conversation name the bots set), when present. */
+  title: string;
+  /** Display name of whoever triggered the turn, when recorded. */
+  who: string;
 };
 
 export type StatusReport = {
@@ -95,6 +99,8 @@ export async function collectStatus(input: {
     error: String(row.error ?? "").slice(0, ERROR_SNIPPET_CHARS),
     status: String(row.status ?? "unknown"),
     threadKey: String(row.thread_key ?? "?"),
+    title: String(row.title ?? ""),
+    who: String(row.user_name ?? ""),
   });
 
   const [apiHealthy, apiReady, recent, tally, inFlight, sandboxes, warm] =
@@ -103,11 +109,15 @@ export async function collectStatus(input: {
       probe("/readyz"),
       query(
         "recent turns",
-        `SELECT thread_key, status, left(coalesce(error, ''), ${ERROR_SNIPPET_CHARS}) AS error,
-                created_at,
-                extract(epoch FROM (completed_at - started_at)) AS duration_seconds
-         FROM session_executions
-         ORDER BY created_at DESC
+        `SELECT e.thread_key, e.status,
+                left(coalesce(e.error, ''), ${ERROR_SNIPPET_CHARS}) AS error,
+                e.created_at,
+                extract(epoch FROM (e.completed_at - e.started_at)) AS duration_seconds,
+                e.metadata ->> 'user_name' AS user_name,
+                s.title
+         FROM session_executions e
+         LEFT JOIN sessions s ON s.thread_key = e.thread_key
+         ORDER BY e.created_at DESC
          LIMIT 8`,
       ),
       query(
@@ -119,11 +129,14 @@ export async function collectStatus(input: {
       ),
       query(
         "in-flight turns",
-        `SELECT thread_key, status, '' AS error, created_at,
-                NULL AS duration_seconds
-         FROM session_executions
-         WHERE status IN ('queued', 'running')
-         ORDER BY created_at ASC
+        `SELECT e.thread_key, e.status, '' AS error, e.created_at,
+                NULL AS duration_seconds,
+                e.metadata ->> 'user_name' AS user_name,
+                s.title
+         FROM session_executions e
+         LEFT JOIN sessions s ON s.thread_key = e.thread_key
+         WHERE e.status IN ('queued', 'running')
+         ORDER BY e.created_at ASC
          LIMIT 8`,
       ),
       query(
@@ -174,7 +187,8 @@ const STATUS_TAG: Record<string, string> = {
 };
 
 const TAG_WIDTH = 5;
-const THREAD_WIDTH = 29;
+const THREAD_WIDTH = 24;
+const WHO_WIDTH = 8;
 const AGE_WIDTH = 4;
 const DUR_WIDTH = 5;
 const ERROR_LINE_CHARS = 60;
@@ -182,7 +196,7 @@ const ERROR_LINE_CHARS = 60;
 /**
  * Discord has no table markup; the closest thing is a monospace code block
  * with hand-padded columns. Header line stays OUTSIDE the block (bold + emoji
- * work there); rows stay ~45 chars wide so portrait mobile doesn't wrap.
+ * work there); rows stay ~50 chars wide to limit wrapping on mobile.
  */
 export function formatStatus(report: StatusReport): string {
   const mark = (value: boolean | null): string =>
@@ -203,25 +217,40 @@ export function formatStatus(report: StatusReport): string {
     lines.push("");
   }
 
+  const tableRow = (
+    tag: string,
+    thread: string,
+    who: string,
+    age: string,
+    took: string,
+  ): string =>
+    `${tag.padEnd(TAG_WIDTH)} ${fit(thread, THREAD_WIDTH)} ` +
+    `${fit(who, WHO_WIDTH, "head")} ${age.padStart(AGE_WIDTH)} ` +
+    `${took.padStart(DUR_WIDTH)}`;
+
   // One table: in-flight turns first (no duration yet), then settled recent
   // turns. The recent query also returns queued/running rows — skip those so
-  // an in-flight turn isn't listed twice.
-  const turnRow = (row: ExecutionRow): string => {
-    const tag = (STATUS_TAG[row.status] ?? row.status).padEnd(TAG_WIDTH);
-    const thread = describeThread(row.threadKey).padEnd(THREAD_WIDTH);
-    const age = formatAge(row.ageSeconds).padStart(AGE_WIDTH);
-    const duration = (
-      row.durationSeconds !== null ? formatDuration(row.durationSeconds) : "-"
-    ).padStart(DUR_WIDTH);
-    return `${tag} ${thread} ${age} ${duration}`.trimEnd();
-  };
+  // an in-flight turn isn't listed twice. AGE = when the turn was requested,
+  // TOOK = how long it ran.
+  const turnRow = (row: ExecutionRow): string =>
+    tableRow(
+      STATUS_TAG[row.status] ?? row.status,
+      threadLabel(row),
+      row.who,
+      formatAge(row.ageSeconds),
+      row.durationSeconds !== null ? formatDuration(row.durationSeconds) : "-",
+    ).trimEnd();
   const settled = report.recent.filter(
     (row) => row.status !== "queued" && row.status !== "running",
   );
-  for (const row of [...report.inFlight, ...settled]) {
-    lines.push(turnRow(row));
-    if (row.error) {
-      lines.push(`      └ ${row.error.slice(0, ERROR_LINE_CHARS)}`);
+  const turns = [...report.inFlight, ...settled];
+  if (turns.length > 0) {
+    lines.push(tableRow("", "THREAD", "WHO", "AGE", "TOOK").trimEnd());
+    for (const row of turns) {
+      lines.push(turnRow(row));
+      if (row.error) {
+        lines.push(`      └ ${row.error.slice(0, ERROR_LINE_CHARS)}`);
+      }
     }
   }
 
@@ -257,20 +286,39 @@ export function formatStatus(report: StatusReport): string {
   return `${header}\n\`\`\`\n${bounded}\n\`\`\``;
 }
 
-/** `platform short-thread-name`, cut to the table's thread column width. */
-function describeThread(threadKey: string): string {
-  const separator = threadKey.indexOf(":");
-  if (separator === -1) return tailCut(threadKey, THREAD_WIDTH);
-  const platform = threadKey.slice(0, separator);
-  const rest = threadKey.slice(separator + 1);
-  // Keep the platform readable and cut the rest from the front: thread keys
-  // front-load the constant part (guild/channel ids, owner/repo) and end with
-  // the discriminating bit.
-  return `${platform} ${tailCut(rest, THREAD_WIDTH - platform.length - 1)}`;
+/**
+ * Human label for a turn: the session title when the bots set one, otherwise
+ * a friendlier rendering of the thread key ("GH PR splits-teams#1799" beats
+ * "github-manage:0xSplits/splits-teams:1799"; raw Discord ids stay raw).
+ */
+function threadLabel(row: { threadKey: string; title: string }): string {
+  if (row.title.trim()) return row.title.trim();
+  const parts = row.threadKey.split(":");
+  const platform = parts[0] ?? row.threadKey;
+  const rest = parts.slice(1).join(":");
+  if (platform === "github-manage" && parts.length >= 3) {
+    const repo = (parts[1] ?? "").split("/").pop() ?? parts[1];
+    return `GH PR ${repo}#${parts[2]}`;
+  }
+  if (platform.startsWith("github")) return `GH ${rest}`;
+  if (platform === "linear") return `Linear ${rest}`;
+  if (platform === "slack") return `Slack ${rest}`;
+  if (platform === "discord") return `Discord ${rest}`;
+  return row.threadKey;
 }
 
-function tailCut(value: string, width: number): string {
-  return value.length <= width ? value : `…${value.slice(-(width - 1))}`;
+/**
+ * Truncate + pad to the column. Middle ellipsis by default so both ends stay
+ * readable ("GH PR splits-con…eams#1799", "Discord 90294…:1391220231" — the
+ * head names the thing, the tail discriminates); plain head-cut for names.
+ */
+function fit(value: string, width: number, keep: "edges" | "head" = "edges"): string {
+  if (value.length <= width) return value.padEnd(width);
+  if (keep === "head" || width < 12) {
+    return `${value.slice(0, width - 1)}…`;
+  }
+  const tail = 7;
+  return `${value.slice(0, width - tail - 1)}…${value.slice(-tail)}`;
 }
 
 function formatAge(seconds: number | null): string {
