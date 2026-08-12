@@ -33,7 +33,12 @@ import {
   renameThreadFromMessage,
 } from "./discord-threading";
 import { setGatewayConnected } from "./gateway";
-import { collectStatus, formatStatus, isStatusCommand } from "./status";
+import {
+  STATUS_FAILURE_REPLY,
+  collectStatus,
+  formatStatus,
+  isStatusCommand,
+} from "./status";
 import {
   collectInitialContext,
   executeSessionTurn,
@@ -260,47 +265,44 @@ export function createDiscordbot(options: DiscordbotOptions): Discordbot {
       DEFAULT_MAX_CONCURRENT_EXECUTIONS_PER_GUILD,
   );
 
-  // Lazy pool for the status fast-path, separate from the state adapter's pool
-  // (which is private to createDefaultState — and options.state deployments
-  // have no pool at all). Capped small: status is an occasional human command.
-  let statusPool: pg.Pool | null = null;
-  const statusDb = (): pg.Pool | null => {
-    if (!options.postgresUrl) return null;
-    if (!statusPool) {
-      statusPool = new pg.Pool({
-        connectionString: options.postgresUrl,
-        max: 2,
-      });
-      statusPool.on("error", (error) => {
-        logger.warn("discordbot_status_pool_error", {
-          error: errorMessage(error),
-        });
-      });
-    }
-    return statusPool;
-  };
-
   // A bare "status"/"health" mention answers straight from the control plane
-  // (api-rs health + the shared session DB) with no sandbox turn — so it still
-  // works when the agent pipeline is what's broken. Returns true when handled.
+  // (api-rs /healthz + /api/status over HTTP — no SQL, no sandbox turn) so it
+  // still works when the agent pipeline is what's broken. The feature is
+  // OPT-IN per channel: statusChannelAllowlist empty/unset disables it
+  // entirely (the report exposes cross-platform activity — session titles,
+  // requester names, error snippets — so which channels may see it is a
+  // deployment decision, not a default). The exchange deliberately stays out
+  // of the session transcript: it's operational metadata, not conversation
+  // the agent should later see. Returns true when handled.
+  const statusChannels = new Set(options.statusChannelAllowlist ?? []);
+  const isStatusChannel = (threadKey: string): boolean => {
+    if (statusChannels.size === 0) return false;
+    const { channelId, threadId } = parseDiscordThreadKey(threadKey);
+    return (
+      (channelId !== undefined && statusChannels.has(channelId)) ||
+      (threadId !== undefined && statusChannels.has(threadId))
+    );
+  };
   const maybeReplyStatus = async (
     thread: Thread<DiscordbotThreadState>,
     message: ChatMessage,
   ): Promise<boolean> => {
     if (!isStatusCommand(message.text ?? "")) return false;
+    if (!isStatusChannel(thread.id)) return false;
     try {
       const report = await collectStatus({
         apiUrl: options.apiUrl,
-        db: statusDb(),
         fetchFn: options.fetch,
       });
-      await thread.post(formatStatus(report));
+      await thread.post(formatStatus(report, userName));
     } catch (error) {
+      // Internals (hostnames, auth errors) stay in the logs; the channel gets
+      // a generic line.
       logger.warn("discordbot_status_reply_failed", {
         error: errorMessage(error),
       });
       try {
-        await thread.post(`⚠️ status check failed: ${errorMessage(error)}`);
+        await thread.post(STATUS_FAILURE_REPLY);
       } catch {
         // best-effort; nothing left to signal with.
       }
@@ -310,8 +312,11 @@ export function createDiscordbot(options: DiscordbotOptions): Discordbot {
 
   chat.onNewMention(async (thread, message) => {
     if (!isAllowedDiscordMessage(message, options, logger)) return;
-    if (await maybeReplyStatus(thread, message)) return;
+    // Subscribe before the status fast-path: the adapter has already created
+    // a thread for the mention, and an unsubscribed thread would silently
+    // ignore follow-ups.
     await thread.subscribe();
+    if (await maybeReplyStatus(thread, message)) return;
     await syncThreadMessageToSession(thread, message, {
       executionLimiter,
       mode: "execute",

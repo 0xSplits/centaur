@@ -1,19 +1,13 @@
 import type { DiscordbotFetch } from "./types";
-import { errorMessage, sliceSurrogateSafe } from "./utils";
+import { sliceSurrogateSafe } from "./utils";
 
 // A "status" mention answers directly from the control plane — no sandbox, no
-// session turn. The whole point is that it still works when the agent pipeline
-// is broken: api-rs health comes from its /healthz + /readyz endpoints, and the
-// turn/sandbox history comes from the shared session database (the same
-// Postgres api-rs writes session_executions/sessions/session_warm_sandboxes
-// to, reached via the bot's DATABASE_URL). Every source is fetched
-// independently and best-effort so one dead dependency never blanks the rest
-// of the report.
-
-/** Structural slice of pg.Pool so tests can stub the database trivially. */
-export type StatusDb = {
-  query(sql: string): Promise<{ rows: Record<string, unknown>[] }>;
-};
+// session turn — so it still works when the agent pipeline is what's broken.
+// All data comes from api-rs over HTTP: /healthz + /readyz for liveness, and
+// the read-only /api/status report (api-rs owns the session schema; this
+// service deliberately runs no SQL). Every fetch carries a timeout and is
+// best-effort, so one dead dependency never blanks the rest of the report or
+// hangs the per-thread handler lock.
 
 const KEYWORD = /^(status|health)[?!.]*$/i;
 // Raw Discord mention markup (<@123>, <@!123>, <@&role>, <#channel>) plus the
@@ -21,7 +15,7 @@ const KEYWORD = /^(status|health)[?!.]*$/i;
 const MENTION_TOKEN = /^(<[@#][!&]?\w+>|@[\w.-]+)$/;
 
 /**
- * True when the message is ONLY a status request ("@gerard status",
+ * True when the message is ONLY a status request ("@bot status",
  * "<@&123> health?"). Anything with more words ("status of the deploy") falls
  * through to a normal agent turn so real questions are never hijacked.
  */
@@ -52,32 +46,31 @@ export type DailyRow = {
 };
 
 export type StatusReport = {
+  /** null = unreachable, false = responded unhealthy, true = healthy. */
   apiHealthy: boolean | null;
   apiReady: boolean | null;
-  collectedNotes: string[];
-  /** Runs per UTC day, oldest→today, zero-filled to exactly 7 entries. */
   daily: DailyRow[];
-  dbOk: boolean;
   inFlight: ExecutionRow[];
   recent: ExecutionRow[];
-  sandboxes: { ageSeconds: number | null; sandboxId: string; threadKey: string }[];
+  /** Whether the /api/status report fetch succeeded. */
+  reportOk: boolean;
+  sandboxes: { idleSeconds: number | null; sandboxId: string; threadKey: string }[];
   tally: Record<string, number>;
   warmPool: Record<string, number>;
 };
 
 const HEALTH_TIMEOUT_MS = 2_000;
-const ERROR_SNIPPET_CHARS = 150;
+const REPORT_TIMEOUT_MS = 5_000;
 
 export async function collectStatus(input: {
   apiUrl: string;
-  db: StatusDb | null;
   fetchFn?: DiscordbotFetch;
   nowMs?: number;
 }): Promise<StatusReport> {
   const fetchFn = input.fetchFn ?? fetch;
   const now = input.nowMs ?? Date.now();
-  const notes: string[] = [];
 
+  // null = unreachable (nothing answered), false = answered non-2xx.
   const probe = async (path: string): Promise<boolean | null> => {
     try {
       const response = await fetchFn(`${input.apiUrl}${path}`, {
@@ -85,120 +78,65 @@ export async function collectStatus(input: {
       });
       return response.ok;
     } catch {
-      return false;
-    }
-  };
-
-  const query = async (
-    label: string,
-    sql: string,
-  ): Promise<Record<string, unknown>[] | null> => {
-    if (!input.db) return null;
-    try {
-      return (await input.db.query(sql)).rows;
-    } catch (error) {
-      notes.push(`${label} unavailable (${errorMessage(error)})`);
       return null;
     }
   };
 
+  const fetchReport = async (): Promise<Record<string, unknown> | null> => {
+    try {
+      const response = await fetchFn(`${input.apiUrl}/api/status`, {
+        signal: AbortSignal.timeout(REPORT_TIMEOUT_MS),
+      });
+      if (!response.ok) return null;
+      const body: unknown = await response.json();
+      return typeof body === "object" && body !== null
+        ? (body as Record<string, unknown>)
+        : null;
+    } catch {
+      return null;
+    }
+  };
+
+  const [apiHealthy, apiReady, report] = await Promise.all([
+    probe("/healthz"),
+    probe("/readyz"),
+    fetchReport(),
+  ]);
+
+  const rows = (key: string): Record<string, unknown>[] => {
+    const value = report?.[key];
+    return Array.isArray(value)
+      ? value.filter(
+          (row): row is Record<string, unknown> =>
+            typeof row === "object" && row !== null,
+        )
+      : [];
+  };
+
   const toExecutionRow = (row: Record<string, unknown>): ExecutionRow => ({
-    ageSeconds: ageSecondsFrom(row.created_at, now),
+    ageSeconds: numberOrNull(row.age_seconds),
     durationSeconds: numberOrNull(row.duration_seconds),
-    error: String(row.error ?? "").slice(0, ERROR_SNIPPET_CHARS),
+    error: String(row.error ?? ""),
     status: String(row.status ?? "unknown"),
     threadKey: String(row.thread_key ?? "?"),
     title: String(row.title ?? ""),
     who: String(row.user_name ?? ""),
   });
 
-  const [apiHealthy, apiReady, recent, tally, inFlight, sandboxes, warm, daily] =
-    await Promise.all([
-      probe("/healthz"),
-      probe("/readyz"),
-      query(
-        "recent turns",
-        `SELECT e.thread_key, e.status,
-                left(coalesce(e.error, ''), ${ERROR_SNIPPET_CHARS}) AS error,
-                e.created_at,
-                extract(epoch FROM (e.completed_at - e.started_at)) AS duration_seconds,
-                e.metadata ->> 'user_name' AS user_name,
-                coalesce(s.title, s.metadata ->> 'discord_conversation_name',
-                         s.metadata ->> 'linear_conversation_name',
-                         s.metadata ->> 'slack_conversation_name') AS title
-         FROM session_executions e
-         LEFT JOIN sessions s ON s.thread_key = e.thread_key
-         ORDER BY e.created_at DESC
-         LIMIT 8`,
-      ),
-      query(
-        "24h tally",
-        `SELECT status, count(*)::int AS count
-         FROM session_executions
-         WHERE created_at > now() - interval '24 hours'
-         GROUP BY status`,
-      ),
-      query(
-        "in-flight turns",
-        `SELECT e.thread_key, e.status, '' AS error, e.created_at,
-                NULL AS duration_seconds,
-                e.metadata ->> 'user_name' AS user_name,
-                coalesce(s.title, s.metadata ->> 'discord_conversation_name',
-                         s.metadata ->> 'linear_conversation_name',
-                         s.metadata ->> 'slack_conversation_name') AS title
-         FROM session_executions e
-         LEFT JOIN sessions s ON s.thread_key = e.thread_key
-         WHERE e.status IN ('queued', 'running')
-         ORDER BY e.created_at ASC
-         LIMIT 8`,
-      ),
-      query(
-        "active sandboxes",
-        `SELECT thread_key, sandbox_id, sandbox_last_active_at
-         FROM sessions
-         WHERE sandbox_id IS NOT NULL
-           AND sandbox_last_active_at > now() - interval '2 hours'
-         ORDER BY sandbox_last_active_at DESC
-         LIMIT 8`,
-      ),
-      // Claimed/failed rows are never deleted — they're lifetime history, so
-      // an unfiltered count reads like a leak ("868 claimed"). Only ready/
-      // evicting are current facts; show claimed/failed as 24h churn.
-      query(
-        "warm pool",
-        `SELECT status, count(*)::int AS count
-         FROM session_warm_sandboxes
-         WHERE status IN ('ready', 'evicting')
-            OR updated_at > now() - interval '24 hours'
-         GROUP BY status`,
-      ),
-      query(
-        "7-day histogram",
-        `SELECT to_char(created_at AT TIME ZONE 'UTC', 'YYYY-MM-DD') AS day,
-                count(*)::int AS runs,
-                (count(*) FILTER (WHERE status = 'failed'))::int AS failed
-         FROM session_executions
-         WHERE created_at > now() - interval '7 days'
-         GROUP BY 1
-         ORDER BY 1`,
-      ),
-    ]);
-
   return {
     apiHealthy,
     apiReady,
-    collectedNotes: notes,
-    daily: zeroFilledWeek(daily ?? [], now),
-    dbOk: recent !== null,
-    inFlight: (inFlight ?? []).map(toExecutionRow),
-    recent: (recent ?? []).map(toExecutionRow),
-    sandboxes: (sandboxes ?? []).map((row) => ({
-      ageSeconds: ageSecondsFrom(row.sandbox_last_active_at, now),
+    daily: zeroFilledWeek(rows("daily"), now),
+    inFlight: rows("in_flight").map(toExecutionRow),
+    recent: rows("recent_executions").map(toExecutionRow),
+    reportOk: report !== null,
+    sandboxes: rows("active_sandboxes").map((row) => ({
+      idleSeconds: numberOrNull(row.idle_seconds),
       sandboxId: String(row.sandbox_id ?? "?"),
       threadKey: String(row.thread_key ?? "?"),
     })),
-    tally: countsByStatus(tally),
-    warmPool: countsByStatus(warm),
+    tally: countsByStatus(rows("tally_24h")),
+    warmPool: countsByStatus(rows("warm_pool")),
   };
 }
 
@@ -218,15 +156,11 @@ const STATUS_TAG: Record<string, string> = {
 const TAG_WIDTH = 5;
 const THREAD_WIDTH = 24;
 const WHO_WIDTH = 10;
-
-// Internal actor ids nobody recognizes → the name the team knows.
-const WHO_ALIAS: Record<string, string> = {
-  "github-pr-manager": "gerard",
-};
 const AGE_WIDTH = 4;
 const DUR_WIDTH = 5;
 const ERROR_LINE_CHARS = 60;
 const BAR_WIDTH = 16;
+const RECENT_ROWS_SHOWN = 8;
 
 const WEEKDAYS = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
 
@@ -239,14 +173,16 @@ function weekdayLabel(dayIso: string): string {
 /**
  * Discord has no table markup; the closest thing is a monospace code block
  * with hand-padded columns. Header line stays OUTSIDE the block (bold + emoji
- * work there); rows stay ~50 chars wide to limit wrapping on mobile.
+ * work there); rows stay ~50 chars wide to limit wrapping on mobile. The
+ * histogram gets its own second block. `botName` labels the header — this is
+ * generic service code, so the deployment's bot name is a parameter.
  */
-export function formatStatus(report: StatusReport): string {
+export function formatStatus(report: StatusReport, botName: string): string {
   const mark = (value: boolean | null): string =>
     value === null ? "❓" : value ? "✅" : "❌";
   const header =
-    `**gerard status** · api-rs ${mark(report.apiHealthy)} ` +
-    `ready ${mark(report.apiReady)} · db ${report.dbOk ? "✅" : "❌"}`;
+    `**${botName} status** · api-rs ${mark(report.apiHealthy)} ` +
+    `ready ${mark(report.apiReady)} · data ${report.reportOk ? "✅" : "❌"}`;
 
   const lines: string[] = [];
 
@@ -272,27 +208,27 @@ export function formatStatus(report: StatusReport): string {
     `${took.padStart(DUR_WIDTH)}`;
 
   // One table: in-flight turns first (no duration yet), then settled recent
-  // turns. The recent query also returns queued/running rows — skip those so
+  // turns. The recent list also carries queued/running rows — skip those so
   // an in-flight turn isn't listed twice. AGE = when the turn was requested,
   // TOOK = how long it ran.
   const turnRow = (row: ExecutionRow): string =>
     tableRow(
       STATUS_TAG[row.status] ?? row.status,
-      threadLabel(row),
-      WHO_ALIAS[row.who] ?? row.who,
+      inline(threadLabel(row)),
+      inline(row.who),
       formatAge(row.ageSeconds),
       row.durationSeconds !== null ? formatDuration(row.durationSeconds) : "-",
     ).trimEnd();
-  const settled = report.recent.filter(
-    (row) => row.status !== "queued" && row.status !== "running",
-  );
+  const settled = report.recent
+    .filter((row) => row.status !== "queued" && row.status !== "running")
+    .slice(0, RECENT_ROWS_SHOWN);
   const turns = [...report.inFlight, ...settled];
   if (turns.length > 0) {
     lines.push(tableRow("", "THREAD", "WHO", "AGE", "TOOK").trimEnd());
     for (const row of turns) {
       lines.push(turnRow(row));
       if (row.error) {
-        lines.push(`      └ ${row.error.slice(0, ERROR_LINE_CHARS)}`);
+        lines.push(`      └ ${inline(row.error).slice(0, ERROR_LINE_CHARS)}`);
       }
     }
   }
@@ -302,10 +238,10 @@ export function formatStatus(report: StatusReport): string {
     sandboxBits.push(`${report.sandboxes.length} active`);
   }
   // ready/evicting are the pool's current state; claimed/failed rows are
-  // historical (the collect query already windows them to 24h). "failed" here
-  // is a warm SPAWN failure (a standby sandbox that didn't provision — the
-  // next session cold-starts instead), NOT a failed turn; label it so it
-  // can't be confused with the histogram's FAIL column.
+  // historical (the report windows them to 24h). "failed" here is a warm
+  // SPAWN failure (a standby sandbox that didn't provision — the next session
+  // cold-starts instead), NOT a failed turn; label it so it can't be confused
+  // with the histogram's FAIL column.
   const WARM_LABEL: Record<string, string> = { failed: "spawn-failed" };
   const warmLine = (statuses: string[]): string =>
     statuses
@@ -323,9 +259,8 @@ export function formatStatus(report: StatusReport): string {
     lines.push(`sandboxes: ${sandboxBits.join(" · ")}`);
   }
 
-  for (const note of report.collectedNotes) lines.push(`! ${note}`);
-  if (!report.dbOk && report.collectedNotes.length === 0) {
-    lines.push("! session database unreachable — turn history unavailable");
+  if (!report.reportOk) {
+    lines.push("! status report unavailable — turn history not shown");
   }
 
   // 7-day histogram, in its OWN code block below the live view: the bar
@@ -363,8 +298,7 @@ export function formatStatus(report: StatusReport): string {
   const body = lines.join("\n");
   // The histogram block is small and fixed-size; give the live view whatever
   // budget remains under Discord's cap.
-  const budget =
-    STATUS_MAX_CHARS - header.length - histogramBlock.length - 20;
+  const budget = STATUS_MAX_CHARS - header.length - histogramBlock.length - 20;
   const bounded =
     body.length <= budget
       ? body
@@ -372,6 +306,9 @@ export function formatStatus(report: StatusReport): string {
   const liveBlock = lines.length > 0 ? `\n\`\`\`\n${bounded}\n\`\`\`` : "";
   return `${header}${liveBlock}${histogramBlock}`;
 }
+
+/** Generic failure reply — internals go to logs, not the channel. */
+export const STATUS_FAILURE_REPLY = "⚠️ status check failed — see service logs.";
 
 /**
  * Human label for a turn: the session title when the bots set one, otherwise
@@ -395,11 +332,25 @@ function threadLabel(row: { threadKey: string; title: string }): string {
 }
 
 /**
+ * Neutralize markdown/code-fence breakouts in interpolated values (titles and
+ * error strings are user/agent-influenced): backticks become apostrophes and
+ * whitespace collapses to single spaces so a value can never close the
+ * surrounding fence or smuggle its own line.
+ */
+function inline(value: string): string {
+  return value.replace(/`/g, "'").replace(/\s+/g, " ").trim();
+}
+
+/**
  * Truncate + pad to the column. Middle ellipsis by default so both ends stay
  * readable ("GH PR splits-con…eams#1799", "Discord 90294…:1391220231" — the
  * head names the thing, the tail discriminates); plain head-cut for names.
  */
-function fit(value: string, width: number, keep: "edges" | "head" = "edges"): string {
+function fit(
+  value: string,
+  width: number,
+  keep: "edges" | "head" = "edges",
+): string {
   if (value.length <= width) return value.padEnd(width);
   if (keep === "head" || width < 12) {
     return `${value.slice(0, width - 1)}…`;
@@ -444,23 +395,14 @@ function zeroFilledWeek(
 }
 
 function countsByStatus(
-  rows: Record<string, unknown>[] | null,
+  rows: Record<string, unknown>[],
 ): Record<string, number> {
   const counts: Record<string, number> = {};
-  for (const row of rows ?? []) {
+  for (const row of rows) {
     const count = numberOrNull(row.count);
     if (count !== null) counts[String(row.status ?? "unknown")] = count;
   }
   return counts;
-}
-
-function ageSecondsFrom(value: unknown, nowMs: number): number | null {
-  if (value instanceof Date) return (nowMs - value.getTime()) / 1000;
-  if (typeof value === "string") {
-    const parsed = Date.parse(value);
-    if (!Number.isNaN(parsed)) return (nowMs - parsed) / 1000;
-  }
-  return null;
 }
 
 function numberOrNull(value: unknown): number | null {
