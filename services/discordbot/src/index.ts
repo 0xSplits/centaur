@@ -33,6 +33,7 @@ import {
   renameThreadFromMessage,
 } from "./discord-threading";
 import { setGatewayConnected } from "./gateway";
+import { collectStatus, formatStatus, isStatusCommand } from "./status";
 import {
   collectInitialContext,
   executeSessionTurn,
@@ -259,8 +260,57 @@ export function createDiscordbot(options: DiscordbotOptions): Discordbot {
       DEFAULT_MAX_CONCURRENT_EXECUTIONS_PER_GUILD,
   );
 
+  // Lazy pool for the status fast-path, separate from the state adapter's pool
+  // (which is private to createDefaultState — and options.state deployments
+  // have no pool at all). Capped small: status is an occasional human command.
+  let statusPool: pg.Pool | null = null;
+  const statusDb = (): pg.Pool | null => {
+    if (!options.postgresUrl) return null;
+    if (!statusPool) {
+      statusPool = new pg.Pool({
+        connectionString: options.postgresUrl,
+        max: 2,
+      });
+      statusPool.on("error", (error) => {
+        logger.warn("discordbot_status_pool_error", {
+          error: errorMessage(error),
+        });
+      });
+    }
+    return statusPool;
+  };
+
+  // A bare "status"/"health" mention answers straight from the control plane
+  // (api-rs health + the shared session DB) with no sandbox turn — so it still
+  // works when the agent pipeline is what's broken. Returns true when handled.
+  const maybeReplyStatus = async (
+    thread: Thread<DiscordbotThreadState>,
+    message: ChatMessage,
+  ): Promise<boolean> => {
+    if (!isStatusCommand(message.text ?? "")) return false;
+    try {
+      const report = await collectStatus({
+        apiUrl: options.apiUrl,
+        db: statusDb(),
+        fetchFn: options.fetch,
+      });
+      await thread.post(formatStatus(report));
+    } catch (error) {
+      logger.warn("discordbot_status_reply_failed", {
+        error: errorMessage(error),
+      });
+      try {
+        await thread.post(`⚠️ status check failed: ${errorMessage(error)}`);
+      } catch {
+        // best-effort; nothing left to signal with.
+      }
+    }
+    return true;
+  };
+
   chat.onNewMention(async (thread, message) => {
     if (!isAllowedDiscordMessage(message, options, logger)) return;
+    if (await maybeReplyStatus(thread, message)) return;
     await thread.subscribe();
     await syncThreadMessageToSession(thread, message, {
       executionLimiter,
@@ -272,6 +322,8 @@ export function createDiscordbot(options: DiscordbotOptions): Discordbot {
 
   chat.onSubscribedMessage(async (thread, message) => {
     if (!isAllowedDiscordMessage(message, options, logger)) return;
+    if (message.isMention === true && (await maybeReplyStatus(thread, message)))
+      return;
     await syncThreadMessageToSession(thread, message, {
       executionLimiter,
       mode: message.isMention === true ? "execute" : "append",
