@@ -302,11 +302,17 @@ export function formatStatus(report: StatusReport): string {
     sandboxBits.push(`${report.sandboxes.length} active`);
   }
   // ready/evicting are the pool's current state; claimed/failed rows are
-  // historical (the collect query already windows them to 24h).
+  // historical (the collect query already windows them to 24h). "failed" here
+  // is a warm SPAWN failure (a standby sandbox that didn't provision — the
+  // next session cold-starts instead), NOT a failed turn; label it so it
+  // can't be confused with the histogram's FAIL column.
+  const WARM_LABEL: Record<string, string> = { failed: "spawn-failed" };
   const warmLine = (statuses: string[]): string =>
     statuses
       .filter((status) => (report.warmPool[status] ?? 0) > 0)
-      .map((status) => `${report.warmPool[status]} ${status}`)
+      .map(
+        (status) => `${report.warmPool[status]} ${WARM_LABEL[status] ?? status}`,
+      )
       .join(", ");
   const warmNow = warmLine(["ready", "evicting"]);
   const warmChurn = warmLine(["claimed", "failed"]);
