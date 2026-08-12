@@ -44,10 +44,19 @@ export type ExecutionRow = {
   who: string;
 };
 
+export type DailyRow = {
+  /** UTC calendar date, `YYYY-MM-DD`. */
+  day: string;
+  failed: number;
+  runs: number;
+};
+
 export type StatusReport = {
   apiHealthy: boolean | null;
   apiReady: boolean | null;
   collectedNotes: string[];
+  /** Runs per UTC day, oldest→today, zero-filled to exactly 7 entries. */
+  daily: DailyRow[];
   dbOk: boolean;
   inFlight: ExecutionRow[];
   recent: ExecutionRow[];
@@ -103,7 +112,7 @@ export async function collectStatus(input: {
     who: String(row.user_name ?? ""),
   });
 
-  const [apiHealthy, apiReady, recent, tally, inFlight, sandboxes, warm] =
+  const [apiHealthy, apiReady, recent, tally, inFlight, sandboxes, warm, daily] =
     await Promise.all([
       probe("/healthz"),
       probe("/readyz"),
@@ -163,12 +172,23 @@ export async function collectStatus(input: {
             OR updated_at > now() - interval '24 hours'
          GROUP BY status`,
       ),
+      query(
+        "7-day histogram",
+        `SELECT to_char(created_at AT TIME ZONE 'UTC', 'YYYY-MM-DD') AS day,
+                count(*)::int AS runs,
+                (count(*) FILTER (WHERE status = 'failed'))::int AS failed
+         FROM session_executions
+         WHERE created_at > now() - interval '7 days'
+         GROUP BY 1
+         ORDER BY 1`,
+      ),
     ]);
 
   return {
     apiHealthy,
     apiReady,
     collectedNotes: notes,
+    daily: zeroFilledWeek(daily ?? [], now),
     dbOk: recent !== null,
     inFlight: (inFlight ?? []).map(toExecutionRow),
     recent: (recent ?? []).map(toExecutionRow),
@@ -206,6 +226,15 @@ const WHO_ALIAS: Record<string, string> = {
 const AGE_WIDTH = 4;
 const DUR_WIDTH = 5;
 const ERROR_LINE_CHARS = 60;
+const BAR_WIDTH = 16;
+
+const WEEKDAYS = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
+
+function weekdayLabel(dayIso: string): string {
+  const parsed = new Date(`${dayIso}T00:00:00Z`);
+  const label = WEEKDAYS[parsed.getUTCDay()];
+  return label ?? "???";
+}
 
 /**
  * Discord has no table markup; the closest thing is a monospace code block
@@ -227,6 +256,32 @@ export function formatStatus(report: StatusReport): string {
       `24h: ${tallyEntries
         .map(([status, count]) => `${count} ${STATUS_TAG[status] ?? status}`)
         .join(" · ")}`,
+    );
+    lines.push("");
+  }
+
+  // 7-day histogram: the bar encodes ONE measure (runs); failures get their
+  // own labeled column rather than a second scale or color-alone marking, and
+  // the failure rate is a plain stat line.
+  const week = report.daily;
+  const totalRuns = week.reduce((sum, day) => sum + day.runs, 0);
+  if (totalRuns > 0) {
+    const totalFailed = week.reduce((sum, day) => sum + day.failed, 0);
+    const maxRuns = Math.max(...week.map((day) => day.runs));
+    lines.push(`     ${"LAST 7 DAYS".padEnd(BAR_WIDTH + 1)}RUNS FAIL`);
+    for (const day of week) {
+      const bar = "█".repeat(
+        day.runs === 0 ? 0 : Math.max(1, Math.round((day.runs / maxRuns) * BAR_WIDTH)),
+      );
+      const fail = day.failed > 0 ? String(day.failed) : "-";
+      lines.push(
+        `${weekdayLabel(day.day)}  ${bar.padEnd(BAR_WIDTH + 1)}` +
+          `${String(day.runs).padStart(4)} ${fail.padStart(4)}`,
+      );
+    }
+    const rate = totalRuns > 0 ? (totalFailed / totalRuns) * 100 : 0;
+    lines.push(
+      `7d: ${totalRuns} runs · ${totalFailed} failed (${rate.toFixed(1)}%)`,
     );
     lines.push("");
   }
@@ -349,6 +404,28 @@ function formatDuration(seconds: number): string {
   if (s < 3600) return `${Math.round(s / 60)}m`;
   if (s < 86400) return `${Math.round(s / 3600)}h`;
   return `${Math.round(s / 86400)}d`;
+}
+
+/** The last 7 UTC calendar days (oldest→today), zero-filling days with no runs. */
+function zeroFilledWeek(
+  rows: Record<string, unknown>[],
+  nowMs: number,
+): DailyRow[] {
+  const byDay = new Map<string, { failed: number; runs: number }>();
+  for (const row of rows) {
+    byDay.set(String(row.day ?? ""), {
+      failed: numberOrNull(row.failed) ?? 0,
+      runs: numberOrNull(row.runs) ?? 0,
+    });
+  }
+  const days: DailyRow[] = [];
+  for (let offset = 6; offset >= 0; offset -= 1) {
+    const day = new Date(nowMs - offset * 86_400_000)
+      .toISOString()
+      .slice(0, 10);
+    days.push({ day, failed: 0, runs: 0, ...byDay.get(day) });
+  }
+  return days;
 }
 
 function countsByStatus(

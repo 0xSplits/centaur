@@ -52,6 +52,13 @@ function fullDb(): StatusDb {
         { status: "claimed", count: 41 },
       ];
     }
+    if (sql.includes("interval '7 days'")) {
+      return [
+        { day: "2026-08-10", failed: 0, runs: 12 },
+        { day: "2026-08-11", failed: 3, runs: 40 },
+        { day: "2026-08-12", failed: 0, runs: 20 },
+      ];
+    }
     if (sql.includes("interval '24 hours'")) {
       return [
         { status: "completed", count: 41 },
@@ -124,6 +131,11 @@ describe("collectStatus", () => {
     expect(report.sandboxes[0]?.sandboxId).toBe("asbx-1755000000-1");
     expect(report.warmPool).toEqual({ claimed: 41, ready: 2 });
     expect(report.collectedNotes).toEqual([]);
+    // Zero-filled to exactly 7 UTC days, oldest first, today last.
+    expect(report.daily).toHaveLength(7);
+    expect(report.daily[0]).toEqual({ day: "2026-08-06", failed: 0, runs: 0 });
+    expect(report.daily[5]).toEqual({ day: "2026-08-11", failed: 3, runs: 40 });
+    expect(report.daily[6]).toEqual({ day: "2026-08-12", failed: 0, runs: 20 });
   });
 
   it("still reports DB data when api-rs is down", async () => {
@@ -173,6 +185,7 @@ describe("formatStatus", () => {
     apiHealthy: true,
     apiReady: true,
     collectedNotes: [],
+    daily: [],
     dbOk: true,
     inFlight: [],
     recent: [],
@@ -195,6 +208,13 @@ describe("formatStatus", () => {
     expect(text).toContain("24h: 41 ok · 2 FAIL");
     // Column headings above the turn table.
     expect(text).toMatch(/THREAD\s+WHO\s+AGE\s+TOOK/);
+    // 7-day histogram: full-width bar on the busiest day, "-" for zero
+    // failures, zero-run days barless, and a failure-rate stat line.
+    expect(text).toMatch(/LAST 7 DAYS\s+RUNS FAIL/);
+    expect(text).toMatch(/Tue {2}█{16}\s+40\s+3/);
+    expect(text).toMatch(/Wed {2}█+\s+20\s+-/);
+    expect(text).toMatch(/Thu {2}\s+0\s+-/);
+    expect(text).toContain("7d: 72 runs · 3 failed (4.2%)");
     // In-flight row first: session title, requester, no duration yet.
     const lines = text.split("\n");
     const runLine = lines.find((line) => line.startsWith("run"));
