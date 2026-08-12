@@ -160,7 +160,7 @@ impl AppState {
             .ok_or_else(|| ApiError::BadRequest("workflow runtime is not enabled".to_owned()))
     }
 
-    fn pool(&self) -> Result<PgPool, ApiError> {
+    pub(crate) fn pool(&self) -> Result<PgPool, ApiError> {
         let initialized = self
             .initialized()
             .ok_or_else(|| ApiError::ServiceUnavailable("api-rs is still starting".to_owned()))?;
@@ -209,6 +209,7 @@ pub fn build_router_with_app_state(state: AppState) -> Router {
         .route("/readyz", get(readyz))
         .route("/metrics", get(metrics))
         .route("/api/personas", get(list_personas))
+        .route("/api/status", get(crate::status::status_report))
         .route("/mcp", post(mcp_post).get(mcp_get))
         .route(
             "/.well-known/oauth-protected-resource",

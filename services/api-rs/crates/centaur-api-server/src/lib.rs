@@ -4,6 +4,7 @@ mod error;
 mod mcp;
 mod routes;
 mod slack_proxy;
+mod status;
 mod tool_discovery;
 pub mod types;
 
