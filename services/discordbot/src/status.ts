@@ -114,7 +114,7 @@ export async function collectStatus(input: {
                 e.created_at,
                 extract(epoch FROM (e.completed_at - e.started_at)) AS duration_seconds,
                 e.metadata ->> 'user_name' AS user_name,
-                s.title
+                coalesce(s.title, s.metadata ->> 'discord_conversation_name') AS title
          FROM session_executions e
          LEFT JOIN sessions s ON s.thread_key = e.thread_key
          ORDER BY e.created_at DESC
@@ -132,7 +132,7 @@ export async function collectStatus(input: {
         `SELECT e.thread_key, e.status, '' AS error, e.created_at,
                 NULL AS duration_seconds,
                 e.metadata ->> 'user_name' AS user_name,
-                s.title
+                coalesce(s.title, s.metadata ->> 'discord_conversation_name') AS title
          FROM session_executions e
          LEFT JOIN sessions s ON s.thread_key = e.thread_key
          WHERE e.status IN ('queued', 'running')
@@ -148,10 +148,15 @@ export async function collectStatus(input: {
          ORDER BY sandbox_last_active_at DESC
          LIMIT 8`,
       ),
+      // Claimed/failed rows are never deleted — they're lifetime history, so
+      // an unfiltered count reads like a leak ("868 claimed"). Only ready/
+      // evicting are current facts; show claimed/failed as 24h churn.
       query(
         "warm pool",
         `SELECT status, count(*)::int AS count
          FROM session_warm_sandboxes
+         WHERE status IN ('ready', 'evicting')
+            OR updated_at > now() - interval '24 hours'
          GROUP BY status`,
       ),
     ]);
@@ -188,7 +193,12 @@ const STATUS_TAG: Record<string, string> = {
 
 const TAG_WIDTH = 5;
 const THREAD_WIDTH = 24;
-const WHO_WIDTH = 8;
+const WHO_WIDTH = 10;
+
+// Internal actor ids nobody recognizes → the name the team knows.
+const WHO_ALIAS: Record<string, string> = {
+  "github-pr-manager": "gerard",
+};
 const AGE_WIDTH = 4;
 const DUR_WIDTH = 5;
 const ERROR_LINE_CHARS = 60;
@@ -236,7 +246,7 @@ export function formatStatus(report: StatusReport): string {
     tableRow(
       STATUS_TAG[row.status] ?? row.status,
       threadLabel(row),
-      row.who,
+      WHO_ALIAS[row.who] ?? row.who,
       formatAge(row.ageSeconds),
       row.durationSeconds !== null ? formatDuration(row.durationSeconds) : "-",
     ).trimEnd();
@@ -254,18 +264,21 @@ export function formatStatus(report: StatusReport): string {
     }
   }
 
-  const warmEntries = Object.entries(report.warmPool).sort();
   const sandboxBits: string[] = [];
   if (report.sandboxes.length > 0) {
     sandboxBits.push(`${report.sandboxes.length} active`);
   }
-  if (warmEntries.length > 0) {
-    sandboxBits.push(
-      `warm: ${warmEntries
-        .map(([status, count]) => `${count} ${status}`)
-        .join(", ")}`,
-    );
-  }
+  // ready/evicting are the pool's current state; claimed/failed rows are
+  // historical (the collect query already windows them to 24h).
+  const warmLine = (statuses: string[]): string =>
+    statuses
+      .filter((status) => (report.warmPool[status] ?? 0) > 0)
+      .map((status) => `${report.warmPool[status]} ${status}`)
+      .join(", ");
+  const warmNow = warmLine(["ready", "evicting"]);
+  const warmChurn = warmLine(["claimed", "failed"]);
+  if (warmNow) sandboxBits.push(`warm: ${warmNow}`);
+  if (warmChurn) sandboxBits.push(`warm 24h: ${warmChurn}`);
   if (sandboxBits.length > 0) {
     lines.push("");
     lines.push(`sandboxes: ${sandboxBits.join(" · ")}`);

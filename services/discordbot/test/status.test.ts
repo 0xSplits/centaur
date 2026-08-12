@@ -46,6 +46,12 @@ const NOW = Date.parse("2026-08-12T12:00:00Z");
 
 function fullDb(): StatusDb {
   return stubDb((sql) => {
+    if (sql.includes("session_warm_sandboxes")) {
+      return [
+        { status: "ready", count: 2 },
+        { status: "claimed", count: 41 },
+      ];
+    }
     if (sql.includes("interval '24 hours'")) {
       return [
         { status: "completed", count: 41 },
@@ -96,9 +102,6 @@ function fullDb(): StatusDb {
         },
       ];
     }
-    if (sql.includes("session_warm_sandboxes")) {
-      return [{ status: "ready", count: 2 }];
-    }
     return [];
   });
 }
@@ -119,7 +122,7 @@ describe("collectStatus", () => {
     expect(report.recent[1]?.error).toContain("sandbox spawn timeout");
     expect(report.inFlight).toHaveLength(1);
     expect(report.sandboxes[0]?.sandboxId).toBe("asbx-1755000000-1");
-    expect(report.warmPool).toEqual({ ready: 2 });
+    expect(report.warmPool).toEqual({ claimed: 41, ready: 2 });
     expect(report.collectedNotes).toEqual([]);
   });
 
@@ -203,7 +206,9 @@ describe("formatStatus", () => {
     expect(text).toMatch(/ok\s+GH PR splits-teams#1799\s+0xdiid\s+5m\s+1m/);
     // Errors land on their own indented line.
     expect(text).toContain("└ sandbox spawn timeout");
-    expect(text).toContain("sandboxes: 1 active · warm: 2 ready");
+    expect(text).toContain(
+      "sandboxes: 1 active · warm: 2 ready · warm 24h: 41 claimed",
+    );
     expect(text.length).toBeLessThanOrEqual(2000);
   });
 
@@ -226,7 +231,7 @@ describe("formatStatus", () => {
     // Middle ellipsis keeps the platform head and the id tail.
     expect(row).toContain("Discord 9");
     expect(row).toContain("…");
-    expect(row).toContain("someone…");
+    expect(row).toContain("someone-w…");
     expect(row?.length ?? 0).toBeLessThanOrEqual(52);
   });
 
