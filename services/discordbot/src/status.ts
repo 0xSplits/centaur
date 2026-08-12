@@ -163,55 +163,65 @@ export async function collectStatus(input: {
 // Discord caps messages at 2000 chars; stay under it with honest truncation.
 const STATUS_MAX_CHARS = 1_900;
 
-const STATUS_EMOJI: Record<string, string> = {
-  cancelled: "🚫",
-  completed: "✅",
-  failed: "❌",
-  queued: "🕒",
-  running: "▶️",
+// Short ASCII tags: emoji are double-width in Discord's code blocks and wreck
+// column alignment, which is the whole point of the tabular layout.
+const STATUS_TAG: Record<string, string> = {
+  cancelled: "cxl",
+  completed: "ok",
+  failed: "FAIL",
+  queued: "que",
+  running: "run",
 };
 
-export function formatStatus(report: StatusReport): string {
-  const lines: string[] = [];
+const TAG_WIDTH = 5;
+const THREAD_WIDTH = 29;
+const AGE_WIDTH = 4;
+const DUR_WIDTH = 5;
+const ERROR_LINE_CHARS = 60;
 
+/**
+ * Discord has no table markup; the closest thing is a monospace code block
+ * with hand-padded columns. Header line stays OUTSIDE the block (bold + emoji
+ * work there); rows stay ~45 chars wide so portrait mobile doesn't wrap.
+ */
+export function formatStatus(report: StatusReport): string {
   const mark = (value: boolean | null): string =>
     value === null ? "❓" : value ? "✅" : "❌";
-  lines.push(
+  const header =
     `**gerard status** · api-rs ${mark(report.apiHealthy)} ` +
-      `ready ${mark(report.apiReady)} · db ${report.dbOk ? "✅" : "❌"}`,
-  );
+    `ready ${mark(report.apiReady)} · db ${report.dbOk ? "✅" : "❌"}`;
+
+  const lines: string[] = [];
 
   const tallyEntries = Object.entries(report.tally).sort();
   if (tallyEntries.length > 0) {
     lines.push(
-      `last 24h: ${tallyEntries
-        .map(([status, count]) => `${count} ${STATUS_EMOJI[status] ?? status}`)
+      `24h: ${tallyEntries
+        .map(([status, count]) => `${count} ${STATUS_TAG[status] ?? status}`)
         .join(" · ")}`,
     );
+    lines.push("");
   }
 
-  if (report.inFlight.length > 0) {
-    lines.push("in flight:");
-    for (const row of report.inFlight) {
-      lines.push(
-        `${STATUS_EMOJI[row.status] ?? "•"} ${describeThread(row.threadKey)}` +
-          ` (${formatAge(row.ageSeconds)})`,
-      );
-    }
-  }
-
-  if (report.recent.length > 0) {
-    lines.push("recent turns:");
-    for (const row of report.recent) {
-      const duration =
-        row.durationSeconds !== null
-          ? ` (${formatDuration(row.durationSeconds)})`
-          : "";
-      const error = row.error ? ` — ${row.error}` : "";
-      lines.push(
-        `${STATUS_EMOJI[row.status] ?? "•"} ${formatAge(row.ageSeconds)} ago · ` +
-          `${describeThread(row.threadKey)}${duration}${error}`,
-      );
+  // One table: in-flight turns first (no duration yet), then settled recent
+  // turns. The recent query also returns queued/running rows — skip those so
+  // an in-flight turn isn't listed twice.
+  const turnRow = (row: ExecutionRow): string => {
+    const tag = (STATUS_TAG[row.status] ?? row.status).padEnd(TAG_WIDTH);
+    const thread = describeThread(row.threadKey).padEnd(THREAD_WIDTH);
+    const age = formatAge(row.ageSeconds).padStart(AGE_WIDTH);
+    const duration = (
+      row.durationSeconds !== null ? formatDuration(row.durationSeconds) : "-"
+    ).padStart(DUR_WIDTH);
+    return `${tag} ${thread} ${age} ${duration}`.trimEnd();
+  };
+  const settled = report.recent.filter(
+    (row) => row.status !== "queued" && row.status !== "running",
+  );
+  for (const row of [...report.inFlight, ...settled]) {
+    lines.push(turnRow(row));
+    if (row.error) {
+      lines.push(`      └ ${row.error.slice(0, ERROR_LINE_CHARS)}`);
     }
   }
 
@@ -227,29 +237,40 @@ export function formatStatus(report: StatusReport): string {
         .join(", ")}`,
     );
   }
-  if (sandboxBits.length > 0) lines.push(`sandboxes: ${sandboxBits.join(" · ")}`);
-
-  for (const note of report.collectedNotes) lines.push(`⚠️ ${note}`);
-  if (!report.dbOk && report.collectedNotes.length === 0) {
-    lines.push("⚠️ session database unreachable — turn history unavailable");
+  if (sandboxBits.length > 0) {
+    lines.push("");
+    lines.push(`sandboxes: ${sandboxBits.join(" · ")}`);
   }
 
-  const text = lines.join("\n");
-  if (text.length <= STATUS_MAX_CHARS) return text;
-  return `${sliceSurrogateSafe(text, STATUS_MAX_CHARS - 12).trimEnd()}\n[truncated]`;
+  for (const note of report.collectedNotes) lines.push(`! ${note}`);
+  if (!report.dbOk && report.collectedNotes.length === 0) {
+    lines.push("! session database unreachable — turn history unavailable");
+  }
+
+  if (lines.length === 0) return header;
+  const body = lines.join("\n");
+  const budget = STATUS_MAX_CHARS - header.length - 20;
+  const bounded =
+    body.length <= budget
+      ? body
+      : `${sliceSurrogateSafe(body, budget - 12).trimEnd()}\n[truncated]`;
+  return `${header}\n\`\`\`\n${bounded}\n\`\`\``;
 }
 
-/** `platform · short thread name` from a session thread key. */
+/** `platform short-thread-name`, cut to the table's thread column width. */
 function describeThread(threadKey: string): string {
   const separator = threadKey.indexOf(":");
-  if (separator === -1) return shorten(threadKey);
+  if (separator === -1) return tailCut(threadKey, THREAD_WIDTH);
   const platform = threadKey.slice(0, separator);
   const rest = threadKey.slice(separator + 1);
-  return `${platform} ${shorten(rest)}`;
+  // Keep the platform readable and cut the rest from the front: thread keys
+  // front-load the constant part (guild/channel ids, owner/repo) and end with
+  // the discriminating bit.
+  return `${platform} ${tailCut(rest, THREAD_WIDTH - platform.length - 1)}`;
 }
 
-function shorten(value: string): string {
-  return value.length <= 40 ? value : `…${value.slice(-39)}`;
+function tailCut(value: string, width: number): string {
+  return value.length <= width ? value : `…${value.slice(-(width - 1))}`;
 }
 
 function formatAge(seconds: number | null): string {
