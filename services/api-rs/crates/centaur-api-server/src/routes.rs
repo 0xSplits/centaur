@@ -1083,8 +1083,17 @@ mod session_authorization_tests {
 
     #[test]
     fn ingress_scope_covers_every_family_the_bot_mints() {
-        let github = ["github:", "github-manage:", "github-review:"];
+        let github = [
+            "github:",
+            "github-issue:",
+            "github-manage:",
+            "github-review:",
+        ];
         assert!(thread_key_matches_platform(&github, "github:acme/repo:12"));
+        assert!(thread_key_matches_platform(
+            &github,
+            "github-issue:acme/repo:12"
+        ));
         assert!(thread_key_matches_platform(
             &github,
             "github-manage:acme/repo:12"
