@@ -373,7 +373,11 @@ class XClient:
             return None, [], None
         params = {**self._tweet_params(), "exclude": "retweets"}
         tweets, meta, includes = self._paged(
-            f"/users/{user['user_id']}/tweets", "data", limit, params
+            f"/users/{user['user_id']}/tweets",
+            "data",
+            limit,
+            params,
+            min_page_size=5,
         )
         return user, [self._normalize_tweet(tweet, includes) for tweet in tweets], meta
 

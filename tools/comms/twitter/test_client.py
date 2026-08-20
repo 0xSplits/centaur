@@ -112,8 +112,34 @@ def test_timeline_uses_specific_user_posts_endpoint() -> None:
     assert tweets[0]["screen_name"] == "ada"
     assert client.requests[0][0] == "/users/by/username/ada"
     assert client.requests[1][0] == "/users/10/tweets"
-    assert client.requests[1][1]["max_results"] == 1
+    assert client.requests[1][1]["max_results"] == 5
     assert client.requests[1][1]["pagination_token"] is None
+
+
+def test_timeline_uses_minimum_page_size_for_one_item_remainder() -> None:
+    first_page = [
+        {"id": str(tweet_id), "author_id": "10", "text": f"post {tweet_id}"}
+        for tweet_id in range(1, 60)
+    ]
+    client = StubXClient(
+        [
+            {"data": {"id": "10", "username": "ada", "name": "Ada"}},
+            {"data": first_page, "meta": {"next_token": "next-page"}},
+            {
+                "data": [{"id": "60", "author_id": "10", "text": "post 60"}],
+                "meta": {},
+            },
+        ]
+    )
+
+    _, tweets, meta = client.get_timeline("ada", limit=60)
+
+    assert len(tweets) == 60
+    assert tweets[-1]["tweet_id"] == "60"
+    assert meta == {"result_count": 60}
+    assert client.requests[1][1]["max_results"] == 60
+    assert client.requests[2][1]["max_results"] == 5
+    assert client.requests[2][1]["pagination_token"] == "next-page"
 
 
 def test_user_posts_keeps_authored_posts_endpoint() -> None:
