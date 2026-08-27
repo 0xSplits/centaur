@@ -23,6 +23,39 @@ RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
     && ln -sf /usr/bin/fdfind /usr/local/bin/fd \
     && rm -rf /usr/share/doc /usr/share/man /usr/share/info
 
+# ── Local test services: postgres server + redis ────────────────────────────
+# The sandbox has no container runtime (PE-8507): docker is present as a CLI
+# with no daemon behind it, so integration suites that expect a database have to
+# talk to a process in the pod instead. Both of these run as uid 1001 — no
+# capability, no privileged pod, no change to the sandbox's isolation model.
+#
+# Postgres is pinned to 15 from PGDG because that is what 0xSplits/splits uses
+# in BOTH docker-compose.yml and .github/workflows/integration-tests.yaml;
+# noble's own postgresql metapackage is 16. Redis is whatever noble ships (7.x
+# vs CI's 6.2) because nothing actually reads it — it exists only because
+# importing the splits query modules eagerly constructs a cache client, and
+# without a server the reconnect loop floods the test output.
+#
+# The createcluster.d drop-in suppresses the Debian postinst's automatic `main`
+# cluster: there is no systemd in a build, the cluster would never be used, and
+# test_services runs its own initdb under the agent's home. It is a drop-in
+# rather than createcluster.conf because that file is a postgresql-common
+# conffile, and pre-writing it makes dpkg prompt mid-build.
+RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
+    --mount=type=cache,target=/var/lib/apt,sharing=locked \
+    mkdir -p /etc/postgresql-common/createcluster.d \
+    && echo "create_main_cluster = false" \
+      > /etc/postgresql-common/createcluster.d/no-main-cluster.conf \
+    && curl -fsSL https://www.postgresql.org/media/keys/ACCC4CF8.asc \
+      | gpg --dearmor -o /usr/share/keyrings/postgresql-archive-keyring.gpg \
+    && echo "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/postgresql-archive-keyring.gpg] https://apt.postgresql.org/pub/repos/apt $(lsb_release -cs)-pgdg main" \
+      | tee /etc/apt/sources.list.d/pgdg.list > /dev/null \
+    && apt-get update && apt-get install -y --no-install-recommends \
+      postgresql-15 redis-server \
+    && /usr/lib/postgresql/15/bin/pg_ctl --version | grep -F "(PostgreSQL) 15." \
+    && redis-server --version \
+    && rm -rf /usr/share/doc /usr/share/man /usr/share/info
+
 # reth's default JIT build uses revmc, which depends on llvm-sys 221.
 RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
     --mount=type=cache,target=/var/lib/apt,sharing=locked \
