@@ -7,7 +7,7 @@ use std::sync::{
     mpsc::{self, Receiver, RecvTimeoutError},
 };
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use codex_app_server_protocol::UserInput;
 use serde_json::{Value, json};
@@ -622,8 +622,10 @@ impl CodexJsonRpcChild {
                 continue;
             }
             let terminal = is_terminal_notification(&value, thread_id, turn_id);
+            let ends_on_error = terminal && notification_method(&value) == Some("error");
             match guard.observe(value, terminal) {
                 GuardStep::Retry(withheld) => {
+                    self.discard_failed_turn_completion(thread_id, turn_id)?;
                     return Ok(TurnTermination::RetriableEngineError { withheld });
                 }
                 GuardStep::Forward(values) => {
@@ -634,6 +636,9 @@ impl CodexJsonRpcChild {
                 GuardStep::ForwardThenDone(values) => {
                     for value in &values {
                         write_value(stdout, value)?;
+                    }
+                    if ends_on_error {
+                        self.discard_failed_turn_completion(thread_id, turn_id)?;
                     }
                     return Ok(TurnTermination::Done);
                 }
@@ -646,6 +651,37 @@ impl CodexJsonRpcChild {
                 turn_id,
                 traceparent,
             )?;
+        }
+    }
+
+    /// Codex follows a turn-ending `error` with that turn's `turn/completed`. The session
+    /// runtime forgets the turn at the `error` and attributes later lines to the next execution,
+    /// where the chat renderers post the old failure again. Read and drop them here instead.
+    fn discard_failed_turn_completion(&mut self, thread_id: &str, turn_id: &str) -> Result<()> {
+        let deadline = Instant::now() + FAILED_TURN_COMPLETION_GRACE;
+        loop {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                eprintln!(
+                    "codex sent no turn/completed for failed turn {turn_id} within \
+                     {FAILED_TURN_COMPLETION_GRACE:?}; a late one will reach the next turn"
+                );
+                return Ok(());
+            }
+            let Some(value) = self.read_value_timeout(remaining)? else {
+                continue;
+            };
+            if is_server_request(&value) {
+                self.send_error_response(&value)?;
+                continue;
+            }
+            if matches!(
+                notification_method(&value),
+                Some("turn/completed" | "turn/failed")
+            ) && is_terminal_notification(&value, thread_id, turn_id)
+            {
+                return Ok(());
+            }
         }
     }
 
@@ -801,6 +837,10 @@ impl TurnGuard {
         }
     }
 }
+
+/// A guess, not a measurement: Codex sends the failed turn's `turn/completed` as the task
+/// unwinds, well under this. Raise it if the no-`turn/completed` message shows up in agent logs.
+const FAILED_TURN_COMPLETION_GRACE: Duration = Duration::from_secs(5);
 
 /// Maximum number of times a turn that hit a transient engine-registration
 /// error is re-submitted. `CODEX_ENGINE_RETRY_MAX` overrides the default; `0`

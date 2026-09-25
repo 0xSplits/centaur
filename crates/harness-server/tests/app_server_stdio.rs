@@ -598,6 +598,90 @@ fn fake_codex_blocks_mode_spawns_app_server_and_translates_user_blocks() {
 }
 
 #[test]
+fn fake_codex_failed_turn_completion_does_not_leak_into_next_turn() {
+    let fake_codex = temp_path("fake-failing-codex.sh");
+    let fake_codex_log = temp_path("fake-failing-codex-requests.jsonl");
+    let script = fake_codex_failing_first_turn_script(&fake_codex_log);
+    std::fs::write(&fake_codex, script).expect("write fake codex script");
+    let mut permissions = std::fs::metadata(&fake_codex)
+        .expect("fake codex metadata")
+        .permissions();
+    permissions.set_mode(0o755);
+    std::fs::set_permissions(&fake_codex, permissions).expect("chmod fake codex script");
+
+    let mut bridge = BridgeProcess::spawn_harness_blocks(
+        Harness::Codex,
+        None,
+        Some((
+            "CODEX_BIN",
+            fake_codex.to_str().expect("utf-8 fake codex path"),
+        )),
+    );
+    let deadline = Instant::now() + Duration::from_secs(10);
+
+    bridge.send(blocks_user_line("first turn fails"));
+    loop {
+        let value = bridge.read_json(deadline);
+        if value.get("method").and_then(Value::as_str) == Some("error") {
+            break;
+        }
+    }
+
+    bridge.send(blocks_user_line("try again"));
+    let mut second_turn = Vec::new();
+    loop {
+        let value = bridge.read_json(deadline);
+        let is_completed = value.get("method").and_then(Value::as_str) == Some("turn/completed");
+        second_turn.push(value);
+        if is_completed {
+            break;
+        }
+    }
+    bridge.finish_successfully();
+
+    let leaked: Vec<&Value> = second_turn
+        .iter()
+        .filter(|value| {
+            value.pointer("/params/turnId").and_then(Value::as_str) == Some("turn-1")
+                || value.pointer("/params/turn/id").and_then(Value::as_str) == Some("turn-1")
+        })
+        .collect();
+    assert!(
+        leaked.is_empty(),
+        "the failed turn's events leaked into the next turn: {leaked:?}"
+    );
+    let completed = second_turn.last().expect("second turn completed");
+    assert_eq!(
+        completed.pointer("/params/turn/id").and_then(Value::as_str),
+        Some("turn-2")
+    );
+    assert_eq!(
+        completed
+            .pointer("/params/turn/status")
+            .and_then(Value::as_str),
+        Some("completed")
+    );
+
+    let _ = std::fs::remove_file(fake_codex);
+    let _ = std::fs::remove_file(fake_codex_log);
+}
+
+fn blocks_user_line(prompt: &str) -> Value {
+    json!({
+        "type": "user",
+        "thread_key": "discord:C123:123",
+        "trace_metadata": {
+            "source": "discordbot",
+            "action": "execute"
+        },
+        "message": {
+            "role": "user",
+            "content": [{"type": "text", "text": prompt}],
+        },
+    })
+}
+
+#[test]
 fn fake_codex_blocks_mode_interrupts_active_turn() {
     let fake_codex = temp_path("fake-interruptible-codex.sh");
     let fake_codex_log = temp_path("fake-interruptible-codex-requests.jsonl");
@@ -2331,6 +2415,67 @@ while IFS= read -r line; do
       id=$(request_id "$line")
       printf '{"id":%s,"result":{}}\n' "$id"
       printf '%s\n' '{"method":"turn/completed","params":{"threadId":"thread-1","turn":{"id":"turn-1","items":[],"itemsView":"full","status":"interrupted","error":null,"startedAt":1,"completedAt":2,"durationMs":1}}}'
+      ;;
+    *)
+      printf '%s\n' "unexpected request: $line" >&2
+      exit 65
+      ;;
+  esac
+done
+"#,
+    );
+    script
+}
+
+// Mirrors Codex's order for a failed turn: the `error` notification, then the
+// `turn/completed` that carries the same error. The first turn fails, the second succeeds.
+fn fake_codex_failing_first_turn_script(log_path: &Path) -> String {
+    let mut script = String::new();
+    script.push_str("#!/bin/sh\n");
+    script.push_str("log=");
+    script.push_str(&shell_quote(log_path));
+    script.push_str(
+        r#"
+touch "$log"
+if [ "${1:-}" = "app-server" ] && [ "${2:-}" = "--help" ]; then
+  printf '%s\n' '--listen stdio://'
+  exit 0
+fi
+if [ "${1:-}" != "app-server" ]; then
+  printf '%s\n' 'expected app-server command' >&2
+  exit 64
+fi
+
+request_id() {
+  printf '%s' "$1" | sed -n 's/.*"id":\([0-9][0-9]*\).*/\1/p'
+}
+
+turns=0
+while IFS= read -r line; do
+  printf '%s\n' "$line" >> "$log"
+  case "$line" in
+    *'"method":"initialize"'*)
+      id=$(request_id "$line")
+      printf '{"id":%s,"result":{"userAgent":"fake-codex"}}\n' "$id"
+      ;;
+    *'"method":"thread/start"'*)
+      id=$(request_id "$line")
+      printf '{"id":%s,"result":{"thread":{"id":"thread-1"}}}\n' "$id"
+      ;;
+    *'"method":"turn/start"'*)
+      id=$(request_id "$line")
+      turns=$((turns + 1))
+      turn="turn-$turns"
+      printf '{"id":%s,"result":{"turn":{"id":"%s"}}}\n' "$id" "$turn"
+      printf '{"method":"turn/started","params":{"threadId":"thread-1","turn":{"id":"%s","items":[],"itemsView":"full","status":"inProgress","error":null,"startedAt":1,"completedAt":null,"durationMs":null}}}\n' "$turn"
+      if [ "$turns" = "1" ]; then
+        printf '{"method":"item/agentMessage/delta","params":{"threadId":"thread-1","turnId":"%s","itemId":"work-1","delta":"working"}}\n' "$turn"
+        printf '{"method":"error","params":{"error":{"message":"exceeded retry limit, last status: 429 Too Many Requests","codexErrorInfo":{"responseTooManyFailedAttempts":{"httpStatusCode":429}},"additionalDetails":null},"willRetry":false,"threadId":"thread-1","turnId":"%s"}}\n' "$turn"
+        printf '{"method":"turn/completed","params":{"threadId":"thread-1","turn":{"id":"%s","items":[],"itemsView":"full","status":"failed","error":{"message":"exceeded retry limit, last status: 429 Too Many Requests","codexErrorInfo":{"responseTooManyFailedAttempts":{"httpStatusCode":429}},"additionalDetails":null},"startedAt":1,"completedAt":2,"durationMs":1}}}\n' "$turn"
+      else
+        printf '{"method":"item/agentMessage/delta","params":{"threadId":"thread-1","turnId":"%s","itemId":"answer-1","delta":"done"}}\n' "$turn"
+        printf '{"method":"turn/completed","params":{"threadId":"thread-1","turn":{"id":"%s","items":[],"itemsView":"full","status":"completed","error":null,"startedAt":1,"completedAt":2,"durationMs":1}}}\n' "$turn"
+      fi
       ;;
     *)
       printf '%s\n' "unexpected request: $line" >&2
