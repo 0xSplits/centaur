@@ -625,7 +625,7 @@ impl CodexJsonRpcChild {
             let ends_on_error = terminal && notification_method(&value) == Some("error");
             match guard.observe(value, terminal) {
                 GuardStep::Retry(withheld) => {
-                    self.discard_failed_turn_completion(thread_id, turn_id)?;
+                    self.discard_failed_turn_completion(thread_id, turn_id);
                     return Ok(TurnTermination::RetriableEngineError { withheld });
                 }
                 GuardStep::Forward(values) => {
@@ -638,7 +638,7 @@ impl CodexJsonRpcChild {
                         write_value(stdout, value)?;
                     }
                     if ends_on_error {
-                        self.discard_failed_turn_completion(thread_id, turn_id)?;
+                        self.discard_failed_turn_completion(thread_id, turn_id);
                     }
                     return Ok(TurnTermination::Done);
                 }
@@ -657,7 +657,15 @@ impl CodexJsonRpcChild {
     /// Codex follows a turn-ending `error` with that turn's `turn/completed`. The session
     /// runtime forgets the turn at the `error` and attributes later lines to the next execution,
     /// where the chat renderers post the old failure again. Read and drop them here instead.
-    fn discard_failed_turn_completion(&mut self, thread_id: &str, turn_id: &str) -> Result<()> {
+    fn discard_failed_turn_completion(&mut self, thread_id: &str, turn_id: &str) {
+        // A read error must not fail the turn: the client already has the `error`, and a second
+        // failure would reach the next execution. A dead Codex surfaces on the next `turn/start`.
+        if let Err(error) = self.read_until_failed_turn_completion(thread_id, turn_id) {
+            eprintln!("codex failed while draining failed turn {turn_id}: {error:#}");
+        }
+    }
+
+    fn read_until_failed_turn_completion(&mut self, thread_id: &str, turn_id: &str) -> Result<()> {
         let deadline = Instant::now() + FAILED_TURN_COMPLETION_GRACE;
         loop {
             let remaining = deadline.saturating_duration_since(Instant::now());

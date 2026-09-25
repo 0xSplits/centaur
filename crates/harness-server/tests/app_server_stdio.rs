@@ -666,6 +666,68 @@ fn fake_codex_failed_turn_completion_does_not_leak_into_next_turn() {
     let _ = std::fs::remove_file(fake_codex_log);
 }
 
+#[test]
+fn fake_codex_engine_retry_drops_the_failed_attempts_completion() {
+    let fake_codex = temp_path("fake-engine-retry-codex.sh");
+    let fake_codex_log = temp_path("fake-engine-retry-codex-requests.jsonl");
+    let script = fake_codex_failing_first_turn_script(&fake_codex_log);
+    std::fs::write(&fake_codex, script).expect("write fake codex script");
+    let mut permissions = std::fs::metadata(&fake_codex)
+        .expect("fake codex metadata")
+        .permissions();
+    permissions.set_mode(0o755);
+    std::fs::set_permissions(&fake_codex, permissions).expect("chmod fake codex script");
+
+    let mut bridge = BridgeProcess::spawn_harness_blocks_envs(
+        Harness::Codex,
+        None,
+        Some((
+            "CODEX_BIN",
+            fake_codex.to_str().expect("utf-8 fake codex path"),
+        )),
+        &[
+            ("FAKE_CODEX_FIRST_TURN_STREAMS", "0"),
+            (
+                "FAKE_CODEX_FIRST_ERROR_MESSAGE",
+                "JSON-RPC error -32602: Job registration failed: Engine not found",
+            ),
+        ],
+    );
+    let deadline = Instant::now() + Duration::from_secs(10);
+
+    bridge.send(blocks_user_line("retried by the engine guard"));
+    let mut events = Vec::new();
+    loop {
+        let value = bridge.read_json(deadline);
+        let is_completed = value.get("method").and_then(Value::as_str) == Some("turn/completed");
+        events.push(value);
+        if is_completed {
+            break;
+        }
+    }
+    bridge.finish_successfully();
+
+    let failures: Vec<&Value> = events
+        .iter()
+        .filter(|value| {
+            value.get("method").and_then(Value::as_str) == Some("error")
+                || value.pointer("/params/turn/status").and_then(Value::as_str) == Some("failed")
+        })
+        .collect();
+    assert!(
+        failures.is_empty(),
+        "the retried attempt's failure reached the client: {failures:?}"
+    );
+    let completed = events.last().expect("retried turn completed");
+    assert_eq!(
+        completed.pointer("/params/turn/id").and_then(Value::as_str),
+        Some("turn-2")
+    );
+
+    let _ = std::fs::remove_file(fake_codex);
+    let _ = std::fs::remove_file(fake_codex_log);
+}
+
 fn blocks_user_line(prompt: &str) -> Value {
     json!({
         "type": "user",
@@ -2450,6 +2512,7 @@ request_id() {
   printf '%s' "$1" | sed -n 's/.*"id":\([0-9][0-9]*\).*/\1/p'
 }
 
+error_message="${FAKE_CODEX_FIRST_ERROR_MESSAGE:-exceeded retry limit, last status: 429 Too Many Requests}"
 turns=0
 while IFS= read -r line; do
   printf '%s\n' "$line" >> "$log"
@@ -2469,9 +2532,11 @@ while IFS= read -r line; do
       printf '{"id":%s,"result":{"turn":{"id":"%s"}}}\n' "$id" "$turn"
       printf '{"method":"turn/started","params":{"threadId":"thread-1","turn":{"id":"%s","items":[],"itemsView":"full","status":"inProgress","error":null,"startedAt":1,"completedAt":null,"durationMs":null}}}\n' "$turn"
       if [ "$turns" = "1" ]; then
-        printf '{"method":"item/agentMessage/delta","params":{"threadId":"thread-1","turnId":"%s","itemId":"work-1","delta":"working"}}\n' "$turn"
-        printf '{"method":"error","params":{"error":{"message":"exceeded retry limit, last status: 429 Too Many Requests","codexErrorInfo":{"responseTooManyFailedAttempts":{"httpStatusCode":429}},"additionalDetails":null},"willRetry":false,"threadId":"thread-1","turnId":"%s"}}\n' "$turn"
-        printf '{"method":"turn/completed","params":{"threadId":"thread-1","turn":{"id":"%s","items":[],"itemsView":"full","status":"failed","error":{"message":"exceeded retry limit, last status: 429 Too Many Requests","codexErrorInfo":{"responseTooManyFailedAttempts":{"httpStatusCode":429}},"additionalDetails":null},"startedAt":1,"completedAt":2,"durationMs":1}}}\n' "$turn"
+        if [ "${FAKE_CODEX_FIRST_TURN_STREAMS:-1}" = "1" ]; then
+          printf '{"method":"item/agentMessage/delta","params":{"threadId":"thread-1","turnId":"%s","itemId":"work-1","delta":"working"}}\n' "$turn"
+        fi
+        printf '{"method":"error","params":{"error":{"message":"%s","codexErrorInfo":"other","additionalDetails":null},"willRetry":false,"threadId":"thread-1","turnId":"%s"}}\n' "$error_message" "$turn"
+        printf '{"method":"turn/completed","params":{"threadId":"thread-1","turn":{"id":"%s","items":[],"itemsView":"full","status":"failed","error":{"message":"%s","codexErrorInfo":"other","additionalDetails":null},"startedAt":1,"completedAt":2,"durationMs":1}}}\n' "$turn" "$error_message"
       else
         printf '{"method":"item/agentMessage/delta","params":{"threadId":"thread-1","turnId":"%s","itemId":"answer-1","delta":"done"}}\n' "$turn"
         printf '{"method":"turn/completed","params":{"threadId":"thread-1","turn":{"id":"%s","items":[],"itemsView":"full","status":"completed","error":null,"startedAt":1,"completedAt":2,"durationMs":1}}}\n' "$turn"
