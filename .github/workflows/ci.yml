@@ -4,6 +4,8 @@ on:
   pull_request:
     branches: [main]
   merge_group:
+  push:
+    branches: [main]
 
 concurrency:
   group: ci-${{ github.workflow }}-${{ github.ref }}
@@ -187,6 +189,7 @@ jobs:
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           workspaces: crates/harness-server
+          save-if: ${{ github.ref == 'refs/heads/main' }}
 
       - name: Format
         working-directory: crates/harness-server
@@ -257,6 +260,7 @@ jobs:
           workspaces: |
             crates/active-record-encryption
             services/proxy-sync
+          save-if: ${{ github.ref == 'refs/heads/main' }}
 
       - name: Format Active Record encryption crate
         working-directory: crates/active-record-encryption
@@ -337,6 +341,7 @@ jobs:
           workspaces: |
             crates/absurd-sdk
             services/api-rs
+          save-if: ${{ github.ref == 'refs/heads/main' }}
 
       - name: Format Absurd SDK
         working-directory: crates/absurd-sdk
@@ -483,6 +488,7 @@ jobs:
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           workspaces: services/api-rs
+          save-if: ${{ github.ref == 'refs/heads/main' }}
 
       - name: Run sandbox backend invariants in Kind
         working-directory: services/api-rs
