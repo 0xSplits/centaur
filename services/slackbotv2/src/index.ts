@@ -75,7 +75,8 @@ import { createFlagMessageOverridesStrategy } from './message-overrides-strategy
 import {
   isAllowedSlackMessage,
   isAllowedSlackWebhookBody,
-  parseSlackWebhookPayload
+  parseSlackWebhookPayload,
+  slackStreamRecipientUserId
 } from './slack-events'
 import { isSlackStopCommand } from './stop-command'
 import {
@@ -2702,7 +2703,7 @@ async function renderExecutionStream(
     // author.
     const sent = await thread.adapter.stream!(thread.id, visibleStream, {
       recipientTeamId: message.teamId,
-      recipientUserId: message.author.userId,
+      recipientUserId: await slackStreamRecipientUserId(message.author, options, options.logger ?? noopLogger),
       ...(taskDisplayMode === 'none' ? {} : { taskDisplayMode }),
       // stopBlocks append optional response metadata to the finalized Slack
       // message via chat.stopStream.
@@ -2754,7 +2755,7 @@ async function renderRecoveredExecutionStream(
       visibleStream,
       {
         recipientTeamId: message.teamId,
-        recipientUserId: message.author.userId,
+        recipientUserId: await slackStreamRecipientUserId(message.author, options, options.logger ?? noopLogger),
         ...(taskDisplayMode === 'none' ? {} : { taskDisplayMode })
       }
     ) ?? await thread.post(visibleStream)
