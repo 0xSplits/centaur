@@ -3,8 +3,12 @@ use std::{net::SocketAddr, time::Duration};
 use clap::Parser;
 
 pub const PDF_MIME_TYPE: &str = "application/pdf";
+pub const FOLDER_MIME_TYPE: &str = "application/vnd.google-apps.folder";
 pub const QUEUE_NAME: &str = "company_context";
 pub const DRIVE_SCAN_TASK: &str = "drive.user.scan";
+pub const SHARED_DRIVES_DISCOVER_TASK: &str = "drive.shared_drives.discover";
+pub const SHARED_DRIVE_SCAN_TASK: &str = "drive.shared_drive.scan";
+pub const SHARED_FOLDERS_BATCH_TASK: &str = "drive.shared_folders.batch";
 pub const DRIVE_CREDENTIALS_RECONCILE_TASK: &str = "drive.credentials.reconcile";
 pub const PDF_EXTRACT_TASK: &str = "drive.pdf.extract";
 pub const DOCUMENT_EMBED_TASK: &str = "drive.document.embed";
@@ -101,6 +105,14 @@ pub struct Config {
         value_parser = positive_usize
     )]
     pub max_scan_pages: usize,
+    /// Folders listed per Drive search while walking shared folders.
+    #[arg(
+        long,
+        env = "COMPANY_CONTEXT_FOLDER_WALK_BATCH_SIZE",
+        default_value = "50",
+        value_parser = folder_walk_batch_size
+    )]
+    pub folder_walk_batch_size: usize,
     #[arg(
         long,
         env = "COMPANY_CONTEXT_MAX_PDF_BYTES",
@@ -178,6 +190,14 @@ fn drive_page_size(value: &str) -> Result<u16, String> {
         return Err("value must not exceed 1000".to_owned());
     }
     Ok(value as u16)
+}
+
+fn folder_walk_batch_size(value: &str) -> Result<usize, String> {
+    let value = positive_usize(value)?;
+    if value > 100 {
+        return Err("value must not exceed 100".to_owned());
+    }
+    Ok(value)
 }
 
 fn embeddings_dimensions(value: &str) -> Result<usize, String> {

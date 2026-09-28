@@ -1,6 +1,6 @@
 # Company Context
 
-Standalone company-context ingestion service. The initial implementation indexes text-bearing PDFs from users' My Drive and shared folders using durable Absurd tasks. Shared Drives are intentionally excluded until they receive independent drive-scoped tasks and checkpoints.
+Standalone company-context ingestion service. The initial implementation indexes text-bearing PDFs from users' My Drive, shared folders, Shared Drives they are members of, and Shared Drive folders shared with them without membership, using durable Absurd tasks. Each user corpus and each member Shared Drive is followed through its own Drive change feed and checkpoint. Shared Drive folders shared with non-members have no change feed, so they are walked recursively each cycle, and files no walk has reached for 24 hours are removed.
 
 The service owns these Postgres schemas:
 
@@ -39,7 +39,13 @@ on rate limits and retry server errors with bounded exponential backoff. Durable
 document tasks record known permanent content and request failures as `rejected`
 instead of retrying them. A credential reconciliation task deactivates
 observations from dead or deleted broker credentials and removes files only when
-no live user credential can still observe them. The Helm deployment reads
+no live user credential can still observe them. Each scan interval also lists
+every credential's Shared Drives and the Shared Drive items shared with it,
+enqueues a scan per member drive, starts a folder walk per other drive, and revokes
+that credential's access to files in drives it can no longer reach. A folder
+walk runs as one Absurd task per batch of folders: each batch lists its
+folders' children in a single Drive search and spawns batches for the
+subfolders. The Helm deployment reads
 `OPENAI_API_KEY` directly from the shared Kubernetes Secret.
 
 Common optional settings:
@@ -52,6 +58,7 @@ Common optional settings:
 - `COMPANY_CONTEXT_SCAN_INTERVAL_SECONDS` (default `300`)
 - `COMPANY_CONTEXT_DRIVE_PAGE_SIZE` (default `100`)
 - `COMPANY_CONTEXT_MAX_SCAN_PAGES` (default `10`)
+- `COMPANY_CONTEXT_FOLDER_WALK_BATCH_SIZE` (default `50`, at most `100`)
 - `COMPANY_CONTEXT_MAX_PDF_BYTES` (default `26214400`)
 - `COMPANY_CONTEXT_MAX_EXTRACTED_BYTES` (default `52428800`)
 - `COMPANY_CONTEXT_EXTRACTION_TIMEOUT_SECONDS` (default `120`)
