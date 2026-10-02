@@ -34,7 +34,7 @@ use crate::otel::{TraceContext, TurnStatus as TelemetryTurnStatus, TurnTelemetry
 use crate::pi::PiHarness;
 use crate::traits::{
     AppServerNormalizer, AppServerRuntime, HarnessChild, HarnessKind, HarnessServer,
-    NormalizedEvent, ThreadState,
+    NormalizedEvent, ThreadState, TurnHold,
 };
 use crate::turn::{BridgeConfig, CodexTurnNormalizer};
 use crate::util::{absolute_path, default_codex_home, write_value};
@@ -1336,6 +1336,9 @@ fn run_harness_turn<H: HarnessServer, W: Write>(
     // the fallback. Any further output (the native result on its way, trailing
     // noise, or a continuation of the turn) pushes the deadline back.
     let mut settle_deadline: Option<Instant> = None;
+    // Armed while the harness holds the turn for a background follow-up that
+    // has not started; any output pushes it back.
+    let mut hold_deadline: Option<Instant> = None;
     let mut last_session_id = state.harness_session_id.clone();
     let mut event_normalizer = H::EventNormalizer::default();
     let mut completed_turn = None;
@@ -1399,6 +1402,17 @@ fn run_harness_turn<H: HarnessServer, W: Write>(
                         _ => {}
                     }
                 }
+                hold_deadline = match harness.turn_hold(&event_normalizer) {
+                    TurnHold::Idle(window) => Some(Instant::now() + window),
+                    TurnHold::Released | TurnHold::Waiting => None,
+                };
+            }
+            Err(RecvTimeoutError::Timeout)
+                if hold_deadline.is_some_and(|deadline| Instant::now() >= deadline) =>
+            {
+                return Err(HarnessServerError::BackgroundFollowUpStalled {
+                    kind: harness.kind(),
+                });
             }
             Err(RecvTimeoutError::Timeout) => match settle_deadline {
                 Some(deadline) if Instant::now() >= deadline => terminal = true,
@@ -1427,6 +1441,12 @@ fn run_harness_turn<H: HarnessServer, W: Write>(
             }
         }
         if terminal {
+            // Background work outliving the turn (e.g. an error result while
+            // agents run) would deliver its output into the next turn; stop
+            // it with the process, which the next turn resumes.
+            if harness.turn_hold(&event_normalizer) != TurnHold::Released {
+                state.process = None;
+            }
             if let Some(notification) = normalizer.finish_turn(None)? {
                 if let ServerNotification::TurnCompleted(completed) = &notification {
                     completed_turn = Some(completed.turn.clone());
