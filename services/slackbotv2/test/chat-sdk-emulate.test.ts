@@ -26,6 +26,7 @@ import {
 import { clearRequesterIdentityCacheForTests } from '../src/session-api'
 import { slackbotMetrics } from '../src/metrics'
 import { createOpenAiMessageOverridesStrategy } from '../src/message-overrides-strategy'
+import { modelDisplayName } from '../src/response-context'
 import claudeSettings from '../../../harness/claude/settings.json'
 
 const BOT_TOKEN = 'xoxb-slackbotv2-emulate'
@@ -1322,7 +1323,7 @@ describe('slackbotv2', () => {
         .filter(call => call.method === 'chat.stopStream')
         .flatMap(call => (Array.isArray(call.body.blocks) ? (call.body.blocks as unknown[]) : []))
         .map(block => JSON.stringify(block))
-        .filter(text => text.includes('GPT-5.6-SOL'))
+        .filter(text => text.includes('Sol 5.6'))
 
     const parent = await postUserMessage('Response metadata thread context.')
     const firstMention = await postUserMessage(`<@${BOT_USER_ID}> start`, parent.ts)
@@ -1389,7 +1390,7 @@ describe('slackbotv2', () => {
         .filter(call => call.method === 'chat.stopStream')
         .flatMap(call => (Array.isArray(call.body.blocks) ? (call.body.blocks as unknown[]) : []))
         .map(block => JSON.stringify(block))
-        .filter(text => text.includes('GPT-5.6-SOL'))
+        .filter(text => text.includes('Sol 5.6'))
 
     const parent = await postUserMessage('Service tier thread context.')
     const firstMention = await postUserMessage(`<@${BOT_USER_ID}> start`, parent.ts)
@@ -1538,7 +1539,7 @@ describe('slackbotv2', () => {
     const blocks = metadataBlockTexts(slackApi.calls)
     expect(blocks).toHaveLength(1)
     expect(blocks[0]).toContain('Claude Code')
-    expect(blocks[0]).toContain(claudeSettings.model.toUpperCase())
+    expect(blocks[0]).toContain(modelDisplayName(claudeSettings.model))
 
     // The effective default model is recorded in execution metadata, but never
     // forwarded to the harness — only explicit overrides ride the input lines.
