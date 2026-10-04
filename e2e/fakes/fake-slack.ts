@@ -4,10 +4,11 @@
 // delivered to slackbotv2 as a signed app_mention event, the way Slack would.
 // No dependencies, so it runs from a ConfigMap on the stock Bun image.
 import { createHmac } from 'node:crypto'
-import { BOT, CHANNEL, TEAM, USER, USER_TOKEN } from './slack-fixture'
+import { BOT, CHANNELS, TEAM, USER, USER_TOKEN } from './slack-fixture'
 
 type Message = {
   type: 'message'
+  channel: string
   ts: string
   text: string
   user: string
@@ -24,7 +25,9 @@ const eventsUrl = requiredEnv('SLACK_EVENTS_URL')
 
 const messages: Message[] = []
 let lastTs = 0
-let eventCount = 0
+// Slack retries an event three times (immediately, then after 1 and 5
+// minutes); these delays are compressed to fit a turn's timeout.
+const EVENT_RETRY_DELAYS_MS = [1_000, 5_000, 30_000]
 
 Bun.serve({
   port,
@@ -60,33 +63,38 @@ function handle(method: string, actor: 'bot' | 'user', body: Record<string, unkn
       return str(body.bot) === BOT.id
         ? { ok: true, bot: { id: BOT.id, name: BOT.name, user_id: BOT.userId, app_id: BOT.appId, deleted: false } }
         : { ok: false, error: 'bot_not_found' }
-    case 'conversations.info':
-      return channel === CHANNEL.id
-        ? { ok: true, channel: { id: CHANNEL.id, name: CHANNEL.name, is_channel: true, is_member: true, is_private: false, is_im: false } }
+    case 'conversations.info': {
+      const known = CHANNELS.find(c => c.id === channel)
+      return known
+        ? { ok: true, channel: { ...known, is_channel: true, is_member: true, is_private: false, is_im: false } }
         : { ok: false, error: 'channel_not_found' }
+    }
     case 'users.conversations':
     case 'conversations.list':
       return {
         ok: true,
-        channels: [{ id: CHANNEL.id, name: CHANNEL.name, is_channel: true, is_member: true, is_private: false }],
+        channels: CHANNELS.map(c => ({ ...c, is_channel: true, is_member: true, is_private: false })),
         response_metadata: { next_cursor: '' }
       }
     case 'conversations.history':
       return {
         ok: true,
         has_more: false,
-        messages: messages.filter(m => !m.thread_ts || m.thread_ts === m.ts).reverse().map(withReplies)
+        messages: messages
+          .filter(m => m.channel === channel && (!m.thread_ts || m.thread_ts === m.ts))
+          .reverse()
+          .map(withReplies)
       }
     case 'conversations.replies': {
-      const root = messages.find(m => m.ts === str(body.ts))
-      if (channel !== CHANNEL.id || !root) return { ok: false, error: 'thread_not_found' }
+      const root = messages.find(m => m.channel === channel && m.ts === str(body.ts))
+      if (!root) return { ok: false, error: 'thread_not_found' }
       const thread = messages.filter(m => m === root || m.thread_ts === root.ts)
       return { ok: true, has_more: false, messages: thread.map(withReplies) }
     }
     case 'chat.postMessage':
     case 'chat.startStream': {
-      if (channel !== CHANNEL.id) return { ok: false, error: 'channel_not_found' }
-      const message = post(actor, {
+      if (!CHANNELS.some(c => c.id === channel)) return { ok: false, error: 'channel_not_found' }
+      const message = post(actor, channel, {
         text: str(body.markdown_text) || str(body.text) || chunksText(body.chunks),
         thread_ts: str(body.thread_ts) || undefined,
         blocks: Array.isArray(body.blocks) ? body.blocks : undefined,
@@ -122,9 +130,14 @@ function handle(method: string, actor: 'bot' | 'user', body: Record<string, unkn
   }
 }
 
-function post(actor: 'bot' | 'user', fields: Omit<Message, 'type' | 'ts' | 'user'>): Message {
+function post(
+  actor: 'bot' | 'user',
+  channel: string,
+  fields: Omit<Message, 'type' | 'channel' | 'ts' | 'user'>
+): Message {
   const message: Message = {
     type: 'message',
+    channel,
     ts: nextTs(),
     user: actor === 'bot' ? BOT.userId : USER.id,
     ...(actor === 'bot' ? { bot_id: BOT.id } : {}),
@@ -141,34 +154,51 @@ async function deliverMention(message: Message): Promise<void> {
     token: 'unused',
     team_id: TEAM.id,
     api_app_id: BOT.appId,
-    event_id: `EvE2E${++eventCount}`,
+    // Unique across fake-slack restarts: slackbotv2 remembers delivered event
+    // IDs in Postgres and drops a retry whose ID it has already seen.
+    event_id: `EvE2E${message.ts.replace('.', '')}`,
     event_time: eventTime,
     authorizations: [{ team_id: TEAM.id, user_id: BOT.userId, is_bot: true }],
     event: {
       type: 'app_mention',
       user: message.user,
       team: TEAM.id,
-      channel: CHANNEL.id,
+      channel: message.channel,
       text: message.text,
       ts: message.ts,
       event_ts: message.ts,
       ...(message.thread_ts ? { thread_ts: message.thread_ts } : {})
     }
   })
-  const signature = createHmac('sha256', signingSecret).update(`v0:${eventTime}:${body}`).digest('hex')
-  try {
-    const response = await fetch(eventsUrl, {
-      method: 'POST',
-      headers: {
-        'content-type': 'application/json',
-        'x-slack-request-timestamp': String(eventTime),
-        'x-slack-signature': `v0=${signature}`
-      },
-      body
-    })
-    log('fake_slack_event_delivered', { ts: message.ts, status: response.status })
-  } catch (error) {
-    log('fake_slack_event_failed', { ts: message.ts, error: String(error) })
+  // Like Slack, retry an undelivered event (no connection or no 2xx) with the
+  // same event_id, so a slackbotv2 restart delays a turn instead of losing it.
+  for (let attempt = 0; ; attempt++) {
+    const timestamp = Math.floor(Date.now() / 1000)
+    const signature = createHmac('sha256', signingSecret).update(`v0:${timestamp}:${body}`).digest('hex')
+    let failure: string
+    try {
+      const response = await fetch(eventsUrl, {
+        method: 'POST',
+        headers: {
+          'content-type': 'application/json',
+          'x-slack-request-timestamp': String(timestamp),
+          'x-slack-signature': `v0=${signature}`,
+          ...(attempt > 0 ? { 'x-slack-retry-num': String(attempt), 'x-slack-retry-reason': 'http_error' } : {})
+        },
+        body
+      })
+      if (response.ok) {
+        log('fake_slack_event_delivered', { ts: message.ts, status: response.status, attempt })
+        return
+      }
+      failure = `status ${response.status}`
+    } catch (error) {
+      failure = String(error)
+    }
+    const delayMs = EVENT_RETRY_DELAYS_MS[attempt]
+    log('fake_slack_event_failed', { ts: message.ts, error: failure, attempt, retrying: delayMs !== undefined })
+    if (delayMs === undefined) return
+    await Bun.sleep(delayMs)
   }
 }
 
