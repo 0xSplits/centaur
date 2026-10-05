@@ -159,16 +159,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn router_builds() {
-        let pool =
-            PgPool::connect_lazy("postgres://postgres:postgres@localhost/centaur_test").unwrap();
-        let _router = build_router_with_runtime(
-            PgSessionStore::new(pool),
-            SandboxRuntime::backend(Arc::new(TestBackend::default()), SandboxSpec::new("test")),
-        );
-    }
-
-    #[tokio::test]
     async fn metrics_endpoint_renders_http_request_metrics() {
         let pool =
             PgPool::connect_lazy("postgres://postgres:postgres@localhost/centaur_test").unwrap();
@@ -806,58 +796,42 @@ mod tests {
             });
     }
 
+    /// Messages and executes carry attachments and long transcripts, so these
+    /// routes must read bodies past axum's 2 MiB default limit.
     #[tokio::test]
-    async fn append_messages_does_not_apply_a_session_body_limit() {
+    async fn session_writes_accept_bodies_over_the_default_limit() {
         let pool =
             PgPool::connect_lazy("postgres://postgres:postgres@localhost/centaur_test").unwrap();
         let app = build_router_with_runtime(
             PgSessionStore::new(pool),
             SandboxRuntime::backend(Arc::new(TestBackend::default()), SandboxSpec::new("test")),
         );
+        let padding = "x".repeat(3 * 1024 * 1024);
 
-        let response = app
-            .oneshot(
-                Request::builder()
-                    .method("POST")
-                    .uri("/api/session/slack%3AC123%3A123.456/messages")
-                    .header(header::AUTHORIZATION, format!("Bearer {}", console_token()))
-                    .header(header::CONTENT_TYPE, "application/json")
-                    .header(header::CONTENT_LENGTH, (256 * 1024 * 1024 + 1).to_string())
-                    .body(Body::from(r#"{"messages":"not-an-array"}"#))
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
+        for (route, field) in [("messages", "messages"), ("execute", "input_lines")] {
+            // A well-formed body with the wrong shape: rejecting it as 422 proves
+            // the whole body was read and parsed rather than refused as too large.
+            let body = json!({ field: padding }).to_string();
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri(format!("/api/session/slack%3AC123%3A123.456/{route}"))
+                        .header(header::AUTHORIZATION, format!("Bearer {}", console_token()))
+                        .header(header::CONTENT_TYPE, "application/json")
+                        .body(Body::from(body))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
 
-        assert_ne!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
-        assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
-    }
-
-    #[tokio::test]
-    async fn execute_does_not_apply_a_session_body_limit() {
-        let pool =
-            PgPool::connect_lazy("postgres://postgres:postgres@localhost/centaur_test").unwrap();
-        let app = build_router_with_runtime(
-            PgSessionStore::new(pool),
-            SandboxRuntime::backend(Arc::new(TestBackend::default()), SandboxSpec::new("test")),
-        );
-
-        let response = app
-            .oneshot(
-                Request::builder()
-                    .method("POST")
-                    .uri("/api/session/slack%3AC123%3A123.456/execute")
-                    .header(header::AUTHORIZATION, format!("Bearer {}", console_token()))
-                    .header(header::CONTENT_TYPE, "application/json")
-                    .header(header::CONTENT_LENGTH, (256 * 1024 * 1024 + 1).to_string())
-                    .body(Body::from(r#"{"input_lines":"not-an-array"}"#))
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-
-        assert_ne!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
-        assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
+            assert_eq!(
+                response.status(),
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "{route}"
+            );
+        }
     }
 
     #[tokio::test]
