@@ -50,10 +50,11 @@ if [ -n "${TOOL_DIRS:-}" ]; then
 fi
 
 if [ -d "$STATE_DIR" ] && [ -w "$STATE_DIR" ]; then
-    mkdir -p "$STATE_DIR/workspace" "$STATE_DIR/uploads" "$STATE_DIR/branches" "$STATE_DIR/codex" "$STATE_DIR/claude"
-    rm -rf "$HOME_DIR/.codex" "$HOME_DIR/.claude" "$HOME_DIR/uploads" "$HOME_DIR/branches"
+    mkdir -p "$STATE_DIR/workspace" "$STATE_DIR/uploads" "$STATE_DIR/branches" "$STATE_DIR/codex" "$STATE_DIR/claude" "$STATE_DIR/pi"
+    rm -rf "$HOME_DIR/.codex" "$HOME_DIR/.claude" "$HOME_DIR/.pi" "$HOME_DIR/uploads" "$HOME_DIR/branches"
     ln -s "$STATE_DIR/codex" "$HOME_DIR/.codex"
     ln -s "$STATE_DIR/claude" "$HOME_DIR/.claude"
+    ln -s "$STATE_DIR/pi" "$HOME_DIR/.pi"
     ln -s "$STATE_DIR/uploads" "$HOME_DIR/uploads"
     ln -s "$STATE_DIR/branches" "$HOME_DIR/branches"
     export CENTAUR_PERSISTENT_STATE=1
@@ -133,10 +134,6 @@ elif [ ! -f "$HOME_DIR/.codex/auth.json" ] && [ -f /etc/centaur/codex-auth.defau
     cp /etc/centaur/codex-auth.default.json "$HOME_DIR/.codex/auth.json"
     chmod 600 "$HOME_DIR/.codex/auth.json"
 fi
-if [ -n "${CENTAUR_TRACE_ID:-}" ]; then
-    printf '%s' "$CENTAUR_TRACE_ID" > "$HOME_DIR/.trace_id"
-fi
-
 HARNESS_CONFIG_DIR="${CENTAUR_HARNESS_CONFIG_DIR:-$HOME_DIR/harness}"
 if [ -f "$HARNESS_CONFIG_DIR/codex/config.toml" ]; then
     cp "$HARNESS_CONFIG_DIR/codex/config.toml" "$HOME_DIR/.codex/config.toml"
@@ -376,17 +373,6 @@ case "$CLAUDE_CODE_AUTH_MODE" in
         ;;
 esac
 
-# ── Pi-mono settings ─────────────────────────────────────────────────────────
-mkdir -p "$HOME_DIR/.pi/agent/extensions"
-cat > "$HOME_DIR/.pi/agent/settings.json" <<EOF
-{
-  "provider": "anthropic",
-  "model": "claude-sonnet-4-20250514",
-  "thinkingLevel": "medium",
-  "autoCompaction": true
-}
-EOF
-
 # ── Per-session workspace clone (no shared worktree metadata) ────────────────
 if [ "${CENTAUR_PERSISTENT_STATE:-0}" = "1" ]; then
     WORKSPACE_DIR="$STATE_DIR/workspace"
@@ -440,20 +426,11 @@ unset _centaur_tools_auto_reload
 # ── Assemble system prompt from bind mounts ──────────────────────────────────
 # Base prompt: mounted as AGENTS_BASE.md when present, fallback to baked-in AGENTS.md.
 # Prompt overlays from mounted repos are appended when present.
+# The selected persona is appended when AGENTS_PERSONA.md exists in the sandbox home.
 TARGET_PROMPT="$WORKSPACE_DIR/AGENTS.md"
-compose-system-prompt --home-dir "$HOME_DIR" --target-prompt "$TARGET_PROMPT"
-
-if [ "${CENTAUR_SANDBOX_OBSERVABILITY_ENABLED:-true}" = "false" ] && [ -f "$TARGET_PROMPT" ]; then
-    cat >> "$TARGET_PROMPT" <<'EOF'
-
----
-
-[Observability access]
-This sandbox does not have Centaur observability access. Do not use vlogs, vmetrics, Grafana, or related internal logs/metrics tools.
-EOF
-fi
-
-# Persona prompt injection is done by the API when it writes AGENTS_BASE.md.
+compose-system-prompt \
+    --home-dir "$HOME_DIR" \
+    --target-prompt "$TARGET_PROMPT"
 
 # Switch to workspace so the harness reads workspace/AGENTS.md (with persona overlay)
 cd "$WORKSPACE_DIR"

@@ -46,6 +46,7 @@ const consoleLogger = {
 
 const options: SlackbotV2Options = {
   apiUrl,
+  agentViewEnabled: booleanEnv('SLACKBOTV2_AGENT_VIEW_ENABLED', false),
   apiKey: optionalEnv('SLACKBOT_API_KEY'),
   assistantStatus: optionalEnv('SLACKBOTV2_ASSISTANT_STATUS'),
   activitySummaryStatusEnabled: booleanEnv('SLACKBOTV2_ACTIVITY_SUMMARY_STATUS_ENABLED', false),
@@ -59,7 +60,6 @@ const options: SlackbotV2Options = {
     'SLACKBOTV2_CODEX_NANOCODEX_ROLLOUT_PERCENT',
     0
   ),
-  consolePublicUrl: optionalEnv('CENTAUR_CONSOLE_PUBLIC_URL'),
   responseMetadataMode: responseMetadataModeEnv('SLACKBOTV2_RESPONSE_METADATA_MODE'),
   responseServiceTierEnabled: booleanEnv('SLACKBOTV2_RESPONSE_SERVICE_TIER_ENABLED', false),
   defaultHarnessType: optionalEnv('SLACKBOTV2_DEFAULT_HARNESS'),
@@ -70,7 +70,8 @@ const options: SlackbotV2Options = {
     ...(optionalEnv('CLAUDE_MODEL') ? { claudecode: optionalEnv('CLAUDE_MODEL')! } : {}),
     ...(optionalEnv('CODEX_MODEL')
       ? { codex: optionalEnv('CODEX_MODEL')!, nanocodex: optionalEnv('CODEX_MODEL')! }
-      : {})
+      : {}),
+    ...(optionalEnv('CENTAUR_PI_MODEL') ? { pi: optionalEnv('CENTAUR_PI_MODEL')! } : {})
   },
   harnessDefaultReasoning: optionalEnv('CODEX_MODEL_REASONING_EFFORT')
     ? {
@@ -93,6 +94,11 @@ const options: SlackbotV2Options = {
   slackApiUrl,
   slackApiTimeoutMs,
   stateKeyPrefix: optionalEnv('SLACKBOTV2_STATE_KEY_PREFIX'),
+  steeringReactionEnabled: booleanEnv('SLACKBOTV2_STEERING_REACTION_ENABLED', false),
+  steeringReactionName: stringEnv(
+    'SLACKBOTV2_STEERING_REACTION',
+    'hourglass_flowing_sand'
+  ),
   userName: stringEnv('SLACKBOTV2_USER_NAME', 'centaur'),
   logger: consoleLogger
 }
@@ -110,6 +116,7 @@ console.log(
     level: 'info',
     event: 'slackbotv2_started',
     service: 'slackbotv2',
+    agent_view_enabled: options.agentViewEnabled,
     activity_summary_status_enabled: options.activitySummaryStatusEnabled,
     auto_join_created_channels_enabled: options.autoJoinCreatedChannels,
     message_overrides_strategy: messageOverridesStrategyMode,
@@ -117,6 +124,8 @@ console.log(
       messageOverridesStrategyMode !== 'llm' || Boolean(messageOverridesStrategyApiKey),
     response_metadata_mode: options.responseMetadataMode,
     response_service_tier_enabled: options.responseServiceTierEnabled,
+    steering_reaction_enabled: options.steeringReactionEnabled,
+    steering_reaction_name: options.steeringReactionName,
     port: server.port,
     api_url: apiUrl
   })

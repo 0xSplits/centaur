@@ -46,16 +46,17 @@ Rails.application.routes.draw do
   end
   get "console/principals/:id", to: "console#principal", as: :console_principal
   namespace :console do
-    resources :threads, only: %i[index create]
-    post "threads/share", to: "threads#share", as: :thread_share
-    # Single-panel transcript refresh polled by thread_poller_controller.js
-    # while a turn is running. thread_key rides as a query param: keys carry
-    # colons and dots a path segment would mangle.
-    get "threads/panel", to: "threads#panel", as: :thread_panel
     resources :workflows, only: %i[index show] do
       member do
         post :run, action: :force_start
       end
+    end
+    resources :scheduled_tasks, except: :show do
+      post :run, on: :member
+      get :slack_channel_options,
+          on: :collection,
+          to: "slack_channel_options#index",
+          defaults: { owner_type: "scheduled_task" }
     end
     resources :skills do
       collection do
@@ -66,10 +67,6 @@ Rails.application.routes.draw do
         post :unshare
       end
     end
-    # Lazily-loaded sidebar thread list (Turbo Frame src). Kept off the main
-    # page render so the unindexed cross-database sessions query does not block
-    # every console page. See ApplicationController#load_console_sidebar_threads.
-    get "sidebar_threads", to: "threads#sidebar", as: :sidebar_threads
   end
   namespace :console do
     resources :roles, only: %i[index show new create edit update] do
@@ -153,6 +150,7 @@ Rails.application.routes.draw do
         post :approve
         post :disable
         post :promote
+        post :demote
       end
     end
     resource :system_settings, only: %i[edit update], path: "settings"
@@ -221,10 +219,14 @@ Rails.application.routes.draw do
       resources :principals, only: %i[index show create update] do
         collection do
           get "lookup/default/:foreign_id/effective_config",
-              action: :effective_config, as: :default_lookup_effective_config
-          get "lookup/:foreign_id/effective_config", action: :effective_config, as: :lookup_effective_config
-          get "lookup/default/:foreign_id", action: :lookup, as: :default_lookup
-          get "lookup/:foreign_id", action: :lookup, as: :lookup
+              action: :effective_config, as: :default_lookup_effective_config,
+              constraints: { foreign_id: /[^\/]+/ }
+          get "lookup/:foreign_id/effective_config", action: :effective_config, as: :lookup_effective_config,
+              constraints: { foreign_id: /[^\/]+/ }
+          get "lookup/default/:foreign_id", action: :lookup, as: :default_lookup,
+              constraints: { foreign_id: /[^\/]+/ }
+          get "lookup/:foreign_id", action: :lookup, as: :lookup,
+              constraints: { foreign_id: /[^\/]+/ }
         end
         member do
           get "effective_config"
@@ -238,6 +240,7 @@ Rails.application.routes.draw do
       resources :grants, only: %i[show create destroy]
       resources :api_keys, only: %i[index show create destroy]
       resources :proxies, only: %i[index show create update destroy]
+      resources :scheduled_tasks, only: %i[show]
       # Operator-managed broker credentials (ApiKey auth). CRUD + lookup; the
       # rotating token blob is never serialized back.
       resources :broker_credentials, only: %i[index show create update destroy] do
@@ -261,6 +264,9 @@ Rails.application.routes.draw do
       namespace :sandbox do
         resource :permissions, only: :show
         resources :oauth_apps, only: :index
+        resources :scheduled_tasks, only: %i[index show create update destroy] do
+          post :run, on: :member
+        end
         resources :skills, only: %i[index show create update destroy] do
           collection { get :search }
           member do

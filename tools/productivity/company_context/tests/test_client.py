@@ -25,7 +25,10 @@ class _FakeConnection:
         fetch_rows=None,
         row=None,
         fetchrow_rows=None,
+        bm25_indexes=True,
     ) -> None:
+        self.bm25_indexes = bm25_indexes
+        self.fetchval_calls = []
         self.rows = rows or []
         self.fetch_rows = list(fetch_rows or [])
         self.row = row
@@ -45,6 +48,10 @@ class _FakeConnection:
                 raise result
             return result
         return self.rows
+
+    async def fetchval(self, query, *args):
+        self.fetchval_calls.append((query, args))
+        return self.bm25_indexes
 
     async def fetchrow(self, query, *args):
         self.fetchrow_calls.append((query, args))
@@ -216,9 +223,7 @@ def test_query_runs_in_read_only_transaction_with_bounded_results(monkeypatch):
         ],
     }
     assert fake.transaction_calls == [{"readonly": True}]
-    assert fake.execute_calls == [
-        ("SELECT set_config('statement_timeout', $1, true)", ("7s",))
-    ]
+    assert fake.execute_calls == [("SET LOCAL statement_timeout = '7s'", ())]
     assert fake.cursor_calls == [
         (
             "SELECT source, count(*) AS count "
@@ -246,9 +251,7 @@ def test_query_clamps_limit_and_timeout(monkeypatch):
 
     assert result["status"] == "ok"
     assert result["limit"] == 1_000
-    assert fake.execute_calls == [
-        ("SELECT set_config('statement_timeout', $1, true)", ("30s",))
-    ]
+    assert fake.execute_calls == [("SET LOCAL statement_timeout = '30s'", ())]
     assert fake.cursor_calls == [
         (
             "SELECT 1 AS value",
@@ -340,7 +343,60 @@ def test_search_queries_bm25_and_returns_compact_results(monkeypatch):
     assert fake.closed is True
 
 
-def test_search_skips_embeddings_when_experiment_is_disabled(monkeypatch):
+def test_search_uses_built_in_full_text_search_without_bm25_indexes(monkeypatch):
+    fake = _FakeConnection(bm25_indexes=False)
+
+    async def fake_connect(*args, **kwargs):
+        return fake
+
+    monkeypatch.setattr(company_context_client.asyncpg, "connect", fake_connect)
+
+    result = CompanyContextClient("postgresql://example").search("ParadeDB BM25", limit=5)
+
+    assert result["status"] == "ok"
+    tables = [
+        "company_context_documents",
+        "google_docs_context_documents",
+        "granola_context_documents",
+    ]
+    assert len(fake.fetch_calls) == len(tables)
+    for (query, args), table in zip(fake.fetch_calls, tables, strict=True):
+        assert f"FROM {table}" in query
+        assert (
+            "search_vector @@ replace(plainto_tsquery('english', $1)::text, ' & ', ' | ')::tsquery"
+            in query
+        )
+        assert "phraseto_tsquery('english', $1)" in query
+        assert "ts_rank('{0.25, 0, 0, 1}', search_vector" in query
+        assert "paradedb" not in query
+        assert "|||" not in query
+        assert args[0] == "ParadeDB BM25"
+        assert args[-1] == 5
+    assert fake.fetch_calls[0][1] == ("ParadeDB BM25", None, None, None, None, 5)
+
+
+def test_search_dms_uses_built_in_full_text_search_without_bm25_indexes(monkeypatch):
+    fake = _FakeConnection(bm25_indexes=False)
+
+    async def fake_connect(*args, **kwargs):
+        return fake
+
+    monkeypatch.setattr(company_context_client.asyncpg, "connect", fake_connect)
+
+    client = CompanyContextClient("postgresql://example")
+    assert client.search_dms("launch plan", limit=5, conversation_id="D123")["status"] == "ok"
+    assert client.search_dm_conversations("alice", limit=3)["status"] == "ok"
+
+    (messages_query, messages_args), (conversations_query, conversations_args) = fake.fetch_calls
+    assert "FROM slack_private_context_documents" in messages_query
+    assert "search_vector @@" in messages_query
+    assert messages_args == ("launch plan", "D123", None, None, 5)
+    assert "FROM slack_private_conversation_context_documents" in conversations_query
+    assert "search_vector @@" in conversations_query
+    assert conversations_args == ("alice", 3)
+
+
+def test_search_skips_embeddings_when_disabled(monkeypatch):
     fake = _FakeConnection(
         rows=[
             {
@@ -1715,3 +1771,39 @@ def test_read_document_reports_missing_document(monkeypatch):
     result = CompanyContextClient("postgresql://example").read_document("missing-doc")
 
     assert result == {"status": "error", "error": "document not found: missing-doc"}
+
+
+def test_embeddings_dimensions_defaults_when_unset(monkeypatch):
+    monkeypatch.delenv("COMPANY_CONTEXT_EMBEDDINGS_DIMENSIONS", raising=False)
+    assert (
+        CompanyContextClient._embeddings_dimensions()
+        == company_context_client.DEFAULT_EMBEDDINGS_DIMENSIONS
+    )
+
+
+def test_embeddings_dimensions_reads_the_configured_width(monkeypatch):
+    monkeypatch.setenv("COMPANY_CONTEXT_EMBEDDINGS_DIMENSIONS", "1024")
+    assert CompanyContextClient._embeddings_dimensions() == 1024
+
+
+def test_embeddings_dimensions_ignores_a_blank_value(monkeypatch):
+    monkeypatch.setenv("COMPANY_CONTEXT_EMBEDDINGS_DIMENSIONS", "   ")
+    assert (
+        CompanyContextClient._embeddings_dimensions()
+        == company_context_client.DEFAULT_EMBEDDINGS_DIMENSIONS
+    )
+
+
+def test_embeddings_dimensions_rejects_a_non_integer(monkeypatch):
+    monkeypatch.setenv("COMPANY_CONTEXT_EMBEDDINGS_DIMENSIONS", "wide")
+    with pytest.raises(RuntimeError, match="must be an integer"):
+        CompanyContextClient._embeddings_dimensions()
+
+
+# Above 2000 pgvector stores the vector but cannot index it, so the search this
+# tool exists to serve would silently fall back to a sequential scan.
+@pytest.mark.parametrize("value", ["0", "-1", "2001"])
+def test_embeddings_dimensions_rejects_unindexable_widths(monkeypatch, value):
+    monkeypatch.setenv("COMPANY_CONTEXT_EMBEDDINGS_DIMENSIONS", value)
+    with pytest.raises(RuntimeError, match="must be between 1 and 2000"):
+        CompanyContextClient._embeddings_dimensions()
