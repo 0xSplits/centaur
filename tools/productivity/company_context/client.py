@@ -10,6 +10,7 @@ import time
 import urllib.request
 from collections import Counter
 from contextlib import suppress
+from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import Any
 from urllib.parse import urlparse, urlunparse
@@ -23,10 +24,14 @@ MAX_SEARCH_LIMIT = 50
 MIN_HYBRID_CANDIDATE_LIMIT = 30
 RRF_K = 60
 DEFAULT_EMBEDDINGS_MODEL = "text-embedding-3-small"
-EMBEDDINGS_DIMENSIONS = 1_536
+DEFAULT_EMBEDDINGS_DIMENSIONS = 1_536
+# pgvector will not index above 2000 dimensions; see the workflow that writes
+# these vectors for the matching bound.
+MAX_EMBEDDINGS_DIMENSIONS = 2_000
 OPENAI_API_KEY_ENV = "OPENAI_API_KEY"
 COMPANY_CONTEXT_EMBEDDINGS_ENABLED_ENV = "COMPANY_CONTEXT_EMBEDDINGS_ENABLED"
 COMPANY_CONTEXT_EMBEDDINGS_MODEL_ENV = "COMPANY_CONTEXT_EMBEDDINGS_MODEL"
+COMPANY_CONTEXT_EMBEDDINGS_DIMENSIONS_ENV = "COMPANY_CONTEXT_EMBEDDINGS_DIMENSIONS"
 DEFAULT_QUERY_LIMIT = 100
 MAX_QUERY_LIMIT = 1_000
 DEFAULT_QUERY_TIMEOUT_SECONDS = 10
@@ -34,6 +39,10 @@ MAX_QUERY_TIMEOUT_SECONDS = 30
 TITLE_MATCH_BOOST = 4
 EXACT_QUERY_TITLE_BOOST = 8
 EXACT_QUERY_BODY_BOOST = 2
+PARADEDB_TEXT_SEARCH = "paradedb"
+POSTGRES_TEXT_SEARCH = "postgres"
+# api-rs migrations create this index only for the ParadeDB backend.
+PARADEDB_PROBE_INDEX = "public.idx_company_context_documents_bm25"
 THREAD_SCORE_MULTIPLIER = 1.25
 CHANNEL_DAY_SCORE_MULTIPLIER = 0.75
 DEFAULT_PREVIEW_CHARS = 280
@@ -349,6 +358,48 @@ def _search_where_clause(term_count: int) -> str:
     return f"({' OR '.join(clauses)})"
 
 
+@dataclass(frozen=True)
+class _KeywordSearch:
+    """A keyword predicate and score expression bound to parameters $1..$n."""
+
+    where: str
+    score: str
+    args: tuple[str, ...]
+
+
+def _keyword_search(backend: str, query: str) -> _KeywordSearch:
+    """Build the keyword search for the database's text-search backend."""
+    if backend == POSTGRES_TEXT_SEARCH:
+        # Match any query term, like the ParadeDB OR-of-terms clause. Lexemes
+        # never contain spaces, so the replace changes only operators.
+        any_term = "replace(plainto_tsquery('english', $1)::text, ' & ', ' | ')::tsquery"
+        # ts_rank weights are ordered {D, C, B, A}; body terms carry weight D
+        # and title terms weight A.
+        weights = f"{{{1 / TITLE_MATCH_BOOST}, 0, 0, 1}}"
+        return _KeywordSearch(
+            where=f"search_vector @@ {any_term}",
+            # The exact phrase ranks a second time, like the exact-query boost.
+            score=(
+                f"(ts_rank('{weights}', search_vector, {any_term}, 1)"
+                f" + ts_rank('{weights}', search_vector, phraseto_tsquery('english', $1), 1))"
+            ),
+            args=(query,),
+        )
+    terms = _search_terms(query)
+    return _KeywordSearch(
+        where=_search_where_clause(len(terms)),
+        score="paradedb.score(document_id)",
+        args=(query, *terms),
+    )
+
+
+async def _keyword_search_for_connection(conn: Any, query: str) -> _KeywordSearch:
+    """Detect the text-search backend that api-rs migrations installed."""
+    has_bm25 = await conn.fetchval(f"SELECT to_regclass('{PARADEDB_PROBE_INDEX}') IS NOT NULL")
+    backend = PARADEDB_TEXT_SEARCH if has_bm25 else POSTGRES_TEXT_SEARCH
+    return _keyword_search(backend, query)
+
+
 def _body_preview(body: str, *, query: str, max_chars: int = DEFAULT_PREVIEW_CHARS) -> str:
     """Build a compact preview centered on the first query-term hit when possible."""
     normalized = _normalize_text(body)
@@ -485,9 +536,7 @@ def _dm_document_summary(row: Any) -> dict[str, Any]:
         "url": str(_row_value(row, "permalink", "")),
         "author_name": user_id or bot_id,
         "access_scope": (
-            "slack_private_channel"
-            if conversation_type == "private_channel"
-            else "slack_dm"
+            "slack_private_channel" if conversation_type == "private_channel" else "slack_dm"
         ),
         "occurred_at": _isoformat(_row_value(row, "occurred_at")),
         "source_updated_at": _isoformat(_row_value(row, "source_updated_at")),
@@ -640,7 +689,7 @@ class CompanyContextClient:
         response = await client.embeddings.create(
             model=self._embeddings_model(),
             input=query,
-            dimensions=EMBEDDINGS_DIMENSIONS,
+            dimensions=self._embeddings_dimensions(),
             encoding_format="float",
         )
         data = list(response.data or [])
@@ -658,6 +707,33 @@ class CompanyContextClient:
             or DEFAULT_EMBEDDINGS_MODEL
         )
 
+    @staticmethod
+    def _embeddings_dimensions() -> int:
+        """Vector width to request for a query embedding.
+
+        Reads the same variable the embeddings workflow writes with. The two
+        must agree: a query vector of a different width than the stored column
+        is a Postgres error, not a worse ranking.
+        """
+        configured = os.getenv(  # noqa: TID251 - non-secret model configuration
+            COMPANY_CONTEXT_EMBEDDINGS_DIMENSIONS_ENV,
+        )
+        if configured is None or not configured.strip():
+            return DEFAULT_EMBEDDINGS_DIMENSIONS
+        try:
+            dimensions = int(configured)
+        except ValueError as error:
+            raise RuntimeError(
+                f"{COMPANY_CONTEXT_EMBEDDINGS_DIMENSIONS_ENV} must be an integer, "
+                f"got {configured!r}"
+            ) from error
+        if not 1 <= dimensions <= MAX_EMBEDDINGS_DIMENSIONS:
+            raise RuntimeError(
+                f"{COMPANY_CONTEXT_EMBEDDINGS_DIMENSIONS_ENV} must be between 1 "
+                f"and {MAX_EMBEDDINGS_DIMENSIONS}, got {dimensions}"
+            )
+        return dimensions
+
     async def _query_async(
         self,
         *,
@@ -669,10 +745,7 @@ class CompanyContextClient:
         try:
             rows = []
             async with conn.transaction(readonly=True):
-                await conn.execute(
-                    "SELECT set_config('statement_timeout', $1, true)",
-                    f"{timeout_seconds}s",
-                )
+                await conn.execute(f"SET LOCAL statement_timeout = '{int(timeout_seconds)}s'")
                 cursor = conn.cursor(
                     sql,
                     prefetch=min(limit + 1, 100),
@@ -742,8 +815,7 @@ class CompanyContextClient:
                 COMPANY_CONTEXT_EMBEDDINGS_ENABLED_ENV, default=False
             )
             candidate_limit = _hybrid_candidate_limit(limit) if embeddings_available else limit
-            terms = _search_terms(query)
-            search_terms = [query, *terms]
+            search = await _keyword_search_for_connection(conn, query)
             results = []
             google_docs_error = None
             granola_error = None
@@ -751,11 +823,11 @@ class CompanyContextClient:
                 source,
                 source_type,
             )
-            source_param = len(search_terms) + 1
-            source_type_param = len(search_terms) + 2
-            occurred_after_param = len(search_terms) + 3
-            occurred_before_param = len(search_terms) + 4
-            limit_param = len(search_terms) + 5
+            source_param = len(search.args) + 1
+            source_type_param = len(search.args) + 2
+            occurred_after_param = len(search.args) + 3
+            occurred_before_param = len(search.args) + 4
+            limit_param = len(search.args) + 5
             rows = await conn.fetch(
                 f"""
                 SELECT
@@ -773,9 +845,9 @@ class CompanyContextClient:
                     occurred_at,
                     source_updated_at,
                     metadata,
-                    paradedb.score(document_id) AS score
+                    {search.score} AS score
                 FROM company_context_documents
-                WHERE {_search_where_clause(len(terms))}
+                WHERE {search.where}
                   AND (${source_param}::text IS NULL OR source = ${source_param})
                   AND (${source_type_param}::text IS NULL OR source_type = ${source_type_param})
                   AND (${occurred_after_param}::timestamptz IS NULL
@@ -783,7 +855,7 @@ class CompanyContextClient:
                   AND (${occurred_before_param}::timestamptz IS NULL
                        OR occurred_at < ${occurred_before_param})
                 ORDER BY
-                    paradedb.score(document_id)
+                    {search.score}
                     * CASE source_type
                         WHEN 'slack_thread' THEN {THREAD_SCORE_MULTIPLIER}
                         WHEN 'slack_channel_day' THEN {CHANNEL_DAY_SCORE_MULTIPLIER}
@@ -792,7 +864,7 @@ class CompanyContextClient:
                     source_updated_at DESC NULLS LAST
                 LIMIT ${limit_param}
                 """,
-                *search_terms,
+                *search.args,
                 company_source,
                 company_source_type,
                 occurred_after,
@@ -814,8 +886,7 @@ class CompanyContextClient:
                 try:
                     google_rows = await self._search_google_docs_async(
                         conn,
-                        search_terms=search_terms,
-                        term_count=len(terms),
+                        search=search,
                         limit=candidate_limit,
                         modified_after=occurred_after,
                         modified_before=occurred_before,
@@ -837,8 +908,7 @@ class CompanyContextClient:
                 try:
                     granola_rows = await self._search_granola_async(
                         conn,
-                        search_terms=search_terms,
-                        term_count=len(terms),
+                        search=search,
                         limit=candidate_limit,
                         occurred_after=occurred_after,
                         occurred_before=occurred_before,
@@ -879,8 +949,8 @@ class CompanyContextClient:
                         occurred_before=occurred_before,
                     )
                 except Exception:
-                    # Embedding generation and the experimental vector schema are
-                    # both optional. Any incompatibility falls back to lexical.
+                    # Embedding generation and vector search are optional. Any
+                    # incompatibility falls back to lexical search.
                     vector_results = []
 
             if vector_results:
@@ -928,15 +998,14 @@ class CompanyContextClient:
         self,
         conn: asyncpg.Connection,
         *,
-        search_terms: list[str],
-        term_count: int,
+        search: _KeywordSearch,
         limit: int,
         modified_after: datetime | None,
         modified_before: datetime | None,
     ) -> list[Any]:
-        modified_after_param = len(search_terms) + 1
-        modified_before_param = len(search_terms) + 2
-        limit_param = len(search_terms) + 3
+        modified_after_param = len(search.args) + 1
+        modified_before_param = len(search.args) + 2
+        limit_param = len(search.args) + 3
         return await conn.fetch(
             f"""
             SELECT
@@ -953,19 +1022,19 @@ class CompanyContextClient:
                 source_created_at,
                 source_modified_at,
                 metadata,
-                paradedb.score(document_id) AS score
+                {search.score} AS score
             FROM google_docs_context_documents
-            WHERE {_search_where_clause(term_count)}
+            WHERE {search.where}
               AND (${modified_after_param}::timestamptz IS NULL
                    OR source_modified_at >= ${modified_after_param})
               AND (${modified_before_param}::timestamptz IS NULL
                    OR source_modified_at < ${modified_before_param})
-            ORDER BY paradedb.score(document_id) DESC,
+            ORDER BY {search.score} DESC,
                      source_modified_at DESC NULLS LAST,
                      document_id ASC
             LIMIT ${limit_param}
             """,
-            *search_terms,
+            *search.args,
             modified_after,
             modified_before,
             limit,
@@ -975,15 +1044,14 @@ class CompanyContextClient:
         self,
         conn: asyncpg.Connection,
         *,
-        search_terms: list[str],
-        term_count: int,
+        search: _KeywordSearch,
         limit: int,
         occurred_after: datetime | None,
         occurred_before: datetime | None,
     ) -> list[Any]:
-        occurred_after_param = len(search_terms) + 1
-        occurred_before_param = len(search_terms) + 2
-        limit_param = len(search_terms) + 3
+        occurred_after_param = len(search.args) + 1
+        occurred_before_param = len(search.args) + 2
+        limit_param = len(search.args) + 3
         return await conn.fetch(
             f"""
             SELECT
@@ -1000,20 +1068,20 @@ class CompanyContextClient:
                 occurred_at,
                 source_updated_at,
                 metadata,
-                paradedb.score(document_id) AS score
+                {search.score} AS score
             FROM granola_context_documents
-            WHERE {_search_where_clause(term_count)}
+            WHERE {search.where}
               AND (${occurred_after_param}::timestamptz IS NULL
                    OR occurred_at >= ${occurred_after_param})
               AND (${occurred_before_param}::timestamptz IS NULL
                    OR occurred_at < ${occurred_before_param})
-            ORDER BY paradedb.score(document_id) DESC,
+            ORDER BY {search.score} DESC,
                      occurred_at DESC NULLS LAST,
                      source_updated_at DESC NULLS LAST,
                      document_id ASC
             LIMIT ${limit_param}
             """,
-            *search_terms,
+            *search.args,
             occurred_after,
             occurred_before,
             limit,
@@ -1141,7 +1209,7 @@ class CompanyContextClient:
                     result["result_type"] = GOOGLE_DOCS_SOURCE_TYPE
                     results.append(result)
             except Exception:
-                # Optional projections may lag the embedding experiment schema.
+                # Optional projections may lag the embedding schema.
                 pass
 
         if _include_granola_source(source, source_type):
@@ -1197,7 +1265,7 @@ class CompanyContextClient:
                     result["result_type"] = GRANOLA_SOURCE_TYPE
                     results.append(result)
             except Exception:
-                # Optional projections may lag the embedding experiment schema.
+                # Optional projections may lag the embedding schema.
                 pass
 
         results.sort(
@@ -1504,9 +1572,8 @@ class CompanyContextClient:
     ) -> dict[str, Any]:
         conn = await self._connect()
         try:
-            terms = _search_terms(query)
-            search_terms = [query, *terms]
-            limit_param = len(search_terms) + 1
+            search = await _keyword_search_for_connection(conn, query)
+            limit_param = len(search.args) + 1
             rows = await conn.fetch(
                 f"""
                 SELECT
@@ -1523,15 +1590,15 @@ class CompanyContextClient:
                     participant_labels,
                     participant_count,
                     metadata,
-                    paradedb.score(document_id) AS score
+                    {search.score} AS score
                 FROM slack_private_conversation_context_documents
-                WHERE {_search_where_clause(len(terms))}
-                ORDER BY paradedb.score(document_id) DESC,
+                WHERE {search.where}
+                ORDER BY {search.score} DESC,
                          last_seen_at DESC NULLS LAST,
                          source_updated_at DESC NULLS LAST
                 LIMIT ${limit_param}
                 """,
-                *search_terms,
+                *search.args,
                 limit,
             )
             results = []
@@ -1590,12 +1657,11 @@ class CompanyContextClient:
     ) -> dict[str, Any]:
         conn = await self._connect()
         try:
-            terms = _search_terms(query)
-            search_terms = [query, *terms]
-            conversation_id_param = len(search_terms) + 1
-            occurred_after_param = len(search_terms) + 2
-            occurred_before_param = len(search_terms) + 3
-            limit_param = len(search_terms) + 4
+            search = await _keyword_search_for_connection(conn, query)
+            conversation_id_param = len(search.args) + 1
+            occurred_after_param = len(search.args) + 2
+            occurred_before_param = len(search.args) + 3
+            limit_param = len(search.args) + 4
             rows = await conn.fetch(
                 f"""
                 SELECT
@@ -1618,21 +1684,21 @@ class CompanyContextClient:
                     occurred_at,
                     source_updated_at,
                     metadata,
-                    paradedb.score(document_id) AS score
+                    {search.score} AS score
                 FROM slack_private_context_documents
-                WHERE {_search_where_clause(len(terms))}
+                WHERE {search.where}
                   AND (${conversation_id_param}::text IS NULL
                        OR conversation_id = ${conversation_id_param})
                   AND (${occurred_after_param}::timestamptz IS NULL
                        OR occurred_at >= ${occurred_after_param})
                   AND (${occurred_before_param}::timestamptz IS NULL
                        OR occurred_at < ${occurred_before_param})
-                ORDER BY paradedb.score(document_id) DESC,
+                ORDER BY {search.score} DESC,
                          occurred_at DESC NULLS LAST,
                          source_updated_at DESC NULLS LAST
                 LIMIT ${limit_param}
                 """,
-                *search_terms,
+                *search.args,
                 conversation_id,
                 occurred_after,
                 occurred_before,
