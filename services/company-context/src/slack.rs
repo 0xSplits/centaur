@@ -1,13 +1,23 @@
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
-use reqwest::{Client, StatusCode, header::RETRY_AFTER};
+use futures_util::StreamExt;
+use reqwest::{
+    Client, StatusCode,
+    header::{CONTENT_TYPE, RETRY_AFTER},
+};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use crate::{config::Config, errors::rejected, telemetry};
+use crate::{
+    config::Config,
+    errors::{denied, rejected},
+    telemetry,
+};
 
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
+/// File downloads can be much larger than API responses.
+const DOWNLOAD_TIMEOUT: Duration = Duration::from_secs(300);
 /// Slack sends Retry-After with every rate limit; this covers a missing header.
 const DEFAULT_RETRY_AFTER: Duration = Duration::from_secs(60);
 
@@ -86,6 +96,33 @@ impl SlackMethod {
 pub struct SlackClient {
     http: Client,
     base_url: String,
+    files_base_url: String,
+}
+
+/// A file attached to a Slack message, as listed in its `files`.
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+pub struct SlackFile {
+    pub id: String,
+    #[serde(default)]
+    pub name: String,
+    #[serde(default)]
+    pub title: String,
+    #[serde(default)]
+    pub mimetype: String,
+    #[serde(default)]
+    pub filetype: String,
+    #[serde(default)]
+    pub mode: String,
+    #[serde(default)]
+    pub size: Option<i64>,
+    #[serde(default)]
+    pub user: String,
+    #[serde(default)]
+    pub created: Option<i64>,
+    #[serde(default)]
+    pub permalink: String,
+    #[serde(default)]
+    pub url_private_download: String,
 }
 
 #[derive(Debug)]
@@ -199,7 +236,88 @@ impl SlackClient {
         Ok(Self {
             http: Client::builder().timeout(REQUEST_TIMEOUT).build()?,
             base_url: config.slack_api_base_url.clone(),
+            files_base_url: config.slack_files_base_url.clone(),
         })
+    }
+
+    /// Downloads a file's content with a token that has `files:read`, up to
+    /// `max_bytes`. The token is only sent to the Slack files host. A file the
+    /// token cannot read is denied rather than rejected, since another
+    /// user's token may read it.
+    pub async fn download_file(
+        &self,
+        url: &str,
+        access_token: &str,
+        max_bytes: usize,
+    ) -> Result<Vec<u8>> {
+        if !url.starts_with(&format!("{}/", self.files_base_url)) {
+            return Err(rejected("Slack file URL is not on the Slack files host"));
+        }
+        let started = Instant::now();
+        let record = |outcome| {
+            telemetry::upstream_request("slack", "files.download", outcome, started.elapsed())
+        };
+        let response = self
+            .http
+            .get(url)
+            .bearer_auth(access_token)
+            .timeout(DOWNLOAD_TIMEOUT)
+            .send()
+            .await
+            .inspect_err(|_| record("transport_error"))
+            .context("send Slack file download request")?;
+        let status = response.status();
+        if !status.is_success() {
+            record(telemetry::http_outcome(status));
+        }
+        if status == StatusCode::TOO_MANY_REQUESTS || status.is_server_error() {
+            bail!("Slack file download returned HTTP {status}");
+        }
+        if matches!(
+            status,
+            StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN | StatusCode::NOT_FOUND
+        ) {
+            return Err(denied(format!(
+                "Slack file download returned HTTP {status}"
+            )));
+        }
+        if !status.is_success() {
+            return Err(rejected(format!(
+                "Slack file download returned HTTP {status}"
+            )));
+        }
+        // Slack answers a token that cannot read the file with its sign-in page.
+        let html = response
+            .headers()
+            .get(CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok())
+            .is_some_and(|value| value.trim_start().starts_with("text/html"));
+        if html {
+            record("sign_in_page");
+            return Err(denied("Slack returned a web page instead of the file"));
+        }
+        let limit_error = "Slack file exceeds the configured byte limit";
+        if response
+            .content_length()
+            .is_some_and(|length| length > max_bytes as u64)
+        {
+            record("too_large");
+            return Err(rejected(limit_error));
+        }
+        let mut bytes = Vec::new();
+        let mut stream = response.bytes_stream();
+        while let Some(chunk) = stream.next().await {
+            let chunk = chunk
+                .inspect_err(|_| record("transport_error"))
+                .context("read Slack file download")?;
+            if bytes.len().saturating_add(chunk.len()) > max_bytes {
+                record("too_large");
+                return Err(rejected(limit_error));
+            }
+            bytes.extend_from_slice(&chunk);
+        }
+        record("ok");
+        Ok(bytes)
     }
 
     /// Calls a Web API method once. Rate limits are returned rather than
@@ -282,7 +400,7 @@ mod tests {
     use std::collections::HashMap;
 
     use super::*;
-    use crate::errors::is_rejected;
+    use crate::errors::{is_denied, is_rejected};
 
     #[test]
     fn conversation_types_require_allowance_and_both_scopes() {
@@ -361,6 +479,7 @@ mod tests {
         let client = SlackClient {
             http: Client::new(),
             base_url: format!("http://{address}"),
+            files_base_url: format!("http://{address}"),
         };
         let call = |case: &str| {
             let client = client.clone();
@@ -380,6 +499,84 @@ mod tests {
         assert!(!is_rejected(&internal), "Slack internal errors are retried");
         let gateway = call("gateway").await.unwrap_err();
         assert!(!is_rejected(&gateway), "server errors are retried");
+        server.abort();
+    }
+
+    /// Serves file downloads the way Slack's files host does.
+    async fn fake_files(
+        axum::extract::Path(name): axum::extract::Path<String>,
+        headers: HeaderMap,
+    ) -> Response {
+        if headers.get("authorization").map(|value| value.as_bytes()) != Some(b"Bearer token-1") {
+            return (
+                [("content-type", "text/html; charset=utf-8")],
+                "<html>Sign in</html>",
+            )
+                .into_response();
+        }
+        match name.as_str() {
+            "notes.txt" => ([("content-type", "text/plain")], "meeting notes").into_response(),
+            "busy.txt" => StatusCode::SERVICE_UNAVAILABLE.into_response(),
+            "malformed.txt" => StatusCode::BAD_REQUEST.into_response(),
+            _ => StatusCode::NOT_FOUND.into_response(),
+        }
+    }
+
+    #[tokio::test]
+    async fn downloads_files_only_from_the_files_host() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            axum::serve(
+                listener,
+                Router::new().route("/files-pri/{name}", axum::routing::get(fake_files)),
+            )
+            .await
+        });
+        let client = SlackClient {
+            http: Client::new(),
+            base_url: format!("http://{address}/api"),
+            files_base_url: format!("http://{address}"),
+        };
+        let url = |name: &str| format!("http://{address}/files-pri/{name}");
+
+        assert_eq!(
+            client
+                .download_file(&url("notes.txt"), "token-1", 100)
+                .await
+                .unwrap(),
+            b"meeting notes"
+        );
+        let too_large = client
+            .download_file(&url("notes.txt"), "token-1", 5)
+            .await
+            .unwrap_err();
+        assert!(is_rejected(&too_large), "{too_large}");
+        let sign_in = client
+            .download_file(&url("notes.txt"), "other-token", 100)
+            .await
+            .unwrap_err();
+        assert!(is_denied(&sign_in), "a sign-in page is not the file");
+        let missing = client
+            .download_file(&url("gone.txt"), "token-1", 100)
+            .await
+            .unwrap_err();
+        assert!(is_denied(&missing), "{missing}");
+        let malformed = client
+            .download_file(&url("malformed.txt"), "token-1", 100)
+            .await
+            .unwrap_err();
+        assert!(is_rejected(&malformed), "{malformed}");
+        let busy = client
+            .download_file(&url("busy.txt"), "token-1", 100)
+            .await
+            .unwrap_err();
+        assert!(!is_rejected(&busy), "server errors are retried");
+        let elsewhere = client
+            .download_file("https://example.com/files-pri/notes.txt", "token-1", 100)
+            .await
+            .unwrap_err();
+        assert!(is_rejected(&elsewhere), "the token stays on the files host");
         server.abort();
     }
 }
