@@ -11,15 +11,17 @@ use tracing::{info, warn};
 
 use crate::{
     config::{
-        SLACK_CONVERSATION_SYNC_TASK, SLACK_CREDENTIALS_RECONCILE_TASK, SLACK_THREAD_SYNC_TASK,
-        SLACK_USER_DISCOVER_TASK,
+        QUEUE_NAME, SLACK_CONVERSATION_PROJECT_TASK, SLACK_CONVERSATION_SYNC_TASK,
+        SLACK_CREDENTIALS_RECONCILE_TASK, SLACK_THREAD_SYNC_TASK, SLACK_USER_DISCOVER_TASK,
+        SLACK_USERS_SYNC_TASK,
     },
     credentials::ConsoleCredentials,
     errors::{is_rejected, rejected},
     slack::{
         AuthTest, Conversation, ConversationsPage, MessagesPage, SlackClient, SlackMethod,
-        SlackReply,
+        SlackReply, User, UsersPage,
     },
+    slack_documents::ConversationProjectParams,
     slack_rate_limit::RateLimiter,
     tasks::{bounded_error, run_task},
 };
@@ -32,6 +34,8 @@ const RATE_LIMITED_ATTEMPTS: u32 = 5;
 const CONVERSATIONS_PAGE_SIZE: &str = "999";
 /// Slack recommends at most 200 messages per history or replies page.
 const MESSAGES_PAGE_SIZE: &str = "200";
+/// Slack recommends at most 200 users per `users.list` page.
+const USERS_PAGE_SIZE: &str = "200";
 /// Each history sync rereads at least this much recent history, so edits and
 /// new replies to threads started within it are picked up. Replies to older
 /// threads are not.
@@ -53,6 +57,8 @@ pub struct SlackTaskState {
     pub history: chrono::Duration,
     /// Per-conversation overrides of `history`.
     pub channel_history: HashMap<String, chrono::Duration>,
+    /// The app's bot token, which lists workspace users.
+    pub bot_token: String,
 }
 
 impl SlackTaskState {
@@ -96,6 +102,11 @@ pub struct ThreadSyncParams {
     pub team_id: String,
     pub conversation_id: String,
     pub thread_ts: String,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+pub struct UsersSyncParams {
+    pub bucket: u64,
 }
 
 #[derive(Debug, Serialize)]
@@ -144,11 +155,20 @@ pub fn register(absurd: &AbsurdClient, state: SlackTaskState) -> Result<()> {
         },
     )?;
 
+    let thread_state = state.clone();
     absurd.register_task(
         SLACK_THREAD_SYNC_TASK,
         move |params: ThreadSyncParams, ctx| {
-            let state = state.clone();
+            let state = thread_state.clone();
             async move { run_task(&ctx, sync_thread(&state, params, &ctx)).await }
+        },
+    )?;
+
+    absurd.register_task(
+        SLACK_USERS_SYNC_TASK,
+        move |params: UsersSyncParams, ctx| {
+            let state = state.clone();
+            async move { run_task(&ctx, sync_users(&state, params, &ctx)).await }
         },
     )?;
     Ok(())
@@ -192,26 +212,7 @@ async fn discover(
                 "Slack credential cannot read any ingested conversation type",
             ));
         }
-        // auth.test has its own generous limit, so it is not paced, but its
-        // result is checkpointed so a resumed run does not call it again.
-        let identity: AuthTest = match ctx.begin_step("slack.auth.test").await? {
-            handle if handle.done => handle.state.context("auth.test checkpoint is empty")?,
-            handle => {
-                let SlackReply::Ok(body) = state
-                    .slack
-                    .call("auth.test", &credential.access_token, &[])
-                    .await?
-                else {
-                    bail!("Slack rate limited auth.test");
-                };
-                let identity: AuthTest =
-                    serde_json::from_value(body).context("decode Slack auth.test response")?;
-                if identity.team_id.is_empty() || identity.user_id.is_empty() {
-                    return Err(rejected("Slack auth.test did not identify a user"));
-                }
-                ctx.complete_step(handle, identity).await?
-            }
-        };
+        let identity = auth_test(&state.slack, ctx, &credential.access_token).await?;
 
         let types = credential.conversation_types.join(",");
         let mut conversations = Vec::new();
@@ -393,6 +394,7 @@ async fn sync_conversation(
             }
         }
         finish_history(&state.pool, conversation_id, task_id, &window).await?;
+        spawn_projection(&state.absurd, conversation_id, task_id).await?;
         Ok(stored)
     }
     .await;
@@ -465,6 +467,7 @@ async fn sync_thread(
                 break;
             }
         }
+        spawn_projection(&state.absurd, &params.conversation_id, ctx.task_id()).await?;
         Ok(stored)
     }
     .await;
@@ -483,6 +486,110 @@ async fn sync_thread(
         }
         Err(error) => Err(error),
     }
+}
+
+/// Stores every user of the bot's workspace, so projections can render names.
+async fn sync_users(
+    state: &SlackTaskState,
+    params: UsersSyncParams,
+    ctx: &TaskContext,
+) -> Result<MessagesSummary> {
+    let mut team_id = String::new();
+    let result = async {
+        let bot_token = state.bot_token.as_str();
+        team_id = auth_test(&state.slack, ctx, bot_token).await?.team_id;
+        let mut stored = 0;
+        let mut cursor = String::new();
+        for page_number in 0.. {
+            let page: UsersPage = paced_call(
+                &state.slack,
+                &state.limiter,
+                ctx,
+                &format!("slack.users.list.{page_number}"),
+                &team_id,
+                SlackMethod::UsersList,
+                bot_token,
+                &[
+                    ("limit", USERS_PAGE_SIZE.to_owned()),
+                    ("cursor", cursor.clone()),
+                ],
+            )
+            .await?;
+            stored += store_users(&state.pool, &team_id, &page.members).await?;
+            cursor = page.response_metadata.next_cursor;
+            if cursor.is_empty() {
+                break;
+            }
+        }
+        Ok(stored)
+    }
+    .await;
+
+    match result {
+        Ok(users) => {
+            info!(
+                event = "company_context_slack_users_synced",
+                task_id = ctx.task_id(),
+                bucket = params.bucket,
+                team_id,
+                users_changed = users
+            );
+            Ok(MessagesSummary::new("completed", users))
+        }
+        Err(error) if is_rejected(&error) => {
+            warn!(
+                event = "company_context_slack_users_rejected",
+                task_id = ctx.task_id(),
+                bucket = params.bucket,
+                error = %error
+            );
+            Ok(MessagesSummary::new("rejected", 0))
+        }
+        Err(error) => Err(error),
+    }
+}
+
+/// Identifies a token's workspace and user. auth.test has its own generous
+/// limit, so it is not paced, but its result is checkpointed so a resumed run
+/// does not call it again.
+async fn auth_test(slack: &SlackClient, ctx: &TaskContext, access_token: &str) -> Result<AuthTest> {
+    let handle = ctx.begin_step::<AuthTest>("slack.auth.test").await?;
+    if handle.done {
+        return handle.state.context("auth.test checkpoint is empty");
+    }
+    let SlackReply::Ok(body) = slack.call("auth.test", access_token, &[]).await? else {
+        bail!("Slack rate limited auth.test");
+    };
+    let identity: AuthTest =
+        serde_json::from_value(body).context("decode Slack auth.test response")?;
+    if identity.team_id.is_empty() || identity.user_id.is_empty() {
+        return Err(rejected("Slack auth.test did not identify a user"));
+    }
+    Ok(ctx.complete_step(handle, identity).await?)
+}
+
+/// Projects a conversation's changed days after its messages were stored.
+async fn spawn_projection(
+    absurd: &AbsurdClient,
+    conversation_id: &str,
+    sync_task_id: &str,
+) -> Result<()> {
+    absurd
+        .spawn(
+            SLACK_CONVERSATION_PROJECT_TASK,
+            ConversationProjectParams {
+                conversation_id: conversation_id.to_owned(),
+            },
+            SpawnOptions {
+                queue: Some(QUEUE_NAME.to_owned()),
+                idempotency_key: Some(format!(
+                    "slack.conversation.project:{conversation_id}:{sync_task_id}"
+                )),
+                ..SpawnOptions::default()
+            },
+        )
+        .await?;
+    Ok(())
 }
 
 /// Returns the span to read: the whole configured history if part of it has
@@ -856,6 +963,62 @@ async fn store_messages(
     Ok(stored as usize)
 }
 
+/// Upserts a page of users and returns how many changed.
+async fn store_users(pool: &PgPool, team_id: &str, users: &[User]) -> Result<usize> {
+    let mut users = users.to_vec();
+    users.sort_by(|left, right| left.id.cmp(&right.id));
+    users.dedup_by(|left, right| left.id == right.id);
+    users.retain(|user| !user.id.is_empty());
+    let ids: Vec<&str> = users.iter().map(|user| user.id.as_str()).collect();
+    let names: Vec<&str> = users.iter().map(|user| user.name.as_str()).collect();
+    let real_names: Vec<&str> = users
+        .iter()
+        .map(|user| match user.profile.real_name.as_str() {
+            "" => user.real_name.as_str(),
+            real_name => real_name,
+        })
+        .collect();
+    let display_names: Vec<&str> = users
+        .iter()
+        .map(|user| user.profile.display_name.as_str())
+        .collect();
+    let bots: Vec<bool> = users.iter().map(|user| user.is_bot).collect();
+    let deleted: Vec<bool> = users.iter().map(|user| user.deleted).collect();
+    let changed = sqlx::query(
+        r#"
+        INSERT INTO company_context_system.slack_users
+            (user_id, team_id, name, real_name, display_name, is_bot, deleted)
+        SELECT user_id, $2, name, real_name, display_name, is_bot, deleted
+        FROM unnest($1::text[], $3::text[], $4::text[], $5::text[], $6::boolean[], $7::boolean[])
+            AS listed(user_id, name, real_name, display_name, is_bot, deleted)
+        ON CONFLICT (user_id) DO UPDATE
+        SET team_id = EXCLUDED.team_id,
+            name = EXCLUDED.name,
+            real_name = EXCLUDED.real_name,
+            display_name = EXCLUDED.display_name,
+            is_bot = EXCLUDED.is_bot,
+            deleted = EXCLUDED.deleted,
+            updated_at = NOW()
+        WHERE (slack_users.team_id, slack_users.name, slack_users.real_name,
+               slack_users.display_name, slack_users.is_bot, slack_users.deleted)
+            IS DISTINCT FROM
+              (EXCLUDED.team_id, EXCLUDED.name, EXCLUDED.real_name,
+               EXCLUDED.display_name, EXCLUDED.is_bot, EXCLUDED.deleted)
+        "#,
+    )
+    .bind(&ids)
+    .bind(team_id)
+    .bind(&names)
+    .bind(&real_names)
+    .bind(&display_names)
+    .bind(&bots)
+    .bind(&deleted)
+    .execute(pool)
+    .await?
+    .rows_affected();
+    Ok(changed as usize)
+}
+
 /// Returns the number of observations deactivated and conversations removed.
 async fn remove_unobserved(pool: &PgPool, retained_ids: &[i64]) -> Result<(u64, usize)> {
     let mut tx = pool.begin().await?;
@@ -918,6 +1081,20 @@ async fn remove_unobserved(pool: &PgPool, retained_ids: &[i64]) -> Result<(u64, 
     .execute(&mut *tx)
     .await?
     .rows_affected();
+    // Users go with the last live credential in their workspace.
+    sqlx::query(
+        r#"
+        DELETE FROM company_context_system.slack_users users
+        WHERE NOT EXISTS (
+            SELECT 1
+            FROM company_context_data.slack_broker_identities identities
+            WHERE identities.team_id = users.team_id
+              AND identities.active
+        )
+        "#,
+    )
+    .execute(&mut *tx)
+    .await?;
     tx.commit().await?;
     Ok((deactivated, removed as usize))
 }
@@ -1090,6 +1267,59 @@ mod tests {
         // History never starts before the Unix epoch.
         assert_eq!(window(None, None, days(36_500)), DateTime::UNIX_EPOCH);
         assert_eq!(history_window(None, None, now, days(90)).until, now);
+    }
+
+    fn user(id: &str, real_name: &str) -> User {
+        serde_json::from_value(json!({
+            "id": id,
+            "name": id.to_lowercase(),
+            "profile": { "real_name": real_name, "display_name": "" },
+        }))
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn users_change_only_when_rendered_fields_change_and_go_with_their_workspace() {
+        let Ok(database_url) = env::var("COMPANY_CONTEXT_TEST_DATABASE_URL") else {
+            eprintln!("skipping: set COMPANY_CONTEXT_TEST_DATABASE_URL to a ParadeDB Postgres URL");
+            return;
+        };
+        let database = TestDatabase::create(&database_url, "slack_users").await;
+        let pool = &database.pool;
+        record_discovery(pool, 1, &identity("U1"), &[])
+            .await
+            .unwrap();
+
+        let ada = user("U1", "Ada");
+        assert_eq!(
+            store_users(pool, "T1", &[ada.clone(), user("U2", "Bob")])
+                .await
+                .unwrap(),
+            2
+        );
+        assert_eq!(store_users(pool, "T1", &[ada]).await.unwrap(), 0);
+        assert_eq!(
+            store_users(pool, "T1", &[user("U1", "Ada Lovelace")])
+                .await
+                .unwrap(),
+            1
+        );
+        let users = || async {
+            sqlx::query_scalar::<_, String>(
+                "SELECT real_name FROM company_context_system.slack_users ORDER BY user_id",
+            )
+            .fetch_all(pool)
+            .await
+            .unwrap()
+        };
+        assert_eq!(users().await, ["Ada Lovelace", "Bob"]);
+
+        remove_unobserved(pool, &[1]).await.unwrap();
+        assert_eq!(users().await.len(), 2);
+        remove_unobserved(pool, &[]).await.unwrap();
+        assert!(users().await.is_empty());
+
+        database.drop().await;
     }
 
     async fn message_texts(pool: &PgPool) -> Vec<(String, String, Option<String>)> {

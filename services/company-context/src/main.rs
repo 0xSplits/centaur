@@ -9,6 +9,7 @@ mod granola;
 mod granola_tasks;
 mod scheduler;
 mod slack;
+mod slack_documents;
 mod slack_rate_limit;
 mod slack_tasks;
 mod tasks;
@@ -117,6 +118,7 @@ async fn main() -> Result<()> {
                 .iter()
                 .map(|(id, days)| (id.clone(), chrono::Duration::days(*days as i64)))
                 .collect(),
+            bot_token: config.slack_bot_token.clone(),
         },
     )?;
 
