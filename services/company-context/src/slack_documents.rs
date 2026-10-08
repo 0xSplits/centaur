@@ -14,7 +14,9 @@ use sqlx::{PgPool, Row, types::Json};
 use tracing::{error, info, warn};
 
 use crate::{
-    config::{SLACK_CHANNEL_DAY_EMBED_TASK, SLACK_CONVERSATION_PROJECT_TASK},
+    config::{
+        SLACK_CHANNEL_DAY_EMBED_TASK, SLACK_CONVERSATION_PROJECT_TASK, SLACK_DOCUMENT_ID_PREFIX,
+    },
     embeddings::EmbeddingsClient,
     errors::is_rejected,
     extraction::{hex_sha256, split_long_text},
@@ -646,7 +648,10 @@ async fn embed_day(
         .enumerate()
         .map(|(ordinal, chunk)| {
             let chunk_id = format!("{ordinal:06}");
-            let document_id = format!("slack:{}:{}:{chunk_id}", params.conversation_id, params.day);
+            let document_id = format!(
+                "{SLACK_DOCUMENT_ID_PREFIX}{}:{}:{chunk_id}",
+                params.conversation_id, params.day
+            );
             (
                 document_id,
                 chunk_id,
@@ -1038,6 +1043,8 @@ mod tests {
             &format!("http://{address}"),
             "--slack-bot-token",
             "xoxb-test",
+            "--jwt-signing-secret",
+            "jwt-secret",
         ])
         .unwrap();
         let embeddings = EmbeddingsClient::new(&config).unwrap();
