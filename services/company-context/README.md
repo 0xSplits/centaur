@@ -17,7 +17,7 @@ The service owns these Postgres schemas:
 - `company_context_system`: private cursors, staging (including Slack messages and users), and processing state.
 - `company_context_data`: retrieval-facing Drive documents, Granola notes, Slack channel and file documents, access observations (including Slack identities, channel memberships, and the conversations each Slack file is shared in), and embeddings. The query endpoints read only this schema, as the `centaur_company_context_v2_query` role, which can only select from it; the service switches to that role for each query transaction, so its login role must be able to grant itself membership (`CREATEROLE` or superuser).
 
-The `centaur_company_context_reader` role used by the company-context tool can read `google_drive_documents` and `google_drive_document_embeddings`. Row-level security limits each reader to files that a live broker credential with the same Google subject (`centaur.google_subject`) still observes; `google_drive_broker_observations` is the only source of that access. The reader cannot query the observations or the system schema directly. The reader has no access to Granola notes; they are exposed only through the query endpoints. The Helm deployment is gated by `experimentalCompanyContext.enabled` until it is ready for production.
+Documents are exposed to retrieval only through the query endpoints; no other database role can read them. The Helm deployment is gated by `experimentalCompanyContext.enabled` until it is ready for production.
 
 ## Required infrastructure
 
@@ -142,7 +142,13 @@ and principal labels do not count. A document is visible only while an active
 broker observation for one of those identities still reaches its Drive file,
 Slack conversation (for Slack files, any conversation the file is shared in),
 or Granola note. A principal without one of those identities sees no documents
-of the corresponding types.
+of the corresponding types. Disabling an OAuth app in the Console removes the
+corresponding identity, so its documents stop being returned without being
+removed from the index.
+
+Granola does not report notes that are unshared or deleted, so a note stays
+visible to the principals whose credentials once observed it until those
+credentials are dead or deleted.
 
 Errors return `{"error": "..."}` with status 400 for an invalid request, 401
 for a missing or invalid token, 403 for a principal unknown to the Console, and
