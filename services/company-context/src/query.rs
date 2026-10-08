@@ -2,10 +2,10 @@
 //! document reads over the published corpora on behalf of the Console
 //! principal named by the request's API JWT.
 //!
-//! Access mirrors the reader role's row-level security: a principal sees a
-//! document only while an active broker observation for its Google subject or
-//! Slack user ID still reaches the document's file or conversation. Queries
-//! run as [`QUERY_ROLE`], which can only read `company_context_data`.
+//! A principal sees a document only while an active broker observation for its
+//! Slack user ID, or for the subject of a Google or Granola credential granted
+//! to it, still reaches the document's file, conversation, or Granola note.
+//! Queries run as [`QUERY_ROLE`], which can only read `company_context_data`.
 
 use std::{
     collections::HashMap,
@@ -32,8 +32,8 @@ use tracing::{error, warn};
 
 use crate::{
     config::{
-        Config, GOOGLE_DRIVE_DOCUMENT_ID_PREFIX, SLACK_DOCUMENT_ID_PREFIX,
-        SLACK_FILE_DOCUMENT_ID_PREFIX,
+        Config, GOOGLE_DRIVE_DOCUMENT_ID_PREFIX, GRANOLA_DOCUMENT_ID_PREFIX,
+        SLACK_DOCUMENT_ID_PREFIX, SLACK_FILE_DOCUMENT_ID_PREFIX,
     },
     credentials::{ConsoleCredentials, PrincipalIdentity},
     embeddings::EmbeddingsClient,
@@ -100,17 +100,18 @@ pub enum DataType {
     SlackMessage,
     SlackFile,
     DriveDoc,
+    GranolaNote,
 }
 
 /// How one data type's documents are selected. Queries bind the principal's
-/// subject to `$2` and the filters to `$4` through `$7`.
+/// subjects to `$2` and the filters to `$4` through `$7`.
 struct Source {
     /// Prefix of the type's document IDs.
     id_prefix: &'static str,
     documents: &'static str,
     embeddings: &'static str,
     columns: &'static str,
-    /// Documents visible to subject `$2`.
+    /// Documents visible to any subject in `$2`.
     visible: &'static str,
     /// Expressions for when the document's content starts and ends.
     starts_at: &'static str,
@@ -142,12 +143,29 @@ impl Source {
 }
 
 impl DataType {
-    const ALL: [Self; 3] = [Self::SlackMessage, Self::SlackFile, Self::DriveDoc];
+    const ALL: [Self; 4] = [
+        Self::SlackMessage,
+        Self::SlackFile,
+        Self::DriveDoc,
+        Self::GranolaNote,
+    ];
 
-    fn subject(self, identity: &PrincipalIdentity) -> Option<&str> {
+    /// The principal's identities the type's observations are keyed by.
+    fn subjects(self, identity: &PrincipalIdentity) -> Vec<&str> {
         match self {
-            Self::SlackMessage | Self::SlackFile => identity.slack_user_id.as_deref(),
-            Self::DriveDoc => identity.google_subject.as_deref(),
+            Self::SlackMessage | Self::SlackFile => {
+                identity.slack_user_id.as_deref().into_iter().collect()
+            }
+            Self::DriveDoc => identity
+                .google_subjects
+                .iter()
+                .map(String::as_str)
+                .collect(),
+            Self::GranolaNote => identity
+                .granola_subjects
+                .iter()
+                .map(String::as_str)
+                .collect(),
         }
     }
 
@@ -170,7 +188,7 @@ impl DataType {
                 visible: r#"d.conversation_id IN (
                        SELECT o.conversation_id
                        FROM company_context_data.slack_broker_observations o
-                       WHERE o.active AND o.provider_subject = $2
+                       WHERE o.active AND o.provider_subject = ANY($2)
                    )"#,
                 // A channel day chunk matches a window its messages overlap.
                 starts_at: "d.first_message_at",
@@ -195,7 +213,7 @@ impl DataType {
                        FROM company_context_data.slack_file_shares s
                        JOIN company_context_data.slack_broker_observations o
                          ON o.conversation_id = s.conversation_id
-                       WHERE o.active AND o.provider_subject = $2
+                       WHERE o.active AND o.provider_subject = ANY($2)
                    )"#,
                 starts_at: "d.source_created_at",
                 ends_at: "d.source_created_at",
@@ -207,7 +225,7 @@ impl DataType {
                        FROM company_context_data.slack_file_shares s
                        JOIN company_context_data.slack_broker_observations o
                          ON o.conversation_id = s.conversation_id
-                       WHERE o.active AND o.provider_subject = $2
+                       WHERE o.active AND o.provider_subject = ANY($2)
                          AND s.conversation_id = ANY($6)
                    )"#,
                 ),
@@ -230,12 +248,34 @@ impl DataType {
                 visible: r#"d.file_id IN (
                        SELECT o.file_id
                        FROM company_context_data.google_drive_broker_observations o
-                       WHERE o.active AND o.provider_subject = $2
+                       WHERE o.active AND o.provider_subject = ANY($2)
                    )"#,
                 starts_at: "COALESCE(d.source_modified_at, d.source_created_at)",
                 ends_at: "COALESCE(d.source_modified_at, d.source_created_at)",
                 in_channels: None,
                 file_id: Some("d.file_id"),
+            },
+            Self::GranolaNote => Source {
+                id_prefix: GRANOLA_DOCUMENT_ID_PREFIX,
+                documents: "company_context_data.granola_documents",
+                embeddings: "company_context_data.granola_document_embeddings",
+                columns: r#"d.document_id, d.title, d.body, NULL::text AS url,
+                   d.occurred_at,
+                   jsonb_build_object(
+                       'note_id', d.note_id,
+                       'owner_email', d.owner_email,
+                       'owner_name', d.owner_name,
+                       'attendees', d.attendees
+                   ) AS metadata"#,
+                visible: r#"d.note_id IN (
+                       SELECT o.note_id
+                       FROM company_context_data.granola_broker_observations o
+                       WHERE o.active AND o.provider_subject = ANY($2)
+                   )"#,
+                starts_at: "d.occurred_at",
+                ends_at: "d.occurred_at",
+                in_channels: None,
+                file_id: None,
             },
         }
     }
@@ -468,9 +508,10 @@ pub async fn search(
     if types.is_empty() {
         return Err(invalid("no requested type supports every filter"));
     }
-    let searches: Vec<(DataType, &str)> = types
+    let searches: Vec<(DataType, Vec<&str>)> = types
         .into_iter()
-        .filter_map(|data_type| Some((data_type, data_type.subject(identity)?)))
+        .map(|data_type| (data_type, data_type.subjects(identity)))
+        .filter(|(_, subjects)| !subjects.is_empty())
         .collect();
     if searches.is_empty() {
         return Ok(Vec::new());
@@ -494,7 +535,7 @@ pub async fn search(
         .await?;
 
     let mut lanes = Vec::new();
-    for (data_type, subject) in searches {
+    for (data_type, subjects) in searches {
         let source = data_type.source();
         let keyword = format!(
             r#"
@@ -511,9 +552,11 @@ pub async fn search(
             visible = source.visible,
             filters = source.filters(),
         );
-        let rows = lane(&mut tx, &keyword, query, None, subject, candidates, &params)
-            .await
-            .with_context(|| format!("keyword search {data_type:?}"))?;
+        let rows = lane(
+            &mut tx, &keyword, query, None, &subjects, candidates, &params,
+        )
+        .await
+        .with_context(|| format!("keyword search {data_type:?}"))?;
         lanes.push((data_type, rows));
 
         if let Some((model, vector)) = &vector {
@@ -539,7 +582,7 @@ pub async fn search(
                 &semantic,
                 vector,
                 Some(model),
-                subject,
+                &subjects,
                 candidates,
                 &params,
             )
@@ -561,9 +604,10 @@ pub async fn document(
     let Some(data_type) = DataType::of_document(document_id) else {
         return Ok(None);
     };
-    let Some(subject) = data_type.subject(identity) else {
+    let subjects = data_type.subjects(identity);
+    if subjects.is_empty() {
         return Ok(None);
-    };
+    }
     let source = data_type.source();
     let mut tx = read_only(pool).await?;
     let row: Option<Row> = sqlx::query_as(&format!(
@@ -573,7 +617,7 @@ pub async fn document(
         visible = source.visible,
     ))
     .bind(document_id)
-    .bind(subject)
+    .bind(&subjects)
     .fetch_optional(&mut *tx)
     .await
     .with_context(|| format!("read {data_type:?} document"))?;
@@ -614,20 +658,20 @@ async fn query_vector(embeddings: &EmbeddingsClient, query: &str) -> Option<(Str
     }
 }
 
-/// Runs one ranked lane: `$1` is the query text or vector, `$2` the subject,
+/// Runs one ranked lane: `$1` is the query text or vector, `$2` the subjects,
 /// `$3` the limit, `$4`..`$7` the filters, and `$8` the embedding model.
 async fn lane(
     tx: &mut Transaction<'_, Postgres>,
     sql: &str,
     input: &str,
     model: Option<&str>,
-    subject: &str,
+    subjects: &[&str],
     limit: i64,
     params: &FilterParams,
 ) -> Result<Vec<Row>> {
     let mut query = sqlx::query_as(sql)
         .bind(input)
-        .bind(subject)
+        .bind(subjects)
         .bind(limit)
         .bind(params.occurred_after)
         .bind(params.occurred_before)
@@ -879,22 +923,26 @@ mod tests {
 
     fn ada() -> PrincipalIdentity {
         PrincipalIdentity {
-            google_subject: Some("G-ADA".to_owned()),
             slack_user_id: Some("U-ADA".to_owned()),
+            google_subjects: vec!["G-ADA".to_owned()],
+            granola_subjects: vec!["GR-ADA".to_owned()],
         }
     }
 
     /// Bob has no Google identity.
     fn bob() -> PrincipalIdentity {
         PrincipalIdentity {
-            google_subject: None,
             slack_user_id: Some("U-BOB".to_owned()),
+            google_subjects: Vec::new(),
+            granola_subjects: vec!["GR-BOB".to_owned(), "GR-BOB-2".to_owned()],
         }
     }
 
     /// Ada observes Drive files F1 and F4 (not F3, whose observation is
     /// inactive) and Slack conversations C1 and C3; Bob observes C2. Slack
-    /// file SF1 is shared in C1 and SF2 in both C2 and C3.
+    /// file SF1 is shared in C1 and SF2 in both C2 and C3. Ada's Granola
+    /// account observes note N1 (not N3, whose observation is inactive); Bob's
+    /// second Granola account observes N2.
     async fn seed(pool: &PgPool) {
         pool.execute(
             r#"
@@ -945,6 +993,17 @@ mod tests {
                 (document_id, file_id, chunk_id, title, body, source_created_at, content_hash)
             VALUES ('slack-file:SF1', 'SF1', '0', 'falcon.pdf', 'falcon launch deck', '2024-01-02Z', 'hash'),
                    ('slack-file:SF2', 'SF2', '0', 'falcon-retro.pdf', 'falcon launch retro deck', '2024-02-01Z', 'hash');
+
+            INSERT INTO company_context_data.granola_broker_observations
+                (broker_credential_id, note_id, provider_subject, active)
+            VALUES (20, 'N1', 'GR-ADA', true), (21, 'N2', 'GR-BOB-2', true),
+                   (20, 'N3', 'GR-ADA', false);
+            INSERT INTO company_context_data.granola_documents
+                (document_id, note_id, chunk_id, title, body, owner_email, occurred_at, content_hash)
+            VALUES
+                ('granola:N1:000000', 'N1', '000000', 'Falcon sync', 'falcon launch timeline', 'ada@example.com', '2024-01-05Z', 'hash'),
+                ('granola:N2:000000', 'N2', '000000', 'Falcon sync', 'falcon launch timeline', 'bob@example.com', '2024-01-05Z', 'hash'),
+                ('granola:N3:000000', 'N3', '000000', 'Falcon sync', 'falcon launch timeline', 'carol@example.com', '2024-01-05Z', 'hash');
             "#,
         )
         .await
@@ -967,6 +1026,7 @@ mod tests {
             [
                 "google-drive:F1",
                 "google-drive:F4",
+                "granola:N1:000000",
                 "slack-file:SF1",
                 "slack-file:SF2",
                 "slack:C1:2024-01-02:000000",
@@ -990,7 +1050,11 @@ mod tests {
         );
         assert_eq!(
             ids(pool, None, &bob, json!({ "query": "falcon" })).await,
-            ["slack-file:SF2", "slack:C2:2024-01-02:000000"]
+            [
+                "granola:N2:000000",
+                "slack-file:SF2",
+                "slack:C2:2024-01-02:000000"
+            ]
         );
 
         // Channel days match windows their messages overlap.
@@ -1075,6 +1139,10 @@ mod tests {
                 (document_id, model, dimensions, content_hash, embedding)
             SELECT document_id, 'text-embedding-3-small', 1536, 'hash', array_fill(0.5, ARRAY[1536])::vector
             FROM company_context_data.slack_file_documents;
+            INSERT INTO company_context_data.granola_document_embeddings
+                (document_id, model, dimensions, content_hash, embedding)
+            SELECT document_id, 'text-embedding-3-small', 1536, 'hash', array_fill(0.5, ARRAY[1536])::vector
+            FROM company_context_data.granola_documents;
             "#,
         )
         .await
@@ -1096,6 +1164,7 @@ mod tests {
             [
                 "google-drive:F1",
                 "google-drive:F4",
+                "granola:N1:000000",
                 "slack-file:SF1",
                 "slack-file:SF2",
                 "slack:C1:2024-01-02:000000",
@@ -1196,14 +1265,23 @@ mod tests {
             .unwrap();
         assert_eq!(message.data_type, DataType::SlackMessage);
         assert_eq!(message.metadata["channel_name"], "secret");
+        let note = document(pool, &ada, "granola:N1:000000")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(note.data_type, DataType::GranolaNote);
+        assert_eq!(note.metadata["note_id"], "N1");
 
         for (identity, document_id) in [
             (&ada, "google-drive:F2"),
             (&ada, "google-drive:F3"),
             (&ada, "slack:C2:2024-01-02:000000"),
+            (&ada, "granola:N2:000000"),
+            (&ada, "granola:N3:000000"),
             (&ada, "missing"),
             (&bob, "google-drive:F1"),
             (&bob, "slack-file:SF1"),
+            (&bob, "granola:N1:000000"),
         ] {
             assert!(
                 document(pool, identity, document_id)

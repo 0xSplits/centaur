@@ -54,12 +54,15 @@ pub struct GoogleCredential {
     pub revision: String,
 }
 
-/// The provider identities a Console principal is known by, the same ones the
-/// reader role's row-level security settings were derived from.
+/// The provider identities a Console principal is known by. Google and
+/// Granola identities are the subjects of the live broker credentials granted
+/// directly to the principal, the accounts it can already use through the
+/// proxy; principal labels are not trusted.
 #[derive(Clone, Debug, Default, sqlx::FromRow)]
 pub struct PrincipalIdentity {
-    pub google_subject: Option<String>,
     pub slack_user_id: Option<String>,
+    pub google_subjects: Vec<String>,
+    pub granola_subjects: Vec<String>,
 }
 
 impl ConsoleCredentials {
@@ -423,13 +426,35 @@ impl ConsoleCredentials {
     pub async fn principal_identity(&self, principal_id: i64) -> Result<Option<PrincipalIdentity>> {
         sqlx::query_as(
             r#"
-            SELECT NULLIF(BTRIM(labels ->> 'google_subject'), '') AS google_subject,
-                   NULLIF(BTRIM(slack_user_id), '') AS slack_user_id
-            FROM principals
-            WHERE id = $1
+            WITH granted AS (
+                SELECT app.provider, app.slug, credentials.provider_subject
+                FROM grants
+                JOIN static_secrets secrets ON secrets.id = grants.static_secret_id
+                JOIN broker_credentials credentials
+                  ON credentials.id = secrets.broker_credential_id
+                JOIN oauth_apps app ON app.id = credentials.oauth_app_id
+                WHERE grants.principal_id = $1
+                  AND credentials.dead = FALSE
+                  AND credentials.provider_subject <> ''
+            )
+            SELECT NULLIF(BTRIM(p.slack_user_id), '') AS slack_user_id,
+                   ARRAY(
+                       SELECT DISTINCT provider_subject FROM granted
+                       WHERE provider = 'google' AND slug = $2
+                       ORDER BY provider_subject
+                   ) AS google_subjects,
+                   ARRAY(
+                       SELECT DISTINCT provider_subject FROM granted
+                       WHERE provider = 'granola' AND slug = $3
+                       ORDER BY provider_subject
+                   ) AS granola_subjects
+            FROM principals p
+            WHERE p.id = $1
             "#,
         )
         .bind(principal_id)
+        .bind(&self.google_oauth_app_slug)
+        .bind(&self.granola_oauth_app_slug)
         .fetch_optional(&self.pool)
         .await
         .context("load principal from Rails Console")
@@ -459,5 +484,84 @@ impl ConsoleCredentials {
             bail!("{description} is empty");
         }
         Ok(value)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::env;
+
+    use sqlx::Executor;
+
+    use super::*;
+    use crate::test_support::TestDatabase;
+
+    #[tokio::test]
+    async fn principals_are_known_by_their_granted_credentials() {
+        let Ok(database_url) = env::var("COMPANY_CONTEXT_TEST_DATABASE_URL") else {
+            eprintln!("skipping: set COMPANY_CONTEXT_TEST_DATABASE_URL to a ParadeDB Postgres URL");
+            return;
+        };
+        let database = TestDatabase::create(&database_url, "principal_identity").await;
+        let pool = &database.pool;
+        // The Console tables the identity lookup reads. Ada (1) holds direct
+        // grants for a Google credential and two live Granola credentials,
+        // plus a dead one and one from another app. Bob (2) has Granola only
+        // through a role grant, and a Google subject only as a label.
+        pool.execute(
+            r#"
+            CREATE TABLE principals (
+                id bigint PRIMARY KEY, labels jsonb NOT NULL DEFAULT '{}', slack_user_id text
+            );
+            CREATE TABLE oauth_apps (id bigint PRIMARY KEY, provider text NOT NULL, slug text NOT NULL);
+            CREATE TABLE broker_credentials (
+                id bigint PRIMARY KEY, oauth_app_id bigint, provider_subject text,
+                provider_email text, dead boolean NOT NULL DEFAULT false
+            );
+            CREATE TABLE static_secrets (id bigint PRIMARY KEY, broker_credential_id bigint);
+            CREATE TABLE grants (principal_id bigint, role_id bigint, static_secret_id bigint);
+
+            INSERT INTO principals VALUES
+                (1, '{}', 'U-ADA'),
+                (2, '{"google_subject": "G-BOB"}', NULL);
+            INSERT INTO oauth_apps VALUES
+                (1, 'granola', 'granola'), (2, 'granola', 'other'), (3, 'google', 'google');
+            INSERT INTO broker_credentials VALUES
+                (1, 1, 'GR-ADA', 'ada@example.com', false),
+                (2, 1, 'GR-ADA-2', 'ada@example.com', false),
+                (3, 1, 'GR-DEAD', 'ada@example.com', true),
+                (4, 2, 'GR-OTHER-APP', 'ada@example.com', false),
+                (5, 3, 'G-ADA', 'ada@example.com', false),
+                (6, 1, 'GR-BOB', 'bob@example.com', false);
+            INSERT INTO static_secrets SELECT id, id FROM broker_credentials;
+            INSERT INTO grants VALUES
+                (1, NULL, 1), (1, NULL, 2), (1, NULL, 3), (1, NULL, 4), (1, NULL, 5),
+                (NULL, 1, 6);
+            "#,
+        )
+        .await
+        .unwrap();
+        let credentials = ConsoleCredentials {
+            pool: pool.clone(),
+            encryption: Arc::new(ActiveRecordEncryption::new("primary", "salt")),
+            google_oauth_app_slug: "google".to_owned(),
+            granola_oauth_app_slug: "granola".to_owned(),
+            slack_oauth_app_slug: "slack".to_owned(),
+            google_user_emails: Vec::new(),
+            granola_user_emails: Vec::new(),
+            slack_user_ids: Vec::new(),
+            slack_conversation_types: Vec::new(),
+        };
+
+        let ada = credentials.principal_identity(1).await.unwrap().unwrap();
+        assert_eq!(ada.slack_user_id.as_deref(), Some("U-ADA"));
+        assert_eq!(ada.google_subjects, ["G-ADA"]);
+        assert_eq!(ada.granola_subjects, ["GR-ADA", "GR-ADA-2"]);
+        let bob = credentials.principal_identity(2).await.unwrap().unwrap();
+        assert!(bob.google_subjects.is_empty());
+        assert!(bob.granola_subjects.is_empty());
+        assert!(credentials.principal_identity(3).await.unwrap().is_none());
+
+        database.drop().await;
     }
 }
