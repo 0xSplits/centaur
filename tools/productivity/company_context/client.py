@@ -13,11 +13,14 @@ from contextlib import suppress
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import Any
-from urllib.parse import urlparse, urlunparse
 
 import asyncpg
 
-from centaur_sdk.tool_sdk import secret
+from centaur_sdk.tool_sdk import (
+    COMPANY_CONTEXT_DSN_ENV,
+    company_context_database_url,
+    secret,
+)
 
 DEFAULT_SEARCH_LIMIT = 10
 MAX_SEARCH_LIMIT = 50
@@ -53,9 +56,6 @@ GRANOLA_SOURCE_TYPE = "granola_note"
 DOCS_SOURCE = "docs"
 LEGACY_GOOGLE_DRIVE_SOURCE = "google_drive"
 GOOGLE_DOCS_SOURCE_TYPE = "google_doc"
-COMPANY_CONTEXT_DSN_ENV = "CENTAUR_POSTGRES_DSN"
-COMPANY_CONTEXT_DATABASE_ENV = "COMPANY_CONTEXT_POSTGRES_DATABASE"
-DEFAULT_POSTGRES_DATABASE = "ai_v2"
 COMPANY_CONTEXT_LOOKUP_METRICS_ENABLED_ENV = "COMPANY_CONTEXT_LOOKUP_METRICS_ENABLED"
 VICTORIAMETRICS_PUSH_ENABLED_ENV = "VICTORIAMETRICS_PUSH_ENABLED"
 VICTORIAMETRICS_URL_ENV = "VICTORIAMETRICS_URL"
@@ -114,28 +114,6 @@ _STOP_WORDS = {
 def _clamp(value: int, *, minimum: int, maximum: int) -> int:
     """Clamp integer tool inputs to predictable output bounds."""
     return max(minimum, min(int(value), maximum))
-
-
-def _scoped_database_url() -> str:
-    value = os.getenv(COMPANY_CONTEXT_DSN_ENV)  # noqa: TID251
-    if value is None:
-        value = secret(COMPANY_CONTEXT_DSN_ENV, default="")
-    value = value.strip()
-    if value == COMPANY_CONTEXT_DSN_ENV:
-        return ""
-    return value
-
-
-def _database_url_with_name(value: str, database: str) -> str:
-    parsed = urlparse(value)
-    if parsed.scheme and parsed.netloc and parsed.path in ("", "/"):
-        return urlunparse(parsed._replace(path=f"/{database}"))
-    return value
-
-
-def _postgres_database_name() -> str:
-    value = os.getenv(COMPANY_CONTEXT_DATABASE_ENV, DEFAULT_POSTGRES_DATABASE)  # noqa: TID251
-    return value.strip() or DEFAULT_POSTGRES_DATABASE
 
 
 def _as_dict(value: Any) -> dict[str, Any]:
@@ -661,7 +639,7 @@ class CompanyContextClient:
         *,
         embeddings_client: Any | None = None,
     ) -> None:
-        self._database_url = (database_url or _scoped_database_url()).strip()
+        self._database_url = company_context_database_url(database_url or None)
         self._embeddings_client = embeddings_client
 
     def _require_database_url(self) -> str:
@@ -671,7 +649,7 @@ class CompanyContextClient:
 
     async def _connect(self) -> asyncpg.Connection:
         return await asyncpg.connect(
-            _database_url_with_name(self._require_database_url(), _postgres_database_name()),
+            self._require_database_url(),
             command_timeout=30,
         )
 
@@ -935,6 +913,7 @@ class CompanyContextClient:
             )
             keyword_results = results[:candidate_limit]
             vector_results: list[dict[str, Any]] = []
+            vector_error = None
             if embeddings_available:
                 try:
                     query_embedding = await self._query_embedding_async(query)
@@ -948,10 +927,11 @@ class CompanyContextClient:
                         occurred_after=occurred_after,
                         occurred_before=occurred_before,
                     )
-                except Exception:
+                except Exception as exc:
                     # Embedding generation and vector search are optional. Any
                     # incompatibility falls back to lexical search.
                     vector_results = []
+                    vector_error = str(exc)
 
             if vector_results:
                 results = _reciprocal_rank_fusion(
@@ -990,6 +970,8 @@ class CompanyContextClient:
                 response["google_docs_error"] = google_docs_error
             if granola_error:
                 response["granola_error"] = granola_error
+            if vector_error:
+                response["vector_error"] = vector_error
             return response
         finally:
             await conn.close()
@@ -1104,6 +1086,8 @@ class CompanyContextClient:
             source,
             source_type,
         )
+        # Bind the query vector as text: a vector-typed parameter makes asyncpg
+        # introspect the type with set_config, which iron-proxy rejects.
         rows = await conn.fetch(
             """
             SELECT
@@ -1121,7 +1105,7 @@ class CompanyContextClient:
                 d.occurred_at,
                 d.source_updated_at,
                 d.metadata,
-                1 - (e.embedding <=> $1::vector) AS vector_similarity
+                1 - (e.embedding <=> $1::text::vector) AS vector_similarity
             FROM company_context_document_embeddings e
             JOIN company_context_documents d
               ON d.document_id = e.company_context_document_id
@@ -1132,7 +1116,7 @@ class CompanyContextClient:
               AND ($4::text IS NULL OR d.source_type = $4)
               AND ($5::timestamptz IS NULL OR d.occurred_at >= $5)
               AND ($6::timestamptz IS NULL OR d.occurred_at < $6)
-            ORDER BY e.embedding <=> $1::vector,
+            ORDER BY e.embedding <=> $1::text::vector,
                      d.source_updated_at DESC NULLS LAST,
                      d.document_id ASC
             LIMIT $7
@@ -1175,7 +1159,7 @@ class CompanyContextClient:
                         d.source_created_at,
                         d.source_modified_at,
                         d.metadata,
-                        1 - (e.embedding <=> $1::vector) AS vector_similarity
+                        1 - (e.embedding <=> $1::text::vector) AS vector_similarity
                     FROM company_context_document_embeddings e
                     JOIN google_docs_context_documents d
                       ON d.document_id = e.google_docs_context_document_id
@@ -1184,7 +1168,7 @@ class CompanyContextClient:
                       AND e.model = $2
                       AND ($3::timestamptz IS NULL OR d.source_modified_at >= $3)
                       AND ($4::timestamptz IS NULL OR d.source_modified_at < $4)
-                    ORDER BY e.embedding <=> $1::vector,
+                    ORDER BY e.embedding <=> $1::text::vector,
                              d.source_modified_at DESC NULLS LAST,
                              d.document_id ASC
                     LIMIT $5
@@ -1230,7 +1214,7 @@ class CompanyContextClient:
                         d.occurred_at,
                         d.source_updated_at,
                         d.metadata,
-                        1 - (e.embedding <=> $1::vector) AS vector_similarity
+                        1 - (e.embedding <=> $1::text::vector) AS vector_similarity
                     FROM company_context_document_embeddings e
                     JOIN granola_context_documents d
                       ON d.document_id = e.granola_context_document_id
@@ -1239,7 +1223,7 @@ class CompanyContextClient:
                       AND e.model = $2
                       AND ($3::timestamptz IS NULL OR d.occurred_at >= $3)
                       AND ($4::timestamptz IS NULL OR d.occurred_at < $4)
-                    ORDER BY e.embedding <=> $1::vector,
+                    ORDER BY e.embedding <=> $1::text::vector,
                              d.occurred_at DESC NULLS LAST,
                              d.source_updated_at DESC NULLS LAST,
                              d.document_id ASC

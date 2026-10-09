@@ -29,7 +29,6 @@ use centaur_sandbox_agent_k8s::{
     OtlpEgressTarget, StateVolumeConfig, Toleration, ToolSource, ToolsConfig,
 };
 use centaur_sandbox_core::{Mount, MountKind, ResourceRequirements, SandboxSpec};
-use centaur_sandbox_local::LocalSandboxBackend;
 use centaur_sandbox_manager::{SandboxReaperConfig, WarmPoolConfig};
 use centaur_session_core::HarnessType;
 use centaur_session_runtime::{
@@ -628,22 +627,6 @@ pub(crate) struct ServerArgs {
 
 #[derive(Debug, ClapArgs)]
 struct SandboxArgs {
-    #[arg(
-        long = "session-sandbox-backend",
-        alias = "kubernetes-sandbox-backend",
-        env = "SESSION_SANDBOX_BACKEND",
-        value_enum,
-        default_value = "local"
-    )]
-    backend: SandboxBackendKind,
-    #[arg(
-        long = "session-sandbox-workload",
-        alias = "kubernetes-sandbox-workload",
-        env = "SESSION_SANDBOX_WORKLOAD",
-        value_enum,
-        default_value = "mock"
-    )]
-    workload: SandboxWorkloadKind,
     /// The default harness for warm sandboxes. Per-session sandboxes always
     /// run their session's harness (pinned via container args); this only
     /// decides what the warm pool boots ahead of time. Defaults to codex
@@ -966,33 +949,25 @@ impl SandboxArgs {
     }
 
     async fn runtime(&self) -> Result<SandboxRuntime, ServerError> {
-        match self.backend {
-            SandboxBackendKind::Local => Ok(SandboxRuntime::backend_with_workload(
-                Arc::new(LocalSandboxBackend::new()),
-                self.local_workload_mode()?,
-            )),
-            SandboxBackendKind::AgentK8s => {
-                let backend = Arc::new(AgentSandboxBackend::new(
-                    self.kube_client().await?,
-                    AgentSandboxConfig::try_from(self)?,
-                ));
-                let stopped = backend.drain_service_account_mismatches().await?;
-                if !stopped.is_empty() {
-                    info!(
-                        stopped_count = stopped.len(),
-                        "drained sandboxes with stale service accounts before enabling reuse"
-                    );
-                }
-                let artifact_backend = backend.clone();
-                Ok(
-                    SandboxRuntime::backend_with_workload(backend, self.container_workload_mode()?)
-                        .with_artifact_reader(move |id, path, max_bytes| {
-                            let backend = artifact_backend.clone();
-                            async move { backend.read_artifact(&id, &path, max_bytes).await }
-                        }),
-                )
-            }
+        let backend = Arc::new(AgentSandboxBackend::new(
+            self.kube_client().await?,
+            AgentSandboxConfig::try_from(self)?,
+        ));
+        let stopped = backend.drain_service_account_mismatches().await?;
+        if !stopped.is_empty() {
+            info!(
+                stopped_count = stopped.len(),
+                "drained sandboxes with stale service accounts before enabling reuse"
+            );
         }
+        let artifact_backend = backend.clone();
+        Ok(
+            SandboxRuntime::backend_with_workload(backend, self.container_workload_mode()?)
+                .with_artifact_reader(move |id, path, max_bytes| {
+                    let backend = artifact_backend.clone();
+                    async move { backend.read_artifact(&id, &path, max_bytes).await }
+                }),
+        )
     }
 
     async fn workflow_host_sandbox_runtime(
@@ -1003,18 +978,13 @@ impl SandboxArgs {
             return Ok(None);
         }
         let spec = self.workflow_host_spec(bootstrap_iron_control_principal)?;
-        let runtime = match self.backend {
-            SandboxBackendKind::Local => {
-                SandboxRuntime::backend(Arc::new(LocalSandboxBackend::new()), spec.clone())
-            }
-            SandboxBackendKind::AgentK8s => SandboxRuntime::backend(
-                Arc::new(AgentSandboxBackend::new(
-                    self.kube_client().await?,
-                    AgentSandboxConfig::try_from(self)?,
-                )),
-                spec.clone(),
-            ),
-        };
+        let runtime = SandboxRuntime::backend(
+            Arc::new(AgentSandboxBackend::new(
+                self.kube_client().await?,
+                AgentSandboxConfig::try_from(self)?,
+            )),
+            spec.clone(),
+        );
         Ok(Some(WorkflowHostSandboxRuntime::new(runtime, spec)))
     }
 
@@ -1028,14 +998,9 @@ impl SandboxArgs {
             .or_else(|| self.agent_image.clone())
             .unwrap_or_else(|| "centaur-agent:latest".to_owned());
         let command = self.workflow_host_command.clone().unwrap_or_else(|| {
-            let path = match self.backend {
-                SandboxBackendKind::Local => env::var("PYTHON_WORKFLOW_HOST_PATH")
-                    .unwrap_or_else(|_| self.default_workflow_host_path()),
-                SandboxBackendKind::AgentK8s => self.default_workflow_host_path(),
-            };
             let interpreter =
                 env::var("PYTHON_WORKFLOW_HOST_PYTHON").unwrap_or_else(|_| "python3".to_owned());
-            format!("exec {interpreter} {path}")
+            format!("exec {interpreter} {WORKFLOW_HOST_PATH}")
         });
         let mut spec = SandboxSpec::new(image)
             .label("centaur.ai/component", "workflow-run")
@@ -1046,46 +1011,24 @@ impl SandboxArgs {
         )? {
             spec = spec.resources(resources);
         }
-        spec = match self.backend {
-            SandboxBackendKind::Local => spec.command(["/bin/sh", "-lc"]).args([command]),
-            SandboxBackendKind::AgentK8s => spec.command(["/entrypoint.sh"]).args([
-                "/bin/sh".to_owned(),
-                "-lc".to_owned(),
-                command,
-            ]),
-        };
-        let agent_k8s_workflow_dirs = self.agent_k8s_workflow_dirs();
-        if env::var_os("WORKFLOW_DIRS").is_none()
-            && matches!(self.backend, SandboxBackendKind::AgentK8s)
-        {
-            spec = spec.env("WORKFLOW_DIRS", agent_k8s_workflow_dirs.clone());
-        }
+        spec = spec.command(["/entrypoint.sh"]).args([
+            "/bin/sh".to_owned(),
+            "-lc".to_owned(),
+            command,
+        ]);
+        spec = spec.env("WORKFLOW_DIRS", self.agent_k8s_workflow_dirs());
         if let Ok(value) =
             env::var("WORKFLOW_HOST_DATABASE_URL").or_else(|_| env::var("DATABASE_URL"))
         {
             spec = spec.env("DATABASE_URL", value);
         }
-        for name in [
-            "WORKFLOW_DIRS",
-            "PYTHON_WORKFLOW_HOST_PATH",
-            "PYTHON_WORKFLOW_HOST_PYTHON",
-        ] {
-            if let Ok(value) = env::var(name) {
-                let value = match (name, self.backend) {
-                    ("WORKFLOW_DIRS", SandboxBackendKind::AgentK8s) => {
-                        agent_k8s_workflow_dirs.clone()
-                    }
-                    ("PYTHON_WORKFLOW_HOST_PATH", SandboxBackendKind::AgentK8s) => {
-                        self.default_workflow_host_path()
-                    }
-                    _ => value,
-                };
-                spec = spec.env(name, value);
-            }
+        if env::var_os("PYTHON_WORKFLOW_HOST_PATH").is_some() {
+            spec = spec.env("PYTHON_WORKFLOW_HOST_PATH", WORKFLOW_HOST_PATH);
         }
-        if matches!(self.backend, SandboxBackendKind::AgentK8s)
-            && let Some(repos_path) = clean_optional_value(self.repos_path.as_deref())
-        {
+        if let Ok(value) = env::var("PYTHON_WORKFLOW_HOST_PYTHON") {
+            spec = spec.env("PYTHON_WORKFLOW_HOST_PYTHON", value);
+        }
+        if let Some(repos_path) = clean_optional_value(self.repos_path.as_deref()) {
             spec = spec.mount(
                 Mount::new(self.repos_mount_kind(repos_path), SANDBOX_REPOS_MOUNT_PATH).read_only(),
             );
@@ -1112,13 +1055,6 @@ impl SandboxArgs {
         "/opt/centaur/workflows".to_owned()
     }
 
-    fn default_workflow_host_path(&self) -> String {
-        match self.backend {
-            SandboxBackendKind::Local => default_workflow_host_path(),
-            SandboxBackendKind::AgentK8s => "/usr/local/bin/workflow-host".to_owned(),
-        }
-    }
-
     async fn kube_client(&self) -> Result<kube::Client, ServerError> {
         if let Some(context) = self.k8s_context.as_deref() {
             let kube_config = kube::Config::from_kubeconfig(&kube::config::KubeConfigOptions {
@@ -1132,47 +1068,28 @@ impl SandboxArgs {
         }
     }
 
-    fn local_workload_mode(&self) -> Result<SandboxWorkloadMode, ServerError> {
-        match self.workload {
-            SandboxWorkloadKind::Mock => Ok(SandboxWorkloadMode::mock_app_server(
-                self.agent_image
-                    .clone()
-                    .unwrap_or_else(|| "local-mock-app-server".to_owned()),
-            )),
-            SandboxWorkloadKind::CodexAppServer => Err(ServerError::UnsupportedConfig(
-                "codex-app-server workload requires --session-sandbox-backend agent-k8s".to_owned(),
-            )),
-        }
-    }
-
     fn container_workload_mode(&self) -> Result<SandboxWorkloadMode, ServerError> {
         let image = self
             .agent_image
             .clone()
-            .unwrap_or_else(|| default_sandbox_image(self.workload).to_owned());
-        match self.workload {
-            SandboxWorkloadKind::Mock => Ok(SandboxWorkloadMode::mock_app_server(image)),
-            SandboxWorkloadKind::CodexAppServer => {
-                let mut workload = SandboxWorkloadMode::codex_app_server(
-                    image,
-                    self.codex_app_server_env_template()?,
-                    self.default_harness.clone(),
-                );
-                if let Some(resources) = resource_requirements(
-                    self.sandbox_resources_json.as_deref(),
-                    "SESSION_SANDBOX_RESOURCES",
-                )? {
-                    workload = workload.resources(resources);
-                }
-                if let Some(repos_path) = clean_optional_value(self.repos_path.as_deref()) {
-                    workload = workload.mount(
-                        Mount::new(self.repos_mount_kind(repos_path), SANDBOX_REPOS_MOUNT_PATH)
-                            .read_only(),
-                    );
-                }
-                Ok(workload)
-            }
+            .unwrap_or_else(|| DEFAULT_SANDBOX_IMAGE.to_owned());
+        let mut workload = SandboxWorkloadMode::codex_app_server(
+            image,
+            self.codex_app_server_env_template()?,
+            self.default_harness.clone(),
+        );
+        if let Some(resources) = resource_requirements(
+            self.sandbox_resources_json.as_deref(),
+            "SESSION_SANDBOX_RESOURCES",
+        )? {
+            workload = workload.resources(resources);
         }
+        if let Some(repos_path) = clean_optional_value(self.repos_path.as_deref()) {
+            workload = workload.mount(
+                Mount::new(self.repos_mount_kind(repos_path), SANDBOX_REPOS_MOUNT_PATH).read_only(),
+            );
+        }
+        Ok(workload)
     }
 
     fn repos_mount_kind(&self, repos_path: String) -> MountKind {
@@ -1403,9 +1320,6 @@ impl SandboxArgs {
     /// DNS endpoints (`<service>.<namespace>.svc[...]`) map to a namespace
     /// selector.
     fn sandbox_otlp_egress_target(&self) -> Result<Option<OtlpEgressTarget>, ServerError> {
-        if !matches!(self.workload, SandboxWorkloadKind::CodexAppServer) {
-            return Ok(None);
-        }
         let envs = self.codex_app_server_env_template()?;
         let endpoint = [
             "OTEL_EXPORTER_OTLP_TRACES_ENDPOINT",
@@ -1971,6 +1885,26 @@ struct IronProxyArgs {
     bootstrap_secret_name: Option<String>,
     #[arg(long = "kubernetes-api-pod-label-selector", env = "KUBERNETES_API_POD_LABEL_SELECTOR", value_parser = parse_label_selector_arg)]
     api_pod_label_selector: Option<BTreeMap<String, String>>,
+    /// Pod labels for the proxy-sync service that per-sandbox proxies contact.
+    #[arg(
+        long = "kubernetes-iron-proxy-sync-pod-label-selector",
+        env = "KUBERNETES_IRON_PROXY_SYNC_POD_LABEL_SELECTOR",
+        value_parser = parse_label_selector_arg
+    )]
+    proxy_sync_pod_label_selector: Option<BTreeMap<String, String>>,
+    /// In-cluster company-context API URL that per-sandbox proxies may reach.
+    #[arg(
+        long = "kubernetes-iron-proxy-company-context-url",
+        env = "KUBERNETES_IRON_PROXY_COMPANY_CONTEXT_URL"
+    )]
+    company_context_url: Option<String>,
+    /// Pod labels for the company-context service.
+    #[arg(
+        long = "kubernetes-iron-proxy-company-context-pod-label-selector",
+        env = "KUBERNETES_IRON_PROXY_COMPANY_CONTEXT_POD_LABEL_SELECTOR",
+        value_parser = parse_label_selector_arg
+    )]
+    company_context_pod_label_selector: Option<BTreeMap<String, String>>,
 }
 
 impl IronProxyArgs {
@@ -2012,6 +1946,22 @@ impl IronProxyArgs {
             .filter(|labels| !labels.is_empty())
         {
             config.api_pod_labels = labels.clone();
+        }
+        if let Some(labels) = self
+            .proxy_sync_pod_label_selector
+            .as_ref()
+            .filter(|labels| !labels.is_empty())
+        {
+            config.proxy_sync_pod_labels = labels.clone();
+        }
+        config.company_context_url =
+            non_empty(self.company_context_url.as_deref()).map(ToOwned::to_owned);
+        if let Some(labels) = self
+            .company_context_pod_label_selector
+            .as_ref()
+            .filter(|labels| !labels.is_empty())
+        {
+            config.company_context_pod_labels = labels.clone();
         }
         Ok(config)
     }
@@ -2294,37 +2244,9 @@ impl IronProxyHarnessArgs {
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
-enum SandboxBackendKind {
-    Local,
-    #[value(name = "agent-k8s")]
-    AgentK8s,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
-enum SandboxWorkloadKind {
-    Mock,
-    #[value(name = "codex-app-server")]
-    CodexAppServer,
-}
-
-fn default_sandbox_image(workload: SandboxWorkloadKind) -> &'static str {
-    match workload {
-        SandboxWorkloadKind::Mock => "busybox:1.36",
-        SandboxWorkloadKind::CodexAppServer => "centaur-agent:latest",
-    }
-}
-
-fn default_workflow_host_path() -> String {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("..")
-        .join("..")
-        .join("..")
-        .join("workflow-python")
-        .join("workflow_host.py")
-        .to_string_lossy()
-        .to_string()
-}
+const DEFAULT_SANDBOX_IMAGE: &str = "centaur-agent:latest";
+/// Where the sandbox image installs the Python workflow host.
+const WORKFLOW_HOST_PATH: &str = "/usr/local/bin/workflow-host";
 
 fn harness_fragment_engine_name(engine: &HarnessType) -> &'static str {
     match engine {
@@ -2549,20 +2471,6 @@ mod tests {
     }
 
     #[test]
-    fn session_principal_admission_rejects_unknown_values() {
-        assert!(
-            Args::try_parse_from([
-                "centaur-api-server",
-                "--database-url",
-                "postgres://postgres:postgres@localhost/centaur",
-                "--session-principal-admission",
-                "sometimes",
-            ])
-            .is_err()
-        );
-    }
-
-    #[test]
     fn session_event_retention_is_disabled_by_default() {
         let args = Args::try_parse_from([
             "centaur-api-server",
@@ -2725,34 +2633,6 @@ mod tests {
     }
 
     #[test]
-    fn parses_session_sandbox_flags() {
-        let args = Args::try_parse_from([
-            "centaur-api-server",
-            "--database-url",
-            "postgres://postgres:postgres@localhost/centaur",
-            "--session-sandbox-backend",
-            "agent-k8s",
-            "--session-sandbox-workload",
-            "codex-app-server",
-            "--session-sandbox-k8s-namespace",
-            "centaur-test",
-            "--session-sandbox-image",
-            "centaur-agent:test",
-            "--session-sandbox-ready-timeout-secs",
-            "17",
-            "--session-sandbox-k8s-context",
-            "kind-test",
-        ])
-        .unwrap();
-
-        assert_eq!(args.sandbox.backend, SandboxBackendKind::AgentK8s);
-        assert_eq!(args.sandbox.workload, SandboxWorkloadKind::CodexAppServer);
-        assert_eq!(args.sandbox.k8s_namespace, "centaur-test");
-        assert_eq!(args.sandbox.ready_timeout_secs, 17);
-        assert_eq!(args.sandbox.k8s_context.as_deref(), Some("kind-test"));
-    }
-
-    #[test]
     fn session_sandbox_state_volume_requires_opt_in() {
         for flags in [
             vec![],
@@ -2822,21 +2702,6 @@ mod tests {
     }
 
     #[test]
-    fn execution_adoption_rescans_every_fifteen_seconds_by_default() {
-        let args = Args::try_parse_from([
-            "centaur-api-server",
-            "--database-url",
-            "postgres://postgres:postgres@localhost/centaur",
-        ])
-        .unwrap();
-
-        assert_eq!(
-            args.execution_adoption_interval(),
-            Some(Duration::from_secs(15))
-        );
-    }
-
-    #[test]
     fn execution_adoption_interval_zero_disables_rescans() {
         let args = Args::try_parse_from([
             "centaur-api-server",
@@ -2848,35 +2713,6 @@ mod tests {
         .unwrap();
 
         assert_eq!(args.execution_adoption_interval(), None);
-    }
-
-    #[test]
-    fn shutdown_drain_defaults_to_twenty_seconds() {
-        let args = Args::try_parse_from([
-            "centaur-api-server",
-            "--database-url",
-            "postgres://postgres:postgres@localhost/centaur",
-        ])
-        .unwrap();
-
-        assert_eq!(
-            args.shutdown_execution_drain_timeout(),
-            Duration::from_secs(20)
-        );
-    }
-
-    #[test]
-    fn shutdown_drain_timeout_is_configurable() {
-        let args = Args::try_parse_from([
-            "centaur-api-server",
-            "--database-url",
-            "postgres://postgres:postgres@localhost/centaur",
-            "--shutdown-execution-drain-timeout-secs",
-            "0",
-        ])
-        .unwrap();
-
-        assert_eq!(args.shutdown_execution_drain_timeout(), Duration::ZERO);
     }
 
     #[test]
@@ -2894,47 +2730,11 @@ mod tests {
     }
 
     #[test]
-    fn sandbox_orphan_sweep_grace_is_configurable() {
-        let args = Args::try_parse_from([
-            "centaur-api-server",
-            "--database-url",
-            "postgres://postgres:postgres@localhost/centaur",
-            "--session-sandbox-orphan-sweep-grace-secs",
-            "1200",
-        ])
-        .unwrap();
-
-        assert_eq!(
-            args.sandbox_reaper_config().orphan_sweep_grace,
-            Duration::from_secs(1200)
-        );
-    }
-
-    #[test]
-    fn accepts_kubernetes_aliases_for_sandbox_flags() {
-        let args = Args::try_parse_from([
-            "centaur-api-server",
-            "--database-url",
-            "postgres://postgres:postgres@localhost/centaur",
-            "--kubernetes-sandbox-backend",
-            "agent-k8s",
-            "--kubernetes-namespace",
-            "centaur-test",
-        ])
-        .unwrap();
-
-        assert_eq!(args.sandbox.backend, SandboxBackendKind::AgentK8s);
-        assert_eq!(args.sandbox.k8s_namespace, "centaur-test");
-    }
-
-    #[test]
     fn agent_k8s_config_converts_from_sandbox_args() {
         let args = Args::try_parse_from([
             "centaur-api-server",
             "--database-url",
             "postgres://postgres:postgres@localhost/centaur",
-            "--session-sandbox-backend",
-            "agent-k8s",
             "--session-sandbox-k8s-namespace",
             "centaur-test",
             "--session-sandbox-image-pull-policy",
@@ -3015,8 +2815,6 @@ mod tests {
             "centaur-api-server",
             "--database-url",
             "postgres://postgres:postgres@localhost/centaur",
-            "--session-sandbox-backend",
-            "agent-k8s",
             "--iron-control-url",
             "http://console.local",
             "--iron-control-proxy-sync-url",
@@ -3055,41 +2853,11 @@ mod tests {
     }
 
     #[test]
-    fn tools_config_reads_auto_reload_flag() {
-        let args = Args::try_parse_from([
-            "centaur-api-server",
-            "--database-url",
-            "postgres://postgres:postgres@localhost/centaur",
-            "--session-sandbox-backend",
-            "agent-k8s",
-            "--iron-control-url",
-            "http://console.local",
-            "--iron-control-proxy-sync-url",
-            "http://proxy-sync.local:8080",
-            "--iron-control-api-key",
-            "iak_test",
-            "--kubernetes-tools-repo",
-            "paradigmxyz/centaur",
-            "--kubernetes-tools-runner-image",
-            "centaur-agent:test",
-            "--kubernetes-tools-auto-reload",
-            "false",
-        ])
-        .unwrap();
-
-        let config = AgentSandboxConfig::try_from(&args.sandbox).unwrap();
-        let tools = config.tools.expect("tools should be Some");
-        assert!(!tools.auto_reload);
-    }
-
-    #[test]
     fn agent_k8s_workflow_dirs_fan_out_across_extra_sources() {
         let args = Args::try_parse_from([
             "centaur-api-server",
             "--database-url",
             "postgres://postgres:postgres@localhost/centaur",
-            "--session-sandbox-backend",
-            "agent-k8s",
             "--kubernetes-tools-repo",
             "paradigmxyz/centaur",
             "--kubernetes-tools-runner-image",
@@ -3115,8 +2883,6 @@ mod tests {
             "centaur-api-server",
             "--database-url",
             "postgres://postgres:postgres@localhost/centaur",
-            "--session-sandbox-backend",
-            "agent-k8s",
         ])
         .unwrap();
 
@@ -3132,8 +2898,6 @@ mod tests {
             "centaur-api-server",
             "--database-url",
             "postgres://postgres:postgres@localhost/centaur",
-            "--session-sandbox-backend",
-            "agent-k8s",
             "--repos-path",
             "/var/lib/centaur/repos",
             "--tools-path",
@@ -3188,8 +2952,6 @@ mod tests {
             "centaur-api-server",
             "--database-url",
             "postgres://postgres:postgres@localhost/centaur",
-            "--session-sandbox-backend",
-            "agent-k8s",
             "--repos-path",
             "/var/lib/centaur/repos",
             "--repos-pvc",
@@ -3222,8 +2984,6 @@ mod tests {
             "centaur-api-server",
             "--database-url",
             "postgres://postgres:postgres@localhost/centaur",
-            "--session-sandbox-backend",
-            "agent-k8s",
             "--session-sandbox-centaur-api-url",
             "http://centaur-api-rs:8080",
         ])
@@ -3283,8 +3043,6 @@ mod tests {
             "centaur-api-server",
             "--database-url",
             "postgres://postgres:postgres@localhost/centaur",
-            "--session-sandbox-workload",
-            "codex-app-server",
             "--session-sandbox-centaur-api-url",
             "http://host.docker.internal:8080",
         ])
@@ -3337,8 +3095,6 @@ mod tests {
             "centaur-api-server",
             "--database-url",
             "postgres://postgres:postgres@localhost/centaur",
-            "--session-sandbox-workload",
-            "codex-app-server",
             "--session-sandbox-extra-env",
             r#"[
                 {"name":"OTEL_EXPORTER_OTLP_TRACES_ENDPOINT","value":"http://laminar-app-server.laminar.svc.cluster.local:8000/v1/traces"},
@@ -3400,8 +3156,6 @@ mod tests {
             "centaur-api-server",
             "--database-url",
             "postgres://postgres:postgres@localhost/centaur",
-            "--session-sandbox-workload",
-            "codex-app-server",
             "--session-sandbox-extra-env",
             r#"[{"name":"OTEL_EXPORTER_OTLP_TRACES_ENDPOINT","value":"http://laminar-app-server.laminar.svc.cluster.local:8000/v1/traces"}]"#,
         ])
@@ -3414,19 +3168,6 @@ mod tests {
                 port: 8000,
             })
         );
-    }
-
-    #[test]
-    fn sandbox_otlp_egress_target_absent_for_mock_workload() {
-        let mock = Args::try_parse_from([
-            "centaur-api-server",
-            "--database-url",
-            "postgres://postgres:postgres@localhost/centaur",
-            "--session-sandbox-extra-env",
-            r#"[{"name":"OTEL_EXPORTER_OTLP_TRACES_ENDPOINT","value":"http://laminar-app-server.laminar.svc.cluster.local:8000/v1/traces"}]"#,
-        ])
-        .unwrap();
-        assert_eq!(mock.sandbox.sandbox_otlp_egress_target().unwrap(), None);
     }
 
     #[test]
@@ -3471,22 +3212,6 @@ mod tests {
             args.sandbox.priority_class_name.as_deref(),
             Some("centaur-sandbox")
         );
-    }
-
-    #[test]
-    fn node_steering_is_empty_when_unset() {
-        let args = Args::try_parse_from([
-            "centaur-api-server",
-            "--database-url",
-            "postgres://postgres:postgres@localhost/centaur",
-        ])
-        .unwrap();
-
-        assert!(args.sandbox.node_selector().unwrap().is_empty());
-        assert!(args.sandbox.pod_annotations().unwrap().is_empty());
-        assert!(args.sandbox.tolerations().unwrap().is_empty());
-        assert!(args.sandbox.service_account_name.is_none());
-        assert!(args.sandbox.priority_class_name.is_none());
     }
 
     /// Unlike `SESSION_SANDBOX_EXTRA_ENV`, bad node steering fails startup:
@@ -3559,8 +3284,6 @@ mod tests {
             "centaur-api-server",
             "--database-url",
             "postgres://postgres:postgres@localhost/centaur",
-            "--session-sandbox-workload",
-            "codex-app-server",
         ])
         .unwrap();
 
@@ -3674,24 +3397,6 @@ mod tests {
     }
 
     #[test]
-    fn iron_control_infra_secret_sync_can_be_disabled() {
-        let args = Args::try_parse_from([
-            "centaur-api-server",
-            "--database-url",
-            "postgres://postgres:postgres@localhost/centaur",
-            "--iron-control-url",
-            "http://console.local",
-            "--iron-control-api-key",
-            "iak_test",
-            "--iron-control-sync-infra-secrets",
-            "false",
-        ])
-        .unwrap();
-
-        assert!(!args.sandbox.iron_control_sync_infra_secrets);
-    }
-
-    #[test]
     fn iron_proxy_database_cidrs_are_parsed_and_validated() {
         let parse = |cidrs: &str| {
             Args::try_parse_from([
@@ -3726,41 +3431,6 @@ mod tests {
     }
 
     #[test]
-    fn firewall_ca_secret_keys_default_and_override() {
-        let parse = |extra: &[&str]| {
-            let mut argv = vec![
-                "centaur-api-server",
-                "--database-url",
-                "postgres://postgres:postgres@localhost/centaur",
-                "--kubernetes-firewall-ca-secret-name",
-                "combined",
-                "--kubernetes-firewall-ca-key-secret-name",
-                "combined",
-            ];
-            argv.extend_from_slice(extra);
-            Args::try_parse_from(argv)
-                .unwrap()
-                .sandbox
-                .iron_proxy
-                .to_config()
-                .unwrap()
-        };
-
-        let config = parse(&[]);
-        assert_eq!(config.ca_cert_secret_key, "ca-cert.pem");
-        assert_eq!(config.ca_key_secret_key, "ca-key.pem");
-
-        let config = parse(&[
-            "--kubernetes-firewall-ca-secret-key",
-            "CA_CERT_PEM",
-            "--kubernetes-firewall-ca-key-secret-key",
-            "CA_KEY_PEM",
-        ]);
-        assert_eq!(config.ca_cert_secret_key, "CA_CERT_PEM");
-        assert_eq!(config.ca_key_secret_key, "CA_KEY_PEM");
-    }
-
-    #[test]
     fn iron_proxy_upstream_deny_cidrs_are_parsed() {
         let args = Args::try_parse_from([
             "centaur-api-server",
@@ -3792,20 +3462,15 @@ mod tests {
             "centaur-api-server",
             "--database-url",
             "postgres://postgres:postgres@localhost/centaur",
-            "--session-sandbox-workload",
-            "codex-app-server",
             "--repos-path",
             "/var/lib/centaur/repos",
         ])
         .unwrap();
 
         let workload = args.sandbox.container_workload_mode().unwrap();
-        let SandboxWorkloadMode::CodexAppServer {
+        let SandboxWorkloadMode {
             harness, mounts, ..
-        } = workload
-        else {
-            panic!("expected codex app server workload");
-        };
+        } = workload;
 
         assert_eq!(harness, HarnessType::Codex);
         assert!(mounts.iter().any(|mount| {
@@ -3824,8 +3489,6 @@ mod tests {
             "centaur-api-server",
             "--database-url",
             "postgres://postgres:postgres@localhost/centaur",
-            "--session-sandbox-workload",
-            "codex-app-server",
             "--repos-path",
             "/var/lib/centaur/repos",
             "--repos-pvc",
@@ -3834,9 +3497,7 @@ mod tests {
         .unwrap();
 
         let workload = args.sandbox.container_workload_mode().unwrap();
-        let SandboxWorkloadMode::CodexAppServer { mounts, .. } = workload else {
-            panic!("expected codex app server workload");
-        };
+        let SandboxWorkloadMode { mounts, .. } = workload;
 
         assert!(mounts.iter().any(|mount| {
             mount.target_path == SANDBOX_REPOS_MOUNT_PATH
@@ -3851,8 +3512,6 @@ mod tests {
             "centaur-api-server",
             "--database-url",
             "postgres://postgres:postgres@localhost/centaur",
-            "--session-sandbox-workload",
-            "codex-app-server",
             "--session-sandbox-resources",
             r#"{"requests":{"cpu":0.5,"ephemeral-storage":"2Gi"},"limits":{"memory":"4Gi","example.com/gpu":1}}"#,
             "--workflow-host-resources",
@@ -3869,9 +3528,7 @@ mod tests {
         .unwrap();
 
         let workload = args.sandbox.container_workload_mode().unwrap();
-        let SandboxWorkloadMode::CodexAppServer { resources, .. } = workload else {
-            panic!("expected codex app server workload");
-        };
+        let SandboxWorkloadMode { resources, .. } = workload;
         assert_eq!(
             resources,
             Some(
@@ -3918,8 +3575,6 @@ mod tests {
             "centaur-api-server",
             "--database-url",
             "postgres://postgres:postgres@localhost/centaur",
-            "--session-sandbox-workload",
-            "codex-app-server",
             "--session-sandbox-resources",
             "",
             "--iron-control-url",
@@ -3932,9 +3587,7 @@ mod tests {
         .unwrap();
 
         let workload = args.sandbox.container_workload_mode().unwrap();
-        let SandboxWorkloadMode::CodexAppServer { resources, .. } = workload else {
-            panic!("expected codex app server workload");
-        };
+        let SandboxWorkloadMode { resources, .. } = workload;
         assert_eq!(resources, None);
 
         assert_eq!(
@@ -3958,8 +3611,6 @@ mod tests {
             "centaur-api-server",
             "--database-url",
             "postgres://postgres:postgres@localhost/centaur",
-            "--session-sandbox-workload",
-            "codex-app-server",
             "--session-sandbox-resources",
             r#"{"request":{"cpu":"500m"}}"#,
         ])

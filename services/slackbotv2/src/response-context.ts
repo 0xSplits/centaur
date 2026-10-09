@@ -43,7 +43,7 @@ const GPT_5_6_REASONING_EFFORTS = new Set([
   ...STANDARD_CODEX_REASONING_EFFORTS,
   'max'
 ])
-const GPT_6_ASTRA_REASONING_EFFORTS = new Set([
+const GPT_6_ULTRA_REASONING_EFFORTS = new Set([
   'low',
   'medium',
   'high',
@@ -84,8 +84,9 @@ const CODEX_REASONING_EFFORTS_BY_MODEL: Record<string, ReadonlySet<string>> = {
   'gpt-5.6-luna': GPT_5_6_REASONING_EFFORTS,
   'gpt-5.6-sol': GPT_5_6_REASONING_EFFORTS,
   'gpt-5.6-terra': GPT_5_6_REASONING_EFFORTS,
-  'gpt-6-astra': GPT_6_ASTRA_REASONING_EFFORTS,
+  'gpt-6-astra': GPT_6_ULTRA_REASONING_EFFORTS,
   'gpt-6-sol': GPT_5_6_REASONING_EFFORTS,
+  'gpt-6.1-sol': GPT_6_ULTRA_REASONING_EFFORTS,
   'gpt-6-luna': GPT_5_6_REASONING_EFFORTS
 }
 
@@ -236,6 +237,38 @@ export function reasoningForModel(
   return supported?.has(effectiveEffort) ? effort : undefined
 }
 
+// Claude model IDs: family, dash-separated version, optional variant words,
+// optional date snapshot (claude-opus-5-5, claude-haiku-4-5-20251001,
+// claude-opus-5-fast).
+const CLAUDE_MODEL_ID = /^claude-([a-z]+)((?:-\d{1,2})*)((?:-[a-z]+)*)(?:-\d{8})?$/
+// GPT model IDs: version, optional variant words, optional date snapshot
+// (gpt-5.2, gpt-5.4-pro, gpt-5.6-sol, gpt-5.2-2025-12-11).
+const GPT_MODEL_ID = /^gpt-(\d+(?:\.\d+)?)((?:-[a-z]+)*)(?:-\d{4}-\d{2}-\d{2})?$/
+// GPT codenames shown in place of the "GPT" prefix (gpt-5.6-sol -> "Sol 5.6").
+const GPT_CODENAMES = new Set(['sol', 'luna', 'terra', 'astra'])
+
+/**
+ * Formats a model ID for the footer as its product name: claude-opus-5-5 ->
+ * "Opus 5.5", gpt-5.6-sol -> "Sol 5.6", gpt-5.2 -> "GPT 5.2". Unrecognized
+ * models (provider-prefixed IDs, o-series) are uppercased.
+ */
+export function modelDisplayName(model: string): string {
+  const id = model.toLowerCase()
+  const gpt = GPT_MODEL_ID.exec(id)
+  if (gpt) {
+    const [, version = '', variant = ''] = gpt
+    const word = variant.slice(1)
+    if (GPT_CODENAMES.has(word)) return `${titleCase(word)} ${version}`
+    return ['GPT', version, titleCase(variant)].filter(Boolean).join(' ')
+  }
+  const claude = CLAUDE_MODEL_ID.exec(id)
+  if (!claude) return model.toUpperCase()
+  const [, family = '', version = '', variant = ''] = claude
+  return [titleCase(family), version.slice(1).replace(/-/g, '.'), titleCase(variant)]
+    .filter(Boolean)
+    .join(' ')
+}
+
 function reasoningDisplayName(reasoning: string | null | undefined): string | undefined {
   const key = reasoning?.trim().toLowerCase()
   if (!key) return undefined
@@ -273,7 +306,7 @@ export function buildSlackResponseContextBlock(params: {
   if (notice) segments.push(`:warning: ${escapeSlackMrkdwn(notice)}`)
   if (includeMetadata) {
     const model = params.model?.trim()
-    if (model) segments.push(escapeSlackMrkdwn(model.toUpperCase()))
+    if (model) segments.push(escapeSlackMrkdwn(modelDisplayName(model)))
     const harness = harnessDisplayName(params.harnessType)
     if (harness) segments.push(escapeSlackMrkdwn(harness))
     const reasoning = reasoningDisplayName(params.reasoning)
