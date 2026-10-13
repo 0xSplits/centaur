@@ -18,6 +18,8 @@ Deliver high-quality software changes end-to-end:
   - Python: `ruff check`, formatting check, targeted tests.
   - TypeScript: `pnpm exec tsc --noEmit` and relevant lint/tests.
   - Run only the checks needed for changed surfaces, but do not skip critical validations.
+  - New tests are not a default PR deliverable. Add one only when it protects behavior or a concrete regression that existing tests miss and would fail if that behavior broke. Do not add tests that repeat the implementation, assert incidental mock calls, or cover reversible, low-impact changes.
+  - If no new test meets that bar, add none and report the existing checks run.
 - **Communicate clearly**: summarize what changed, why, and how it was validated.
 
 ## Debugging And Investigation
@@ -41,4 +43,4 @@ Deliver high-quality software changes end-to-end:
 ## Model/Budget Guidance
 - `--simple`/`--fast`: narrow, minimal solution.
 - `--auto`: balanced trade-offs.
-- `--complex`/`--deep`: rigorous pass with stronger testing and edge-case coverage.
+- `--complex`/`--deep`: rigorous pass with stronger validation and edge-case coverage where warranted.
