@@ -21,7 +21,10 @@ from centaur_sdk import secret
 
 _US_HOST = "amplitude.com"
 _EU_HOST = "analytics.eu.amplitude.com"
-_CHART_PATH = re.compile(r"/analytics/[^/]+/chart/([A-Za-z0-9_-]+)/?")
+# Web app chart links: app.amplitude.com/analytics/<org>/chart/<id>[/edit/...]
+# and the legacy analytics.amplitude.com/<org>/chart/<id>.
+_CHART_HOSTS = {"app.amplitude.com", "analytics.amplitude.com"}
+_CHART_PATH = re.compile(r"(?:/analytics)?/[^/]+/chart/([A-Za-z0-9_-]+)(?:/|$)")
 
 
 def _fmt_date(value: str) -> str:
@@ -108,7 +111,7 @@ class AmplitudeClient:
             params: Query parameters (dict, or list of tuples for repeated keys)
 
         Returns:
-            JSON response data
+            JSON response data, or {"data": <body>} when the body is not JSON
 
         Raises:
             RuntimeError: If the request fails
@@ -118,19 +121,21 @@ class AmplitudeClient:
             response = self.client.request(method, endpoint, headers=headers, params=params)
             response.raise_for_status()
             return response.json()
+        except json.JSONDecodeError:
+            return {"data": response.text}
         except httpx.HTTPStatusError as e:
             raise RuntimeError(f"API error: {e.response.status_code} - {e.response.text}") from e
         except httpx.RequestError as e:
             raise RuntimeError(f"Request failed: {e}") from e
 
     def chart_results(self, chart: str) -> dict:
-        """Fetch a saved chart's CSV result from its ID or shared URL."""
+        """Fetch a saved chart's CSV result from its ID or web app URL."""
         if re.fullmatch(r"[A-Za-z0-9_-]+", chart):
             chart_id = chart
         else:
             parsed = urlparse(chart)
-            match = _CHART_PATH.fullmatch(parsed.path)
-            if parsed.scheme != "https" or parsed.hostname != "app.amplitude.com" or not match:
+            match = _CHART_PATH.match(parsed.path)
+            if parsed.scheme != "https" or parsed.hostname not in _CHART_HOSTS or not match:
                 raise RuntimeError("Expected an Amplitude chart URL or chart ID")
             chart_id = match.group(1)
         return self._request("GET", f"/api/3/chart/{chart_id}/csv")

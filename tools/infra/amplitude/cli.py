@@ -53,7 +53,7 @@ def _dump(result: dict) -> None:
 
 @app.command("chart-results")
 def chart_results(chart: str = typer.Argument(..., help="Saved chart URL or ID")):
-    """Fetch the saved chart result using the existing project credentials."""
+    """Fetch a saved chart's CSV result from its URL or ID."""
     client = get_client()
     try:
         _dump(_run(lambda: client.chart_results(chart)))
