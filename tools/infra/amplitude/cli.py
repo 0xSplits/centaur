@@ -77,6 +77,36 @@ def chart_query(
         client.close()
 
 
+@app.command("chart-results")
+def chart_results(chart: str = typer.Argument(..., help="Saved chart URL or ID")):
+    """Get saved chart results with the existing project API key and secret."""
+    client = get_client()
+    try:
+        _dump(_run(lambda: client.chart_results(chart)))
+    finally:
+        client.close()
+
+
+@app.command("dashboard-get")
+def dashboard_get(url: str = typer.Argument(..., help="Amplitude dashboard URL")):
+    """Read a dashboard definition and chart references through Amplitude MCP."""
+    client = get_client()
+    try:
+        _dump(_run(lambda: client.dashboard_get(url)))
+    finally:
+        client.close()
+
+
+@app.command("mcp-tools")
+def mcp_tools():
+    """List Amplitude MCP tools and their current input schemas."""
+    client = get_client()
+    try:
+        _dump(_run(client.mcp_tools))
+    finally:
+        client.close()
+
+
 @app.command()
 def segmentation(
     event: str = typer.Argument(..., help="Event type (use '_all' for any active event)"),

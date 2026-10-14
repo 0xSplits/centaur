@@ -3,7 +3,8 @@
 Queries events with the Dashboard REST API and reads the tracking plan with the
 Taxonomy API. Those calls use HTTP Basic with the project's API key and secret.
 
-Saved chart reads use the Developer API and a separate, read-only PAT.
+Saved chart results use the Dashboard REST API. Structured definitions can use
+the Developer API with an optional read-only PAT; dashboards use OAuth MCP.
 """
 
 import base64
@@ -19,6 +20,7 @@ from centaur_sdk import secret
 _US_HOST = "amplitude.com"
 _EU_HOST = "analytics.eu.amplitude.com"
 _DEVELOPER_HOST = "developer-api.amplitude.com"
+_MCP_URL = "https://mcp.amplitude.com/mcp"
 _CHART_PATH = re.compile(r"^/analytics/[^/]+/chart/([A-Za-z0-9_-]+)/?$")
 
 
@@ -203,6 +205,89 @@ class AmplitudeClient:
             f"/v1/projects/{chart_data['project_id']}/charts/{chart_data['id']}/query",
             json={},
         )
+
+    def chart_results(self, value: str) -> dict:
+        """Get saved chart results with the project's existing API key and secret."""
+        chart_id = self._chart_id(value)
+        return self._request("GET", f"/api/3/chart/{chart_id}/csv")
+
+    def _mcp_rpc(self, method: str, params: dict | None = None) -> dict:
+        """Call Amplitude's read-only MCP connection through brokered OAuth."""
+        session_id = None
+        if method != "initialize":
+            initialized, session_id = self._mcp_post(
+                "initialize",
+                {
+                    "protocolVersion": "2025-03-26",
+                    "capabilities": {},
+                    "clientInfo": {"name": "centaur-amplitude", "version": "1.0"},
+                },
+            )
+            if not initialized.get("protocolVersion"):
+                raise RuntimeError("Amplitude MCP initialization failed")
+            self._mcp_post(
+                "notifications/initialized", {}, session_id=session_id, notification=True
+            )
+        result, _ = self._mcp_post(method, params, session_id=session_id)
+        return result
+
+    def _mcp_post(
+        self,
+        method: str,
+        params: dict | None,
+        *,
+        session_id: str | None = None,
+        notification: bool = False,
+    ) -> tuple[dict, str | None]:
+        headers = {"Accept": "application/json, text/event-stream"}
+        if session_id:
+            headers["Mcp-Session-Id"] = session_id
+        message = {"jsonrpc": "2.0", "method": method, "params": params or {}}
+        if not notification:
+            message["id"] = 1
+        try:
+            response = self.client.post(
+                _MCP_URL,
+                headers=headers,
+                json=message,
+            )
+            response.raise_for_status()
+        except httpx.HTTPStatusError as exc:
+            raise RuntimeError(f"Amplitude MCP error: HTTP {exc.response.status_code}") from exc
+        except httpx.RequestError as exc:
+            raise RuntimeError(f"Amplitude MCP request failed ({type(exc).__name__})") from exc
+        if notification:
+            return {}, response.headers.get("mcp-session-id", session_id)
+        if response.headers.get("content-type", "").startswith("text/event-stream"):
+            messages = [
+                line[6:] for line in response.text.splitlines() if line.startswith("data: ")
+            ]
+            if not messages:
+                raise RuntimeError("Amplitude MCP returned an empty event stream")
+            payload = json.loads(messages[-1])
+        else:
+            payload = response.json()
+        if not isinstance(payload, dict) or "error" in payload or "result" not in payload:
+            raise RuntimeError(f"Amplitude MCP {method} failed")
+        return payload["result"], response.headers.get("mcp-session-id", session_id)
+
+    def mcp_tools(self) -> dict:
+        """List the available MCP tool schemas for dashboard and chart reads."""
+        return self._mcp_rpc("tools/list")
+
+    def dashboard_get(self, url: str) -> dict:
+        """Read an Amplitude dashboard definition, including its chart links."""
+        parsed = urlparse(url)
+        if (
+            parsed.scheme != "https"
+            or parsed.hostname != "app.amplitude.com"
+            or not re.fullmatch(r"/analytics/[^/]+/dashboard/[A-Za-z0-9_-]+/?", parsed.path)
+        ):
+            raise RuntimeError("Expected an Amplitude dashboard URL")
+        result = self._mcp_rpc("tools/call", {"name": "get_from_url", "arguments": {"url": url}})
+        if result.get("isError"):
+            raise RuntimeError("Amplitude MCP could not read the dashboard")
+        return result
 
     def _event_spec(
         self,

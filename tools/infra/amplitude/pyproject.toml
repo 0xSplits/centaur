@@ -26,6 +26,7 @@ build-backend = "hatchling.build"
 
 [tool.centaur]
 module = "client.py"
+hosts = ["mcp.amplitude.com"]
 # Dashboard REST + Taxonomy APIs authenticate with HTTP Basic using
 # {api_key}:{secret_key}. The client base64-encodes both placeholders into one
 # Authorization header; iron-proxy decodes the header, swaps each placeholder

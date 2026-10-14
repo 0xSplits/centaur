@@ -1,5 +1,7 @@
 """Saved chart reads use the Developer API without changing Dashboard REST auth."""
 
+import json
+
 import httpx
 import pytest
 from centaur_tool_amplitude.client import AmplitudeClient
@@ -12,7 +14,9 @@ CHART_URL = (
 
 def _client(handler):
     client = AmplitudeClient(developer_token="amp_test")
-    client._client = httpx.Client(transport=httpx.MockTransport(handler))
+    client._client = httpx.Client(
+        base_url="https://amplitude.com", transport=httpx.MockTransport(handler)
+    )
     return client
 
 
@@ -74,3 +78,57 @@ def test_chart_url_rejects_other_hosts_and_developer_errors_hide_response():
         with pytest.raises(RuntimeError, match="Developer API error: HTTP 403") as exc:
             client.get_chart(CHART_URL, project_id="12345")
     assert "sensitive response" not in str(exc.value)
+
+
+def test_chart_results_uses_existing_project_credentials():
+    def handler(request):
+        assert request.url.host == "amplitude.com"
+        assert request.url.path == "/api/3/chart/crzjkabd/csv"
+        assert request.headers["Authorization"].startswith("Basic ")
+        return httpx.Response(200, json={"data": "Segment,2026-10-14\norgs,3\n"})
+
+    client = AmplitudeClient(api_key="project_key", secret_key="project_secret")
+    client._client = httpx.Client(
+        base_url="https://amplitude.com", transport=httpx.MockTransport(handler)
+    )
+    with client:
+        result = client.chart_results(CHART_URL)
+
+    assert result["data"] == "Segment,2026-10-14\norgs,3\n"
+
+
+def test_dashboard_get_reads_mcp_object_with_brokered_auth():
+    calls = []
+
+    def handler(request):
+        assert request.url.host == "mcp.amplitude.com"
+        assert request.url.path == "/mcp"
+        assert "Authorization" not in request.headers
+        call = json.loads(request.content)
+        calls.append(call["method"])
+        if call["method"] == "initialize":
+            return httpx.Response(
+                200,
+                headers={"Mcp-Session-Id": "test-session"},
+                json={"jsonrpc": "2.0", "id": 1, "result": {"protocolVersion": "2025-03-26"}},
+            )
+        assert request.headers["Mcp-Session-Id"] == "test-session"
+        if call["method"] == "notifications/initialized":
+            assert "id" not in call
+            return httpx.Response(202)
+        assert call["method"] == "tools/call"
+        assert call["params"] == {
+            "name": "get_from_url",
+            "arguments": {"url": "https://app.amplitude.com/analytics/splits/dashboard/t2d1v8wc"},
+        }
+        return httpx.Response(200, json={"jsonrpc": "2.0", "id": 1, "result": {"content": []}})
+
+    client = AmplitudeClient()
+    client._client = httpx.Client(transport=httpx.MockTransport(handler))
+    with client:
+        result = client.dashboard_get(
+            "https://app.amplitude.com/analytics/splits/dashboard/t2d1v8wc"
+        )
+
+    assert result == {"content": []}
+    assert calls == ["initialize", "notifications/initialized", "tools/call"]
