@@ -1,6 +1,6 @@
 [project]
 name = "amplitude"
-description = "Amplitude product analytics — event segmentation, funnels, retention, taxonomy"
+description = "Amplitude product analytics — events, taxonomy, and saved charts"
 version = "0.1.0"
 requires-python = ">=3.11"
 dependencies = [
@@ -34,4 +34,7 @@ module = "client.py"
 secrets = [
     {type = "http", name = "AMPLITUDE_API_KEY", match_headers = ["Authorization"], hosts = ["amplitude.com", "analytics.eu.amplitude.com"]},
     {type = "http", name = "AMPLITUDE_SECRET_KEY", match_headers = ["Authorization"], hosts = ["amplitude.com", "analytics.eu.amplitude.com"]},
+]
+optional_secrets = [
+    {type = "http", name = "AMPLITUDE_PAT", match_headers = ["Authorization"], hosts = ["developer-api.amplitude.com"]},
 ]

@@ -1,4 +1,4 @@
-"""CLI for the Amplitude Dashboard REST + Taxonomy APIs."""
+"""CLI for the Amplitude Dashboard REST, Taxonomy, and Developer APIs."""
 
 import json
 
@@ -6,7 +6,7 @@ import typer
 from rich.console import Console
 from rich.table import Table
 
-app = typer.Typer(name="amplitude", help="Amplitude product analytics (Dashboard REST + Taxonomy)")
+app = typer.Typer(name="amplitude", help="Amplitude product analytics and saved charts")
 
 
 @app.command("health")
@@ -44,11 +44,37 @@ def _run(fn):
         return fn()
     except RuntimeError as e:
         console.print(f"[red]Error: {e}[/]")
-        raise typer.Exit(1)
+        raise typer.Exit(1) from e
 
 
 def _dump(result: dict) -> None:
     print(json.dumps(result, indent=2))
+
+
+@app.command("chart-get")
+def chart_get(
+    chart: str = typer.Argument(..., help="Saved chart URL or ID"),
+    project_id: str = typer.Option(None, "--project-id", help="Skip project discovery"),
+):
+    """Fetch a saved chart's metadata and full read-only definition."""
+    client = get_client()
+    try:
+        _dump(_run(lambda: client.get_chart(chart, project_id)))
+    finally:
+        client.close()
+
+
+@app.command("chart-query")
+def chart_query(
+    chart: str = typer.Argument(..., help="Saved chart URL or ID"),
+    project_id: str = typer.Option(None, "--project-id", help="Skip project discovery"),
+):
+    """Query a saved chart using its saved time range and filters."""
+    client = get_client()
+    try:
+        _dump(_run(lambda: client.query_chart(chart, project_id)))
+    finally:
+        client.close()
 
 
 @app.command()
@@ -106,7 +132,7 @@ def segmentation(
 
 @app.command()
 def funnel(
-    events: list[str] = typer.Argument(..., help="Event types in step order"),
+    events: list[str] = typer.Argument(..., help="Event types in step order"),  # noqa: B008 -- Typer argument metadata
     start: str = typer.Option(..., "--start", "-s", help="Start date (YYYY-MM-DD or YYYYMMDD)"),
     end: str = typer.Option(..., "--end", "-e", help="End date (YYYY-MM-DD or YYYYMMDD)"),
     mode: str = typer.Option("ordered", "--mode", help="ordered, unordered, or sequential"),
