@@ -1,4 +1,4 @@
-"""CLI for the Amplitude Dashboard REST, Taxonomy, and Developer APIs."""
+"""CLI for the Amplitude Dashboard REST + Taxonomy APIs."""
 
 import json
 
@@ -6,7 +6,7 @@ import typer
 from rich.console import Console
 from rich.table import Table
 
-app = typer.Typer(name="amplitude", help="Amplitude product analytics and saved charts")
+app = typer.Typer(name="amplitude", help="Amplitude product analytics (Dashboard REST + Taxonomy)")
 
 
 @app.command("health")
@@ -51,58 +51,12 @@ def _dump(result: dict) -> None:
     print(json.dumps(result, indent=2))
 
 
-@app.command("chart-get")
-def chart_get(
-    chart: str = typer.Argument(..., help="Saved chart URL or ID"),
-    project_id: str = typer.Option(None, "--project-id", help="Skip project discovery"),
-):
-    """Fetch a saved chart's metadata and full read-only definition."""
-    client = get_client()
-    try:
-        _dump(_run(lambda: client.get_chart(chart, project_id)))
-    finally:
-        client.close()
-
-
-@app.command("chart-query")
-def chart_query(
-    chart: str = typer.Argument(..., help="Saved chart URL or ID"),
-    project_id: str = typer.Option(None, "--project-id", help="Skip project discovery"),
-):
-    """Query a saved chart using its saved time range and filters."""
-    client = get_client()
-    try:
-        _dump(_run(lambda: client.query_chart(chart, project_id)))
-    finally:
-        client.close()
-
-
 @app.command("chart-results")
 def chart_results(chart: str = typer.Argument(..., help="Saved chart URL or ID")):
-    """Get saved chart results with the existing project API key and secret."""
+    """Fetch the saved chart result using the existing project credentials."""
     client = get_client()
     try:
         _dump(_run(lambda: client.chart_results(chart)))
-    finally:
-        client.close()
-
-
-@app.command("dashboard-get")
-def dashboard_get(url: str = typer.Argument(..., help="Amplitude dashboard URL")):
-    """Read a dashboard definition and chart references through Amplitude MCP."""
-    client = get_client()
-    try:
-        _dump(_run(lambda: client.dashboard_get(url)))
-    finally:
-        client.close()
-
-
-@app.command("mcp-tools")
-def mcp_tools():
-    """List Amplitude MCP tools and their current input schemas."""
-    client = get_client()
-    try:
-        _dump(_run(client.mcp_tools))
     finally:
         client.close()
 
@@ -162,7 +116,7 @@ def segmentation(
 
 @app.command()
 def funnel(
-    events: list[str] = typer.Argument(..., help="Event types in step order"),  # noqa: B008 -- Typer argument metadata
+    events: list[str] = typer.Argument(..., help="Event types in step order"),  # noqa: B008
     start: str = typer.Option(..., "--start", "-s", help="Start date (YYYY-MM-DD or YYYYMMDD)"),
     end: str = typer.Option(..., "--end", "-e", help="End date (YYYY-MM-DD or YYYYMMDD)"),
     mode: str = typer.Option("ordered", "--mode", help="ordered, unordered, or sequential"),
