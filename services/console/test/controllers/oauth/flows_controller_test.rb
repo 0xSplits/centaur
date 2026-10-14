@@ -606,7 +606,7 @@ module Oauth
       assert_equal "lin-user-token", cred.access_token
       assert_equal "lin-refresh-token", cred.refresh_token
       assert cred.next_attempt_at.present?
-      assert_equal [ "api.linear.app" ], cred.static_secret.rules.map(&:host)
+      assert_equal [ "api.linear.app", "uploads.linear.app", "mcp.linear.app" ], cred.static_secret.rules.map(&:host)
       assert_equal "Linear – Ada Lovelace token", cred.static_secret.name
     end
 
