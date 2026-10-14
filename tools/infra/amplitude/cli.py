@@ -44,11 +44,21 @@ def _run(fn):
         return fn()
     except RuntimeError as e:
         console.print(f"[red]Error: {e}[/]")
-        raise typer.Exit(1)
+        raise typer.Exit(1) from e
 
 
 def _dump(result: dict) -> None:
     print(json.dumps(result, indent=2))
+
+
+@app.command("chart-results")
+def chart_results(chart: str = typer.Argument(..., help="Saved chart URL or ID")):
+    """Fetch a saved chart's CSV result from its URL or ID."""
+    client = get_client()
+    try:
+        _dump(_run(lambda: client.chart_results(chart)))
+    finally:
+        client.close()
 
 
 @app.command()
@@ -106,7 +116,7 @@ def segmentation(
 
 @app.command()
 def funnel(
-    events: list[str] = typer.Argument(..., help="Event types in step order"),
+    events: list[str] = typer.Argument(..., help="Event types in step order"),  # noqa: B008
     start: str = typer.Option(..., "--start", "-s", help="Start date (YYYY-MM-DD or YYYYMMDD)"),
     end: str = typer.Option(..., "--end", "-e", help="End date (YYYY-MM-DD or YYYYMMDD)"),
     mode: str = typer.Option("ordered", "--mode", help="ordered, unordered, or sequential"),
