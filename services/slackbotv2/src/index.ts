@@ -1336,10 +1336,11 @@ async function syncThreadMessageToSession(
   const effectiveModel =
     resolvedModel ??
     defaultModelForHarness(effectiveHarnessType, input.options.harnessDefaultModels)
+  const requestedReasoning = overrides.reasoning ?? channelDefault?.reasoning
   const resolvedReasoning = reasoningForModel(
     effectiveHarnessType,
     effectiveModel,
-    overrides.reasoning ?? channelDefault?.reasoning
+    requestedReasoning
   )
   const effectiveReasoning = effectiveReasoningForHarness(
     effectiveHarnessType,
@@ -1615,20 +1616,33 @@ async function syncThreadMessageToSession(
         }
         const harnessType = outcome.harnessType ?? effectiveHarnessType
         forwardInput.metadataHarnessType = harnessType
+        // A persona-pinned model overrides any model or provider selection.
+        const personaModel = outcome.personaModel
         let model = effectiveModel
         let reasoning = effectiveReasoning
-        if (harnessType !== effectiveHarnessType) {
+        if (harnessType !== effectiveHarnessType || personaModel) {
           model =
-            resolvedModel ?? defaultModelForHarness(harnessType, input.options.harnessDefaultModels)
-          const requestedReasoning = reasoningForModel(harnessType, model, resolvedReasoning)
+            personaModel ??
+            resolvedModel ??
+            defaultModelForHarness(harnessType, input.options.harnessDefaultModels)
+          // Validate the raw request: resolvedReasoning was filtered against
+          // the model expected before the session resolved.
+          const modelReasoning = reasoningForModel(harnessType, model, requestedReasoning)
           reasoning = effectiveReasoningForHarness(
             harnessType,
-            requestedReasoning,
+            modelReasoning,
             input.options.harnessDefaultReasoning
           )
           forwardInput.metadataModel = model
-          forwardInput.reasoning = requestedReasoning
+          forwardInput.reasoning = modelReasoning
+          if (personaModel) {
+            // The API ignores model and provider selections on a pinned thread;
+            // don't send them, so a rejected pin isn't blamed on a sticky model.
+            forwardInput.model = undefined
+            forwardInput.provider = undefined
+          }
           traceLog(input.options, 'slackbotv2_session_harness_resolved', trace, {
+            persona_model: personaModel,
             requested_harness_type: effectiveHarnessType,
             resolved_harness_type: harnessType
           })
@@ -1640,7 +1654,7 @@ async function syncThreadMessageToSession(
           notice: fallbackNotice,
           reasoning,
           serviceTier:
-            input.options.responseServiceTierEnabled === true && !resolvedProvider
+            input.options.responseServiceTierEnabled === true && (personaModel || !resolvedProvider)
               ? defaultServiceTierForHarness(harnessType)
               : undefined
         })

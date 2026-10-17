@@ -217,6 +217,11 @@ pub struct PersonaDefinition {
     pub prompt_hash: String,
     #[serde(skip_serializing)]
     pub prompt: String,
+    /// Model pinned per harness (keyed by harness wire value). Every turn of
+    /// a session on that harness runs it, whatever model or provider the turn
+    /// requests.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub models: BTreeMap<String, String>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -281,6 +286,13 @@ impl PersonaRegistry {
 
     fn get(&self, persona_id: &str) -> Option<&PersonaDefinition> {
         self.personas.get(persona_id)
+    }
+
+    fn model_for(&self, persona_id: &str, harness: &HarnessType) -> Option<&str> {
+        self.get(persona_id)?
+            .models
+            .get(harness.as_ref())
+            .map(String::as_str)
     }
 
     fn persona_allowed_for_access(
@@ -827,6 +839,13 @@ impl SessionRuntime {
         self.personas
             .as_ref()
             .and_then(|personas| personas.default_persona_id())
+    }
+
+    /// The model a session's persona pins for its harness, if any.
+    pub fn persona_model(&self, session: &Session) -> Option<&str> {
+        self.personas
+            .as_deref()?
+            .model_for(session.persona_id.as_deref()?, &session.harness_type)
     }
 
     fn context(&self) -> RuntimeContext {
@@ -2132,6 +2151,11 @@ impl SessionRuntime {
             validate_input_lines(&input_lines)?;
             let (idle_timeout, max_duration) = duration_options(idle_timeout_ms, max_duration_ms)?;
             let requester_metadata = metadata.clone();
+            let persona_model = self.persona_model(&session);
+            let input_lines = match persona_model {
+                Some(model) => input_lines_with_persona_model(input_lines, model),
+                None => input_lines,
+            };
 
             let claim = if let Some(execution_id) = persisted_execution_id {
                 span.record("centaur.execution_id", execution_id);
@@ -2143,7 +2167,12 @@ impl SessionRuntime {
                     .create_execution_with_request(
                         thread_key,
                         idempotency_key.as_deref(),
-                        execution_metadata(metadata, idle_timeout_ms, max_duration_ms),
+                        execution_metadata(
+                            metadata,
+                            idle_timeout_ms,
+                            max_duration_ms,
+                            persona_model,
+                        ),
                         persisted_request.expect("new executions have a persisted request"),
                     )
                     .await?;
@@ -2389,9 +2418,12 @@ impl SessionRuntime {
         if self.shutting_down.load(Ordering::SeqCst) {
             return Err(SessionRuntimeError::ShuttingDown);
         }
-        self.store.get_session(thread_key).await?;
+        let session = self.store.get_session(thread_key).await?;
         validate_input_lines(&input.input_lines)?;
         let _ = duration_options(input.idle_timeout_ms, input.max_duration_ms)?;
+        // The persisted request keeps the caller's lines; the driver pins
+        // them to the persona model when it writes them to the sandbox.
+        let persona_model = self.persona_model(&session);
 
         let request = persisted_execute_request(&input)?;
         let execution = self
@@ -2403,6 +2435,7 @@ impl SessionRuntime {
                     input.metadata.clone(),
                     input.idle_timeout_ms,
                     input.max_duration_ms,
+                    persona_model,
                 ),
                 request,
             )
@@ -2592,6 +2625,19 @@ impl SessionRuntime {
             }
         }) else {
             return;
+        };
+
+        // A steer that lands after the turn ends starts a new turn, which must
+        // run the pinned model too.
+        let input_lines = match self.store.get_session(thread_key).await {
+            Ok(session) => match self.persona_model(&session) {
+                Some(model) => input_lines_with_persona_model(input_lines, model),
+                None => input_lines,
+            },
+            Err(error) => {
+                warn!(%thread_key, %error, "session lookup failed during steering");
+                input_lines
+            }
         };
 
         // Steering joins the active execution's trace so harness spans for the
@@ -6636,6 +6682,35 @@ fn finish_execution_trace_span(span: &Span, status: &str) {
     );
 }
 
+/// Pins every user turn to the persona's model. The pin overrides a
+/// requested model and drops a requested provider, which may not serve it.
+/// A reasoning effort chosen for a different requested model is dropped too,
+/// so the pinned model runs its default effort instead of rejecting the turn.
+fn input_lines_with_persona_model(input_lines: Vec<String>, model: &str) -> Vec<String> {
+    input_lines
+        .into_iter()
+        .map(|line| {
+            let Ok(Value::Object(mut map)) = serde_json::from_str::<Value>(&line) else {
+                return line;
+            };
+            if map.get("type").and_then(Value::as_str) != Some("user") {
+                return line;
+            }
+            let replaces_model = map
+                .get("model")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .is_some_and(|requested| !requested.is_empty() && requested != model);
+            if replaces_model {
+                map.remove("reasoning");
+            }
+            map.insert("model".to_owned(), json!(model));
+            map.remove("provider");
+            Value::Object(map).to_string()
+        })
+        .collect()
+}
+
 fn input_lines_with_session_context(
     thread_key: &ThreadKey,
     trace: &SessionTraceContext,
@@ -7291,9 +7366,14 @@ fn execution_metadata(
     metadata: Option<Value>,
     idle_timeout_ms: Option<u64>,
     max_duration_ms: Option<u64>,
+    persona_model: Option<&str>,
 ) -> Value {
     let mut metadata = default_metadata(metadata);
     if let Value::Object(object) = &mut metadata {
+        // A persona-pinned model overrides whatever model the caller recorded.
+        if let Some(model) = persona_model {
+            object.insert("model".to_owned(), json!(model));
+        }
         if let Some(value) = idle_timeout_ms {
             object.insert("idle_timeout_ms".to_owned(), json!(value));
         }
@@ -7581,6 +7661,7 @@ mod tests {
                 source_ref: Some("abc123".to_owned()),
                 prompt_hash: "sha256:prompt".to_owned(),
                 prompt: "secret prompt".to_owned(),
+                models: BTreeMap::new(),
             }],
             Some("eng".to_owned()),
             vec!["/repo/tools".to_owned()],
@@ -7617,6 +7698,7 @@ mod tests {
                     source_ref: None,
                     prompt_hash: "sha256:private".to_owned(),
                     prompt: "private prompt".to_owned(),
+                    models: BTreeMap::new(),
                 },
                 PersonaDefinition {
                     id: "public".to_owned(),
@@ -7625,6 +7707,7 @@ mod tests {
                     source_ref: None,
                     prompt_hash: "sha256:public".to_owned(),
                     prompt: "public prompt".to_owned(),
+                    models: BTreeMap::new(),
                 },
             ],
             Some("private".to_owned()),
@@ -7697,6 +7780,7 @@ mod tests {
                 source_ref: None,
                 prompt_hash: "sha256:eng".to_owned(),
                 prompt: "engineering persona".to_owned(),
+                models: BTreeMap::new(),
             }],
             Some("eng".to_owned()),
             vec!["/repo/tools".to_owned()],
@@ -8187,8 +8271,12 @@ mod tests {
 
     #[test]
     fn execution_metadata_preserves_idle_and_max_duration() {
-        let metadata =
-            execution_metadata(Some(json!({"source": "test"})), Some(2_000), Some(5_000));
+        let metadata = execution_metadata(
+            Some(json!({"source": "test"})),
+            Some(2_000),
+            Some(5_000),
+            None,
+        );
 
         assert_eq!(metadata["source"], "test");
         assert_eq!(metadata["idle_timeout_ms"], 2_000);
@@ -8687,6 +8775,41 @@ mod tests {
                 .spec(&thread_key, &HarnessType::ClaudeCode, None)
                 .args,
             vec!["harness-server", "claude-code"]
+        );
+    }
+
+    #[test]
+    fn persona_model_overrides_requested_model_and_provider_on_user_turns() {
+        let lines = input_lines_with_persona_model(
+            vec![
+                r#"{"type":"user","reasoning":"high"}"#.to_owned(),
+                r#"{"type":"user","model":"pinned","reasoning":"high"}"#.to_owned(),
+                r#"{"type":"user","model":"explicit","provider":"amazon-bedrock","reasoning":"ultra"}"#
+                    .to_owned(),
+                r#"{"type":"control","provider":"amazon-bedrock"}"#.to_owned(),
+                "raw".to_owned(),
+            ],
+            "pinned",
+        );
+        let selections = lines
+            .iter()
+            .map(|line| {
+                serde_json::from_str::<Value>(line).ok().map(|value| {
+                    ["model", "provider", "reasoning"].map(|key| value.get(key).cloned())
+                })
+            })
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            selections,
+            [
+                Some([Some(json!("pinned")), None, Some(json!("high"))]),
+                Some([Some(json!("pinned")), None, Some(json!("high"))]),
+                // The effort was chosen for the replaced model.
+                Some([Some(json!("pinned")), None, None]),
+                Some([None, Some(json!("amazon-bedrock")), None]),
+                None,
+            ]
         );
     }
 
@@ -9717,6 +9840,7 @@ mod adoption_tests {
             source_ref: Some("abc123".to_owned()),
             prompt_hash: format!("sha256:{persona_id}"),
             prompt: format!("{persona_id} persona prompt"),
+            models: BTreeMap::from([("codex".to_owned(), format!("{persona_id}-model"))]),
         });
         runtime_with(store, backend).with_personas(
             PersonaRegistry::new(definitions, None, vec!["/repo/tools".to_owned()]).unwrap(),
@@ -9771,6 +9895,83 @@ mod adoption_tests {
                 .iter()
                 .any(|event| event.event_type == "session.harness_switched")
         );
+        reset_test_store(&store).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn queued_execution_runs_persona_pinned_model_for_session_harness() {
+        let Some(store) = test_store().await else {
+            return;
+        };
+        let _serial = TEST_LOCK.lock().await;
+        let thread_key =
+            ThreadKey::parse(format!("test:persona-model-{}", uuid::Uuid::new_v4())).unwrap();
+        let backend = Arc::new(MockBackend::new(SandboxStatus::Running, Vec::new()));
+        let (io, _stdout, stdin) = mock_io();
+        backend.push_io(io).await;
+        let runtime = runtime_with_personas(&store, backend);
+        runtime
+            .create_or_get_session(
+                &thread_key,
+                &HarnessType::Codex,
+                Some("eng"),
+                None,
+                HarnessConflictPolicy::Reject,
+            )
+            .await
+            .expect("create persona session");
+
+        // Ingresses execute through the durable queue; the driver writes the
+        // persisted request to the sandbox.
+        let execution = runtime
+            .enqueue_session_execution(
+                &thread_key,
+                ExecuteSessionInput {
+                    idempotency_key: None,
+                    metadata: Some(json!({"model": "explicit"})),
+                    input_lines: vec![
+                        r#"{"type":"user","model":"explicit","provider":"amazon-bedrock","message":{"role":"user","content":[{"type":"text","text":"hi"}]}}"#
+                            .to_owned(),
+                    ],
+                    idle_timeout_ms: None,
+                    max_duration_ms: None,
+                },
+            )
+            .await
+            .expect("enqueue execution");
+
+        use tokio::io::AsyncBufReadExt;
+        let mut lines = tokio::io::BufReader::new(stdin).lines();
+        let line = timeout(Duration::from_secs(5), lines.next_line())
+            .await
+            .expect("input line written")
+            .expect("read input line")
+            .expect("input line present");
+        let line: Value = serde_json::from_str(&line).unwrap();
+        assert_eq!(line["model"], "eng-model");
+        assert!(line.get("provider").is_none());
+        assert_eq!(execution.metadata["model"], "eng-model");
+
+        // A steer can start a new turn, so it carries the pin too.
+        runtime
+            .append_messages(
+                &thread_key,
+                &[SessionMessageInput {
+                    client_message_id: Some("steer".to_owned()),
+                    role: MessageRole::User,
+                    parts: vec![json!({"type": "text", "text": "also this"})],
+                    metadata: json!({}),
+                }],
+            )
+            .await
+            .expect("append steering message");
+        let steer = timeout(Duration::from_secs(5), lines.next_line())
+            .await
+            .expect("steering line written")
+            .expect("read steering line")
+            .expect("steering line present");
+        let steer: Value = serde_json::from_str(&steer).unwrap();
+        assert_eq!(steer["model"], "eng-model");
         reset_test_store(&store).await;
     }
 

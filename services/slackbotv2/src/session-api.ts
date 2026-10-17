@@ -819,6 +819,8 @@ type CreateSessionOutcome = {
   personaId?: string | null
   /** The unavailable persona ID replaced by the API during new-session creation. */
   unavailableRequestedPersonaId?: string
+  /** Model the persona pins for the session's harness; it overrides model and provider flags. */
+  personaModel?: string
   /** The API restarted the thread onto the requested harness. */
   harnessSwitched: boolean
 }
@@ -940,11 +942,13 @@ async function sessionOutcomeFromResponse(response: Response): Promise<CreateSes
       payload,
       'unavailable_requested_persona_id'
     )
+    const personaModel = rawSlackString(payload, 'persona_model')
     return {
       harnessSwitched: payloadIsObject && payload.harness_switched === true,
       ...(harnessType ? { harnessType } : {}),
       ...(personaId !== undefined ? { personaId } : {}),
-      ...(unavailableRequestedPersonaId ? { unavailableRequestedPersonaId } : {})
+      ...(unavailableRequestedPersonaId ? { unavailableRequestedPersonaId } : {}),
+      ...(personaModel ? { personaModel } : {})
     }
   } catch {
     return { harnessSwitched: false }
@@ -1392,10 +1396,11 @@ async function executeSession(
   const recordedModel = metadataModel ?? model
   const body: SlackbotV2ExecuteSessionRequest = {
     idempotency_key: message.id,
-    // Record the model this execution runs on (explicit override, else the
-    // configured/baked harness default) so downstream readers can show
-    // it. Metadata only; the harness receives `model` via input_lines and only
-    // when explicitly overridden.
+    // Record the model this execution runs on (persona pin, else explicit
+    // override, else the configured/baked harness default) so downstream
+    // readers can show it. Metadata only; the harness receives `model` via
+    // input_lines only when explicitly overridden, and api-rs sets a persona
+    // pin itself.
     metadata: sessionMetadata(
       options,
       message,
