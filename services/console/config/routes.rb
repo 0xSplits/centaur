@@ -260,6 +260,26 @@ Rails.application.routes.draw do
             delete :remove_editor, path: "editors"
           end
         end
+        # Permission management from an active Console admin's Slack DM.
+        namespace :admin do
+          resources :principals, only: %i[index show] do
+            collection do
+              get "lookup/:foreign_id", action: :lookup, as: :lookup, constraints: { foreign_id: /[^\/]+/ }
+            end
+            member do
+              patch "sandbox_access", action: :update_sandbox_access
+              post "slack_channel_permissions", action: :upsert_slack_channel_permission
+              delete "slack_channel_permissions/:channel_id", action: :destroy_slack_channel_permission
+            end
+            resources :roles, only: %i[index create destroy], controller: :principal_roles
+            resources :grants, only: %i[index], controller: :grantee_grants
+          end
+          resources :grants, only: %i[create destroy]
+          resources :secrets, only: %i[index]
+          resources :roles, only: %i[index show] do
+            collection { get "lookup/:foreign_id", action: :lookup, as: :lookup, constraints: { foreign_id: /[^\/]+/ } }
+          end
+        end
       end
     end
   end

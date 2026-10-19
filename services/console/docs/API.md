@@ -1107,6 +1107,26 @@ The sandbox permissions response includes an `oauth_credentials` array with non-
 }
 ```
 
+### Sandbox Admin Permission Management
+
+An active admin Console user's Slack DM sandbox may manage principal roles, direct secret grants, Slack channel permissions, and sandbox capabilities with its sandbox entitlement JWT. The sandbox principal must be a `slack_dm` principal linked to that admin whose Slack team is the bot's workspace, as recorded by the Slack channel catalog. Other sandboxes, including channel, Slack Connect, and Console-user sessions, receive `403`. Request and response shapes match the corresponding admin endpoints.
+
+| Method | Path | Notes |
+| ------ | ---- | ----- |
+| `GET` | `/api/v1/sandbox/admin/principals` | List principals. `slack_channel_id=<id>` returns only principals bound to that channel. |
+| `GET` | `/api/v1/sandbox/admin/principals/:id` | Fetch one by OID. |
+| `GET` | `/api/v1/sandbox/admin/principals/lookup/:foreign_id` | Fetch one by foreign ID. |
+| `GET`/`POST` | `/api/v1/sandbox/admin/principals/:principal_id/roles` | List or assign roles (`data: { role_id }`). |
+| `DELETE` | `/api/v1/sandbox/admin/principals/:principal_id/roles/:id` | Unassign a role. |
+| `GET` | `/api/v1/sandbox/admin/roles`, `/roles/:id`, `/roles/lookup/:foreign_id` | List or fetch roles. |
+| `GET` | `/api/v1/sandbox/admin/principals/:principal_id/grants` | List a principal's direct grants. |
+| `POST` | `/api/v1/sandbox/admin/grants` | Grant a secret to a principal (`data: { principal_id, <grant_key>: <secret oid> }`). Role grants return `403`. |
+| `DELETE` | `/api/v1/sandbox/admin/grants/:id` | Revoke a direct principal grant. Role grants return `404`. |
+| `GET` | `/api/v1/sandbox/admin/secrets` | List grantable secrets of every kind with `id`, `grant_key`, `foreign_id`, `name`, `description`, and `labels`. `q` filters by name or foreign ID. |
+| `POST` | `/api/v1/sandbox/admin/principals/:id/slack_channel_permissions` | Upsert one Slack channel permission (`data: { channel_id, upload_enabled, download_enabled, history_enabled }`). New permissions default omitted flags to `true`. |
+| `DELETE` | `/api/v1/sandbox/admin/principals/:id/slack_channel_permissions/:channel_id` | Remove the principal's own permission for a channel. |
+| `PATCH` | `/api/v1/sandbox/admin/principals/:id/sandbox_access` | Update only the supplied `sandbox_repo_cache` and `sandbox_*_enabled` fields. Flags must be JSON booleans; other values return `400`. |
+
 ## OAuth consent flow
 
 The consent flow turns a team member's OAuth consent into a managed broker credential. It runs on iron-control's own domain and is deliberately unauthenticated: the member reaches it with a single well-known link keyed by the app's `slug`. There is no external app to integrate with, so the start endpoint takes no `user` or `return_to`: after consent the member lands on an iron-control result page, and the credential's `external_user_key` is generated automatically. Safety comes from the consent itself (a credential is only created after a successful code exchange) and upsert-on-reconsent (re-consenting for the same provider account updates the existing credential instead of creating a new one).
