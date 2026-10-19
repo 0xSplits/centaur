@@ -177,6 +177,8 @@ export async function withSlackApiTimeout<T>(
 }
 
 type ForwardSessionApiCallbacks = {
+  /** Runs after append; returning false skips execute. */
+  shouldExecute?(): Promise<boolean>
   onExecutionStarted?(execution: SlackbotV2ExecuteSessionResponse): Promise<void>
   onMessagesAppended?(): Promise<void>
   onSessionCreated?(outcome: CreateSessionOutcome): Promise<void>
@@ -531,6 +533,7 @@ export async function forwardToSessionApi(
     })
   }
   if (!input.executeMessage) return null
+  if (callbacks.shouldExecute && !(await callbacks.shouldExecute())) return null
   const executeMessage = input.executeMessage
 
   const executeStartedAtMs = nowMs()

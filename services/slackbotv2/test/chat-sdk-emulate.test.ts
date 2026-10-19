@@ -174,6 +174,193 @@ describe('slackbotv2', () => {
     expect(slackApi.calls.some(call => call.method === 'agents.sessions.rename')).toBe(true)
   })
 
+  it('interrupts the active execution when Slack sends agent_session_stopped', async () => {
+    const threadTs = '1700000000.000100'
+    const key = threadKey(threadTs)
+    const interrupts: Array<{ body: unknown; url: string }> = []
+    const sharedState = createMemoryState()
+    await sharedState.connect()
+    bot = createTestBot({
+      agentViewEnabled: true,
+      state: sharedState,
+      fetch: async (input, init) => {
+        if (String(input).endsWith('/interrupt')) {
+          interrupts.push({ body: JSON.parse(String(init?.body)), url: String(input) })
+          return Response.json({
+            ok: true,
+            interrupted: true,
+            execution_id: 'exe-stopped',
+            thread_key: key
+          })
+        }
+        return globalThis.fetch(input, init)
+      }
+    })
+    const stateKey = `thread-state:${key}`
+    await sharedState.set(stateKey, { activeExecution: true, lastEventId: 7 })
+
+    const delivery = await deliverEvent({
+      type: 'agent_session_stopped',
+      channel: CHANNEL_ID,
+      thread_ts: threadTs,
+      streaming_message_ts: ['1700000000.000200'],
+      user: USER_ID
+    })
+
+    expect(delivery.response.status).toBe(200)
+    await delivery.finished()
+    // finished() does not cover the stop handler: the adapter registers it
+    // through a second waitUntil after resetting the session status.
+    await waitFor(async () =>
+      (await sharedState.get<Record<string, unknown>>(stateKey))?.activeExecution === false
+    )
+    expect(interrupts).toEqual([{
+      body: { reason: `Interrupted from Slack by ${USER_ID}` },
+      url: `${codexApi.url}/api/session/${encodeURIComponent(key)}/interrupt`
+    }])
+    expect(await sharedState.get<Record<string, unknown>>(stateKey)).toMatchObject({
+      activeExecution: false,
+      lastEventId: 7,
+      renderObligation: null
+    })
+  })
+
+  it('logs a failed native stop without failing the webhook', async () => {
+    const logs: CapturedLog[] = []
+    const sharedState = createMemoryState()
+    await sharedState.connect()
+    bot = createTestBot({
+      agentViewEnabled: true,
+      logger: captureLogger(logs),
+      state: sharedState,
+      fetch: async (input, init) => {
+        if (String(input).endsWith('/interrupt')) {
+          return new Response('unavailable', { status: 503, statusText: 'Service Unavailable' })
+        }
+        return globalThis.fetch(input, init)
+      }
+    })
+    const stateKey = `thread-state:${threadKey('1700000000.000300')}`
+    await sharedState.set(stateKey, { activeExecution: true, lastEventId: 3 })
+
+    const delivery = await deliverEvent({
+      type: 'agent_session_stopped',
+      channel: CHANNEL_ID,
+      thread_ts: '1700000000.000300',
+      streaming_message_ts: [],
+      user: USER_ID
+    })
+
+    expect(delivery.response.status).toBe(200)
+    await delivery.finished()
+    await waitFor(() => hasLog(logs, 'slackbotv2_stop_command_failed'))
+    expect(logData(logs, 'slackbotv2_stop_command_failed')).toMatchObject({
+      trigger: 'agent_session_stopped'
+    })
+    await waitFor(() => slackApi.calls.some(call => call.method === 'chat.postEphemeral'))
+    expect(slackApi.calls.find(call => call.method === 'chat.postEphemeral')?.body).toMatchObject({
+      channel: CHANNEL_ID,
+      thread_ts: '1700000000.000300',
+      user: USER_ID
+    })
+    expect(await sharedState.get<Record<string, unknown>>(stateKey)).toMatchObject({
+      activeExecution: true,
+      lastEventId: 3
+    })
+  })
+
+  it('does not start an execution stopped during its handoff', async () => {
+    const sharedState = createMemoryState()
+    await sharedState.connect()
+    let appendStarted = false
+    let releaseAppend = () => {}
+    const appendHeld = new Promise<void>(resolve => { releaseAppend = resolve })
+    let interruptCount = 0
+    bot = createTestBot({
+      state: sharedState,
+      fetch: async (input, init) => {
+        const url = String(input)
+        if (url.endsWith('/interrupt')) {
+          interruptCount += 1
+          return Response.json({ ok: true, interrupted: false, thread_key: 'unused' })
+        }
+        if (url.endsWith('/messages') && init?.method === 'POST') {
+          appendStarted = true
+          await appendHeld
+        }
+        return globalThis.fetch(input, init)
+      }
+    })
+    const parent = await postUserMessage('Context before a stopped run.')
+    const text = `<@${BOT_USER_ID}> start, then get stopped`
+    const mention = await postUserMessage(text, parent.ts)
+    const mentionDelivery = deliverEvent({
+      type: 'app_mention', user: USER_ID, channel: CHANNEL_ID, team: TEAM_ID,
+      ts: mention.ts, thread_ts: parent.ts, text
+    })
+    await waitFor(() => appendStarted)
+
+    const stop = await deliverEvent({
+      type: 'agent_session_stopped', channel: CHANNEL_ID, thread_ts: parent.ts,
+      streaming_message_ts: [], user: USER_ID
+    })
+    expect(stop.response.status).toBe(200)
+    await stop.finished()
+    await waitFor(() => interruptCount === 1)
+    releaseAppend()
+    const delivery = await mentionDelivery
+    expect(delivery.response.status).toBe(200)
+    await delivery.finished()
+
+    expect(codexApi.appends).toHaveLength(1)
+    expect(codexApi.executes).toHaveLength(0)
+    expect(await sharedState.get<Record<string, unknown>>(`thread-state:${threadKey(parent.ts)}`))
+      .toMatchObject({ activeExecution: false })
+  })
+
+  it('interrupts an execution stopped while execute is in flight', async () => {
+    const interrupts: unknown[] = []
+    bot = createTestBot({
+      fetch: async (input, init) => {
+        if (String(input).endsWith('/interrupt')) {
+          // Nothing is active until the held execute returns.
+          interrupts.push(JSON.parse(String(init?.body)))
+          return Response.json({
+            ok: true,
+            interrupted: interrupts.length > 1,
+            thread_key: 'unused'
+          })
+        }
+        return globalThis.fetch(input, init)
+      }
+    })
+    const releaseExecute = codexApi.holdNextExecute()
+    const parent = await postUserMessage('Context before a stopped run.')
+    const text = `<@${BOT_USER_ID}> start, then get stopped`
+    const mention = await postUserMessage(text, parent.ts)
+    const mentionDelivery = deliverEvent({
+      type: 'app_mention', user: USER_ID, channel: CHANNEL_ID, team: TEAM_ID,
+      ts: mention.ts, thread_ts: parent.ts, text
+    })
+    await waitFor(() => codexApi.executes.length === 1)
+
+    const stop = await deliverEvent({
+      type: 'agent_session_stopped', channel: CHANNEL_ID, thread_ts: parent.ts,
+      streaming_message_ts: [], user: USER_ID
+    })
+    await stop.finished()
+    await waitFor(() => interrupts.length === 1)
+    releaseExecute()
+    const delivery = await mentionDelivery
+    await waitFor(() => interrupts.length === 2)
+    await delivery.finished()
+
+    expect(interrupts).toEqual([
+      { reason: `Interrupted from Slack by ${USER_ID}` },
+      { reason: 'Interrupted from Slack' }
+    ])
+  })
+
   it('accepts Slack events on the legacy route', async () => {
     const parent = await postUserMessage('Legacy route context.')
     const mention = await postUserMessage(`<@${BOT_USER_ID}> use the legacy route`, parent.ts)
@@ -5182,6 +5369,7 @@ type StreamCall = {
     | 'agents.sessions.rename'
     | 'assistant.threads.setStatus'
     | 'assistant.threads.setTitle'
+    | 'chat.postEphemeral'
     | 'chat.postMessage'
     | 'chat.update'
     | 'chat.startStream'
@@ -5399,6 +5587,11 @@ async function handlePatchedSlackRequest(
   }
 
   const path = normalizeApiPath(url.pathname)
+  if (path === '/api/chat.postEphemeral') {
+    input.calls.push({ method: 'chat.postEphemeral', body: await requestBody(request) })
+    await sendWebResponse(res, Response.json({ ok: true, message_ts: '1700000000.999999' }))
+    return
+  }
   if (path === '/api/agents.sessions.setStatus' || path === '/api/agents.sessions.rename') {
     const body = await requestBody(request)
     input.calls.push({ method: path.slice('/api/'.length) as StreamCall['method'], body })

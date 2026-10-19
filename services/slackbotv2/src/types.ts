@@ -241,6 +241,11 @@ export type SlackbotV2ThreadState = {
   /** Last thread-level model provider selected by Slack flags. Null clears persisted state. */
   provider?: string | null
   renderObligation?: SlackbotV2RenderObligation | null
+  /**
+   * When a user last stopped this thread (ms). An execution still being
+   * handed off for a message sent before then must not run.
+   */
+  stopRequestedAt?: number
 }
 
 export type SlackbotV2RenderObligation = {
