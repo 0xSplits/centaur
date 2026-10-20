@@ -4,6 +4,7 @@ pub mod client;
 mod error;
 mod mcp;
 mod routes;
+mod slack_external_teams;
 mod slack_proxy;
 mod tool_discovery;
 pub mod types;
@@ -15,6 +16,7 @@ pub use routes::{
     AppState, build_router_with_app_state, build_router_with_runtime,
     build_router_with_session_and_workflow_runtime, build_router_with_session_runtime,
 };
+pub use slack_external_teams::partition_slack_external_team_ids;
 pub use tool_discovery::{
     DiscoveredToolProxyFragment, ToolDiscoveryConfig, ToolDiscoveryError,
     discover_persona_registry, discover_tool_proxy_fragment,
@@ -490,6 +492,44 @@ mod tests {
                 .await
                 .unwrap();
             assert_eq!(response.status(), expected);
+        }
+    }
+
+    #[tokio::test]
+    async fn slack_external_team_ids_are_readable_by_slackbot_and_writable_by_console() {
+        let slackbot = "test-slackbot-key".to_owned();
+        let body = r#"{"slack_external_team_ids":["T0PARTNER"]}"#;
+        for (method, token, expected) in [
+            (
+                Method::GET,
+                slackbot.clone(),
+                StatusCode::SERVICE_UNAVAILABLE,
+            ),
+            (
+                Method::GET,
+                principal_token("prn_sandbox"),
+                StatusCode::FORBIDDEN,
+            ),
+            (Method::PUT, slackbot, StatusCode::FORBIDDEN),
+            (
+                Method::PUT,
+                console_token(),
+                StatusCode::SERVICE_UNAVAILABLE,
+            ),
+        ] {
+            let response = build_router_with_app_state(AppState::unready(test_auth_with_slack()))
+                .oneshot(
+                    Request::builder()
+                        .method(&method)
+                        .uri("/api/slack/external-team-ids")
+                        .header(header::AUTHORIZATION, format!("Bearer {token}"))
+                        .header(header::CONTENT_TYPE, "application/json")
+                        .body(Body::from(body))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), expected, "{method}");
         }
     }
 

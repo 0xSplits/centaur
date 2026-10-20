@@ -15,6 +15,7 @@ import {
   type Thread
 } from 'chat'
 import { createSlackAdapter } from '@chat-adapter/slack'
+import { verifySlackSignature } from '@chat-adapter/slack/webhook'
 import {
   assertSlackOk,
   callSlackApi,
@@ -79,6 +80,7 @@ import { createFlagMessageOverridesStrategy } from './message-overrides-strategy
 import {
   isAllowedSlackMessage,
   isAllowedSlackWebhookBody,
+  SlackExternalTeamIdsUnavailableError,
   parseSlackWebhookPayload,
   slackStreamRecipientUserId
 } from './slack-events'
@@ -575,7 +577,27 @@ export function createSlackbotV2(options: SlackbotV2Options): SlackbotV2 {
         route,
         ...webhookFields
       })
-      if (!isAllowedSlackWebhookBody(rawBody, options, logger)) {
+      // Verify before the policy gate: it can call api-rs and answer 503, which
+      // an unsigned request must not be able to trigger. The adapter verifies
+      // again before dispatch.
+      try {
+        await verifySlackSignature(rawBody, c.req.raw.headers, {
+          signingSecret: options.signingSecret
+        })
+      } catch (error) {
+        outcome = 'error'
+        logger.warn('slackbotv2_webhook_signature_rejected', { error: errorMessage(error) })
+        return new globalThis.Response('Invalid signature', { status: 401 })
+      }
+      let allowed: boolean
+      try {
+        allowed = await isAllowedSlackWebhookBody(rawBody, options, logger)
+      } catch (error) {
+        if (!(error instanceof SlackExternalTeamIdsUnavailableError)) throw error
+        outcome = 'error'
+        return new globalThis.Response('Slack Connect allowlist is unavailable. Please retry.', { status: 503 })
+      }
+      if (!allowed) {
         outcome = 'ignored'
         return new globalThis.Response('ok', { status: 200 })
       }

@@ -571,7 +571,8 @@ describe('slackbotv2', () => {
     expect(denied.status).toBe(200)
     expect(codexApi.workflowEvents).toHaveLength(0)
 
-    bot = createTestBot({ allowedExternalTeamIds: ['TEXTERNAL'] })
+    codexApi.externalTeamIds = ['TEXTERNAL']
+    bot = createTestBot()
     const waits: Promise<unknown>[] = []
     const allowed = await bot.app.request(
       '/api/webhooks/slack',
@@ -4316,6 +4317,56 @@ describe('slackbotv2', () => {
     }
   })
 
+  it('rejects an unsigned external org event before checking the allowlist', async () => {
+    codexApi.externalTeamIds = null
+    const forged = signedSlackEvent({
+      event_id: 'Ev-allowlist-forged',
+      event: { type: 'app_mention', user: USER_ID, channel: CHANNEL_ID, user_team: 'TEXTERNAL' }
+    })
+    const response = await bot.app.request('/api/webhooks/slack', {
+      ...forged,
+      headers: { ...(forged.headers as Record<string, string>), 'x-slack-signature': 'v0=0' }
+    })
+
+    expect(response.status).toBe(401)
+  })
+
+  it("asks Slack to retry an external org's event until the allowlist loads", async () => {
+    const realNow = performance.now.bind(performance)
+    let clockOffsetMs = 0
+    const clock = spyOn(performance, 'now').mockImplementation(() => realNow() + clockOffsetMs)
+    try {
+      codexApi.externalTeamIds = null
+      const mention = await postUserMessage(`<@${BOT_USER_ID}> from a partner during an outage`)
+      const event = {
+        type: 'app_mention',
+        user: USER_ID,
+        channel: CHANNEL_ID,
+        team: 'TEXTERNAL',
+        user_team: 'TEXTERNAL',
+        ts: mention.ts,
+        text: `<@${BOT_USER_ID}> from a partner during an outage`
+      }
+      const deliver = async (retryNum?: string) => {
+        const delivery = await deliverEvent(event, { eventId: 'Ev-allowlist-outage', retryNum })
+        await delivery.finished()
+        return delivery.response.status
+      }
+
+      expect(await deliver()).toBe(503)
+      // Slack's immediate first retry lands inside the failed lookup's retry window.
+      codexApi.externalTeamIds = ['TEXTERNAL']
+      expect(await deliver('1')).toBe(503)
+      expect(codexApi.appends).toHaveLength(0)
+
+      clockOffsetMs += 6_000
+      expect(await deliver('2')).toBe(200)
+      expect(codexApi.appends).toHaveLength(1)
+    } finally {
+      clock.mockRestore()
+    }
+  })
+
   it('enforces external org and trigger-bot member allowlists', async () => {
     const externalMention = await postUserMessage(`<@${BOT_USER_ID}> from external org`)
     const externalDelivery = await deliverEvent({
@@ -4332,7 +4383,8 @@ describe('slackbotv2', () => {
     expect(codexApi.appends).toHaveLength(0)
     expect(codexApi.executes).toHaveLength(0)
 
-    bot = createTestBot({ allowedExternalTeamIds: ['TEXTERNAL'] })
+    codexApi.externalTeamIds = ['TEXTERNAL']
+    bot = createTestBot()
     const allowedExternalMention = await postUserMessage(`<@${BOT_USER_ID}> allowed external org`)
     const allowedExternalDelivery = await deliverEvent({
       type: 'app_mention',
@@ -4999,6 +5051,8 @@ type MockSessionApi = {
   failNextEvents: boolean
   failNextExecute: boolean
   failNextExecuteAfterAccept: boolean
+  /** Slack Connect allowlist api-rs returns; null makes the lookup fail. */
+  externalTeamIds: string[] | null
   holdNextExecute(): () => void
   queueCreateResponse(body: Record<string, unknown>, status?: number): void
   reset(): void
@@ -5024,6 +5078,7 @@ async function startMockCodexApi(): Promise<MockSessionApi> {
   let failNextEvents = false
   let failNextExecute = false
   let failNextExecuteAfterAccept = false
+  let externalTeamIds: string[] | null = []
   const port = await availablePort(4063)
   const closeStreams = () => {
     for (const stream of streams) stream.end()
@@ -5039,6 +5094,9 @@ async function startMockCodexApi(): Promise<MockSessionApi> {
       executes,
       get autoRespond() {
         return autoRespond
+      },
+      get externalTeamIds() {
+        return externalTeamIds
       },
       get executeHold() {
         return executeHold
@@ -5098,6 +5156,7 @@ async function startMockCodexApi(): Promise<MockSessionApi> {
       failNextEvents = false
       failNextExecute = false
       failNextExecuteAfterAccept = false
+      externalTeamIds = []
       workflowEvents.length = 0
     },
     queueCreateResponse(body: Record<string, unknown>, status = 200) {
@@ -5129,6 +5188,12 @@ async function startMockCodexApi(): Promise<MockSessionApi> {
     },
     set failNextEvents(value: boolean) {
       failNextEvents = value
+    },
+    get externalTeamIds() {
+      return externalTeamIds
+    },
+    set externalTeamIds(value: string[] | null) {
+      externalTeamIds = value
     },
     holdNextExecute() {
       if (executeHoldRelease) throw new Error('execute is already held')
@@ -5190,6 +5255,7 @@ async function handleMockCodexRequest(
     eventRequests: MockSessionEventRequest[]
     executeHold: Promise<void> | null
     executes: MockSessionRequest<SlackbotV2ExecuteSessionRequest>[]
+    externalTeamIds: string[] | null
     failNextExecuteAfterAccept: boolean
     failNextEvents: boolean
     failNextExecute: boolean
@@ -5204,6 +5270,15 @@ async function handleMockCodexRequest(
   }
 ): Promise<void> {
   const url = new URL(req.url ?? '/', `http://127.0.0.1:${input.port}`)
+  if (url.pathname === '/api/slack/external-team-ids') {
+    await sendWebResponse(
+      res,
+      input.externalTeamIds
+        ? Response.json({ slack_external_team_ids: input.externalTeamIds })
+        : new Response('unavailable', { status: 503 })
+    )
+    return
+  }
   if (url.pathname === '/api/workflows/events') {
     const request = await nodeRequestToWebRequest(req, url)
     input.workflowEvents.push((await request.json()) as MockWorkflowEventRequest)

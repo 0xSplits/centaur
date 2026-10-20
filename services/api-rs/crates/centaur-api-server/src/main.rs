@@ -2,7 +2,8 @@ mod activity_summary;
 mod args;
 
 use centaur_api_server::{
-    ApiAuthConfig, AppState, build_router_with_app_state, warm_slack_public_channel_cache,
+    ApiAuthConfig, AppState, build_router_with_app_state, partition_slack_external_team_ids,
+    warm_slack_public_channel_cache,
 };
 use centaur_session_runtime::SessionRuntime;
 use centaur_session_sqlx::PgSessionStore;
@@ -11,7 +12,7 @@ use centaur_workflows::WorkflowRuntime;
 use clap::Parser;
 use thiserror::Error;
 use tokio::net::TcpListener;
-use tracing::info;
+use tracing::{info, warn};
 
 use args::{Args, MigrateArgs};
 
@@ -81,10 +82,39 @@ async fn migrate(args: MigrateArgs) -> Result<(), ServerError> {
     Ok(())
 }
 
+/// Best effort: a failure here must not keep the control plane from starting.
+async fn seed_legacy_slack_external_team_ids(store: &PgSessionStore, raw: &str) {
+    let entries: Vec<&str> = raw.split([',', ' ', '\t', '\n']).collect();
+    let (team_ids, invalid) = partition_slack_external_team_ids(&entries);
+    if !invalid.is_empty() {
+        warn!(
+            invalid = invalid.join(", "),
+            "skipping invalid SLACKBOT_EXTERNAL_ORG_ALLOWLIST entries"
+        );
+    }
+    if team_ids.is_empty() {
+        return;
+    }
+    match store.seed_slack_external_team_ids(&team_ids).await {
+        Ok(true) => info!(
+            team_count = team_ids.len(),
+            "seeded Slack Connect allowlist from SLACKBOT_EXTERNAL_ORG_ALLOWLIST"
+        ),
+        Ok(false) => {}
+        Err(error) => warn!(
+            error = %error,
+            "failed to seed Slack Connect allowlist from SLACKBOT_EXTERNAL_ORG_ALLOWLIST"
+        ),
+    }
+}
+
 async fn initialize_runtime(args: Args, app_state: AppState) -> Result<(), ServerError> {
     let store = PgSessionStore::connect(&args.server.database_url).await?;
     if args.server.run_migrations {
         store.run_migrations(args.server.text_search).await?;
+    }
+    if let Some(raw) = args.server.legacy_slack_external_org_allowlist.as_deref() {
+        seed_legacy_slack_external_team_ids(&store, raw).await;
     }
     if let Some(config) = args.activity_summary_config() {
         let worker = activity_summary::ActivitySummaryWorker::new(store.clone(), config)?;

@@ -49,6 +49,7 @@ use crate::{
     api_jwt::{bearer_jwt_from_headers, decode_jwt_payload, verify_console_jwt},
     auth::{ApiAuthConfig, AuthenticatedCaller, CallerClass, Capability},
     mcp::{mcp_get, mcp_post, mcp_protected_resource_metadata},
+    slack_external_teams::{get_slack_external_team_ids, replace_slack_external_team_ids},
     slack_proxy::slack_proxy_router,
     types::{
         AppendMessagesRequest, AppendMessagesResponse, CreateSessionRequest, CreateSessionResponse,
@@ -153,7 +154,7 @@ impl AppState {
             .ok_or_else(|| ApiError::BadRequest("workflow runtime is not enabled".to_owned()))
     }
 
-    fn pool(&self) -> Result<PgPool, ApiError> {
+    pub(crate) fn pool(&self) -> Result<PgPool, ApiError> {
         let initialized = self
             .initialized()
             .ok_or_else(|| ApiError::ServiceUnavailable("api-rs is still starting".to_owned()))?;
@@ -228,6 +229,10 @@ pub fn build_router_with_app_state(state: AppState) -> Router {
             post(pause_session_sandbox),
         )
         .route("/api/sandboxes/drain", post(drain_sandboxes))
+        .route(
+            "/api/slack/external-team-ids",
+            get(get_slack_external_team_ids).put(replace_slack_external_team_ids),
+        )
         .merge(slack_proxy_router())
         .route("/api/workflows/schedules", get(list_workflow_schedules))
         .route(
@@ -496,6 +501,14 @@ fn route_access(method: &Method, route: &str) -> Option<RouteAccess> {
         (&Method::POST, "/api/workflows/actions/invoke") => {
             capability(Capability::WorkflowsActions)
         }
+        (&Method::GET | &Method::HEAD, "/api/slack/external-team-ids") => {
+            capability(Capability::SlackExternalTeamsRead)
+        }
+        (&Method::PUT, "/api/slack/external-team-ids") => {
+            capability(Capability::SlackExternalTeamsWrite)
+        }
+        // Keep other methods out of the principal-only `/api/slack/` family.
+        (_, "/api/slack/external-team-ids") => None,
         (_, route) if route.starts_with("/api/slack/") => Some(RouteAccess::PrincipalOnly),
         (_, route) if route.starts_with("/api/admin/slack/dm-sync/") => {
             capability(Capability::AdminSync)
