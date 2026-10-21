@@ -19,10 +19,12 @@ output parsing in Python, TypeScript, api-rs, or the ingresses.
   `parse_blocks_line_with_state` in `src/server.rs`. `--mode jsonrpc` accepts
   Codex App Server requests instead, including `turn/steer`. It is used for
   protocol testing.
-- **Output:** stdout carries only Codex App Server V2 notifications, typed with
-  the pinned `codex-app-server-protocol` crate (`thread/started`,
-  `item/*`, `turn/completed`, `error`). Harness stderr may be logged, but
-  nothing else may reach stdout.
+- **Output:** stdout carries only Codex App Server V2 notifications
+  (`thread/started`, `item/*`, `turn/completed`, `error`), typed in
+  `src/protocol.rs`. `crates/harness-server-conformance` (its own workspace,
+  so the Codex crates stay out of other lockfiles) round-trips them through
+  the upstream `codex-app-server-protocol` types at a pinned revision. Harness
+  stderr may be logged, but nothing else may reach stdout.
 
 Backends:
 
