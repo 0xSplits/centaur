@@ -233,6 +233,7 @@ pub fn build_router_with_app_state(state: AppState) -> Router {
             "/api/slack/external-team-ids",
             get(get_slack_external_team_ids).put(replace_slack_external_team_ids),
         )
+        .route("/api/status", get(crate::status::status_report))
         .merge(slack_proxy_router())
         .route("/api/workflows/schedules", get(list_workflow_schedules))
         .route(
@@ -477,9 +478,10 @@ fn route_access(method: &Method, route: &str) -> Option<RouteAccess> {
     let capability = |capability| Some(RouteAccess::Capability(capability));
     match (method, route) {
         (&Method::GET, "/api/session/{thread_key}")
-        | (&Method::GET, "/api/session/{thread_key}/events") => {
-            capability(Capability::SessionsRead)
-        }
+        | (&Method::GET, "/api/session/{thread_key}/events")
+        // The status report exposes thread keys, titles and execution state,
+        // all of which SessionsRead already reaches.
+        | (&Method::GET, "/api/status") => capability(Capability::SessionsRead),
         (&Method::POST, "/api/session/{thread_key}")
         | (&Method::POST, "/api/session/{thread_key}/messages")
         | (&Method::POST, "/api/session/{thread_key}/execute")
