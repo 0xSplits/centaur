@@ -26,6 +26,14 @@ build-backend = "hatchling.build"
 
 [tool.centaur]
 module = "client.py"
+# The proxy injects the current access token of the `linear` Console broker
+# credential: a Linear OAuth app's client_credentials grant, which Console
+# re-mints before the token expires. Create it with `centaur-perms broker
+# create --foreign-id linear --token-endpoint https://api.linear.app/oauth/token`
+# and the app's client id, secret, and scopes. Every client-credentials
+# consumer of the app (linearbot included) must request the same scopes:
+# Linear revokes all of the app's tokens when one is minted with different
+# scopes. `LINEAR_API_KEY` stays the placeholder name the client sends.
 secrets = [
-    {type = "http", name = "LINEAR_API_KEY", mode = "inject", inject_header = "Authorization", hosts = ["api.linear.app", "uploads.linear.app"]},
+    {type = "brokered_token", name = "LINEAR_API_KEY", credential = "linear", hosts = ["api.linear.app", "uploads.linear.app"]},
 ]
