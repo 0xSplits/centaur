@@ -7,8 +7,6 @@ use std::sync::mpsc::{self, Receiver, RecvTimeoutError};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
-use codex_app_server_protocol::{JSONRPCMessage, ServerNotification};
-use harness_server::is_known_untyped_server_notification;
 use serde_json::{Value, json};
 use uuid::Uuid;
 
@@ -1274,6 +1272,7 @@ fn turn_interrupt_rejects_wrong_thread_and_turn_without_killing_process() {
 
     let interrupted = bridge.run_turn_with_rejected_interrupts(
         &thread_id,
+        &start_log,
         3,
         4,
         5,
@@ -1884,9 +1883,12 @@ impl BridgeProcess {
     }
 
     #[allow(clippy::too_many_arguments)]
+    /// Interrupts only after the harness has written `started_marker`, so a
+    /// slow spawn cannot be killed before it records its start.
     fn run_turn_with_rejected_interrupts(
         &mut self,
         thread_id: &str,
+        started_marker: &Path,
         request_id: i64,
         wrong_thread_interrupt_request_id: i64,
         wrong_turn_interrupt_request_id: i64,
@@ -1974,6 +1976,14 @@ impl BridgeProcess {
                     && !wrong_thread_interrupt_sent
                     && !capture.turn_id.is_empty()
                 {
+                    while !started_marker.exists() {
+                        assert!(
+                            Instant::now() < deadline,
+                            "harness never wrote {}",
+                            started_marker.display()
+                        );
+                        std::thread::sleep(Duration::from_millis(10));
+                    }
                     self.send(json!({
                         "id": wrong_thread_interrupt_request_id,
                         "method": "turn/interrupt",
@@ -2507,27 +2517,24 @@ impl RawProcess {
     }
 }
 
+/// Checks the JSON-RPC envelope of a line of app-server stdout. Payload shapes
+/// are checked against the Codex types in `crates/harness-server-conformance`.
 fn validate_jsonrpc_value(value: &Value, allow_error: bool) {
-    let message: JSONRPCMessage =
-        serde_json::from_value(value.clone()).expect("valid JSON-RPC message");
-    match message {
-        JSONRPCMessage::Notification(notification) => {
-            let method = notification.method.clone();
-            if !is_known_untyped_server_notification(&method) {
-                ServerNotification::try_from(notification).unwrap_or_else(|error| {
-                    panic!(
-                        "notification is not a typed Codex App Server V2 notification: {error}; value={value}"
-                    )
-                });
-            }
-        }
-        JSONRPCMessage::Response(_) => {}
-        JSONRPCMessage::Error(error) => {
-            assert!(allow_error, "app-server returned JSON-RPC error: {error:?}");
-        }
-        JSONRPCMessage::Request(request) => {
-            panic!("app-server emitted unexpected request: {request:?}")
-        }
+    let has_id = value.get("id").is_some();
+    if value.get("method").is_some() {
+        assert!(!has_id, "app-server emitted unexpected request: {value}");
+        assert!(
+            value.get("params").is_some_and(Value::is_object),
+            "notification without params: {value}"
+        );
+    } else if let Some(error) = value.get("error") {
+        assert!(has_id, "JSON-RPC error without id: {value}");
+        assert!(allow_error, "app-server returned JSON-RPC error: {error}");
+    } else {
+        assert!(
+            has_id && value.get("result").is_some(),
+            "not a JSON-RPC message: {value}"
+        );
     }
 }
 
@@ -2886,4 +2893,99 @@ fn shell_quote(path: &Path) -> String {
 
 fn shell_quote_str(raw: &str) -> String {
     format!("'{}'", raw.replace('\'', "'\\''"))
+}
+
+#[test]
+fn fake_codex_blocks_mode_filters_child_and_stale_notifications_across_queued_turns() {
+    // Codex 0.160.1 emits child-agent output on the parent's app-server pipe.
+    // Replay those shapes before the RPC response, during the turn, and after
+    // its completion so they cannot answer or complete a later execution.
+    let fake_codex = temp_path("fake-child-codex.sh");
+    let log = temp_path("fake-child-codex-requests.jsonl");
+    let replay = include_str!("fixtures/codex/child_notifications.jsonl")
+        .lines()
+        .map(|line| format!("printf '%s\\n' '{line}'"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let parent_collab = json!({"method": "item/completed", "params": {
+        "threadId": "thread-1", "turnId": "turn-1", "completedAtMs": 2,
+        "item": {
+            "type": "collabAgentToolCall", "id": "spawn-child", "tool": "spawnAgent",
+            "status": "completed", "senderThreadId": "thread-1", "receiverThreadIds": ["child"],
+            "prompt": "review", "model": null, "reasoningEffort": null, "agentsStates": {},
+        },
+    }});
+    let script = fake_codex_app_server_script(&log)
+        .replace(
+            r#"      printf '{"id":%s,"result":{"turn":{"id":"turn-1"}}}\n' "$id""#,
+            &format!(
+                r#"{replay}
+      printf '{{"id":%s,"result":{{"turn":{{"id":"turn-1"}}}}}}\n' "$id"
+{replay}"#,
+            ),
+        )
+        .replace(
+            "      if [ -n \"${FAKE_CODEX_TURN_DELAY:-}\" ]; then",
+            &format!("{replay}\nprintf '%s\\n' '{parent_collab}'\n      if [ -n \"${{FAKE_CODEX_TURN_DELAY:-}}\" ]; then"),
+        )
+        .replace(
+            "      fi\n      ;;",
+            &format!("      fi\n{replay}\n      ;;"),
+        );
+    std::fs::write(&fake_codex, script).expect("write fake codex script");
+    let mut permissions = std::fs::metadata(&fake_codex).unwrap().permissions();
+    permissions.set_mode(0o755);
+    std::fs::set_permissions(&fake_codex, permissions).unwrap();
+    let mut bridge = BridgeProcess::spawn_harness_blocks(
+        Harness::Codex,
+        None,
+        Some(("CODEX_BIN", fake_codex.to_str().unwrap())),
+    );
+    for prompt in ["first queued turn", "second queued turn"] {
+        bridge.send(json!({
+            "type": "user", "thread_key": "slack:C123:123.456",
+            "trace_metadata": {"source": "slackbotv2", "action": "execute"},
+            "message": {"role": "user", "content": [{"type": "text", "text": prompt}]},
+        }));
+    }
+    let deadline = Instant::now() + Duration::from_secs(10);
+    for _ in 0..2 {
+        let turn = bridge.read_blocks_turn(deadline);
+        assert_completed_turn(&turn);
+        assert_codex_v2_turn(&turn);
+        assert_eq!(turn.text_from_deltas, "codex blocks");
+        assert_eq!(turn.completed_agent_items.len(), 1);
+    }
+    let lines = bridge.finish_successfully();
+    let events = lines
+        .iter()
+        .map(|line| serde_json::from_str::<Value>(line).unwrap())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| event["method"] == "turn/completed")
+            .count(),
+        2
+    );
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| event["params"]["item"]["id"] == "spawn-child")
+            .count(),
+        2
+    );
+    for event in events {
+        if let Some(thread) = event.pointer("/params/threadId") {
+            assert_eq!(thread, "thread-1");
+        }
+        if let Some(turn) = event
+            .pointer("/params/turnId")
+            .or_else(|| event.pointer("/params/turn/id"))
+        {
+            assert_eq!(turn, "turn-1");
+        }
+    }
+    std::fs::remove_file(fake_codex).unwrap();
+    std::fs::remove_file(log).unwrap();
 }
