@@ -19,12 +19,12 @@ concurrency:
 
 permissions:
   contents: read
-  deployments: write
-  issues: write
-  pull-requests: write
 
 jobs:
   build-and-deploy:
+    permissions:
+      contents: read
+      pull-requests: write
     name: Build and deploy docs
     runs-on: depot-ubuntu-24.04-16
     timeout-minutes: 20

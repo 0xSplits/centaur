@@ -6,10 +6,12 @@ on:
   workflow_dispatch:
 
 permissions:
-  pull-requests: write
+  contents: read
 
 jobs:
   close-stale-drafts:
+    permissions:
+      pull-requests: write
     name: Close stale drafts
     runs-on: depot-ubuntu-24.04
     timeout-minutes: 5

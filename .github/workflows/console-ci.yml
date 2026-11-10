@@ -10,6 +10,9 @@ defaults:
   run:
     working-directory: services/console
 
+permissions:
+  contents: read
+
 jobs:
   console_changes:
     name: Detect Console CI changes
